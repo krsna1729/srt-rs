@@ -4,9 +4,10 @@
 
 use bytes::Bytes;
 
-use super::{GroupMemberState, GroupMode, SrtGroup};
+use super::{GroupMemberState, GroupMode, MAX_BACKUP_HISTORY, SrtGroup};
 use crate::error::Error;
 use crate::srt_connection::ConnectionState;
+use crate::srt_packet::sequence_less_than;
 use crate::time::Timestamp;
 
 impl SrtGroup {
@@ -128,20 +129,22 @@ impl SrtGroup {
         Ok(sent)
     }
 
+    /// One Backup send. A carrier that stopped hearing from its peer is
+    /// demoted first; a member that takes over from another carrier replays
+    /// the unacknowledged flight before the new payload, so the receiver
+    /// gets no hole; a takeover that cannot replay all of it is refused.
     fn send_backup(&mut self, payload: Bytes, now: Timestamp) -> Result<usize, Error> {
+        self.demote_stale_backup_carrier(now);
         let mut active = self.active_indices().into_iter().next();
         if active.is_none() {
             self.promote_backup_member();
             active = self.active_indices().into_iter().next();
         }
-        let Some(index) = active else {
+        let Some(mut index) = active else {
             return Err(Error::invalid_state("no active Backup group members"));
         };
 
-        if self.next_send_sequence.is_some() {
-            let member_id = self.members[index].id;
-            self.align_member_sequence(member_id)?;
-        }
+        self.take_over_backup_flight(index, now)?;
         let sequence_number = self.sequence_for_send(&[index])?;
         if !self.members[index].connection.can_send()
             || self.members[index]
@@ -151,17 +154,142 @@ impl SrtGroup {
         {
             self.mark_send_failure(index);
             self.promote_backup_member();
-            let Some(index) = self.active_indices().into_iter().next() else {
+            let Some(promoted) = self.active_indices().into_iter().next() else {
                 return Err(Error::invalid_state("all Backup group members failed"));
             };
-            self.align_member_sequence(self.members[index].id)?;
+            index = promoted;
+            self.take_over_backup_flight(index, now)?;
             self.members[index]
                 .connection
-                .send_shared_with_sequence(payload, sequence_number, now)
+                .send_shared_with_sequence(payload.clone(), sequence_number, now)
                 .map_err(|_| Error::invalid_state("Backup promotion send failed"))?;
         }
         self.next_send_sequence = Some(sequence_number.wrapping_add(1) & 0x7FFF_FFFF);
+        self.record_backup_send(index, sequence_number, payload);
         Ok(1)
+    }
+
+    /// Demote the Backup carrier to [`GroupMemberState::Unstable`] when it
+    /// holds unacknowledged data and has heard nothing from its peer for
+    /// longer than [`Self::backup_stability_timeout_micros`], and a connected
+    /// standby can take over. Its connection stays up; it requalifies once
+    /// its flight drains.
+    fn demote_stale_backup_carrier(&mut self, now: Timestamp) {
+        let Some(index) = self.members.iter().position(|member| {
+            member.state == GroupMemberState::Active
+                && member.connection.state() == ConnectionState::Connected
+        }) else {
+            return;
+        };
+        let standby = self.members.iter().any(|member| {
+            member.state == GroupMemberState::Standby
+                && member.connection.state() == ConnectionState::Connected
+        });
+        if !standby {
+            return;
+        }
+        let Some(timeout) = self.backup_stability_timeout_micros(self.members[index].id) else {
+            return;
+        };
+        let connection = &self.members[index].connection;
+        let Some(sender) = connection.sender_buffer() else {
+            return;
+        };
+        if !sender.has_outstanding_submitted_data() {
+            return;
+        }
+        let Some(admitted) = sender.oldest_packet_time() else {
+            return;
+        };
+        let heard = connection
+            .last_recv_time()
+            .map_or(admitted, |received| received.max(admitted));
+        if now.saturating_sub(heard) > timeout {
+            self.members[index].state = GroupMemberState::Unstable;
+        }
+    }
+
+    /// Prepare the member at `index` to carry the next Backup send: the
+    /// previous carrier's still unacknowledged flight is replayed onto it,
+    /// at the same sequences, when it takes over; otherwise it is aligned to
+    /// the group sequence.
+    fn take_over_backup_flight(&mut self, index: usize, now: Timestamp) -> Result<(), Error> {
+        let member_id = self.members[index].id;
+        let carrier = self
+            .backup_carrier
+            .filter(|&carrier| carrier != member_id)
+            .and_then(|carrier| self.members.iter().position(|member| member.id == carrier));
+        if let Some(carrier) = carrier {
+            // ACKs that arrived since the carrier's last send.
+            self.trim_backup_history(carrier);
+        }
+        let takes_over = self
+            .backup_carrier
+            .is_some_and(|carrier| carrier != member_id);
+        let Some(&(first, _)) = self.backup_history.front().filter(|_| takes_over) else {
+            return if self.next_send_sequence.is_some() {
+                self.align_member_sequence(member_id)
+            } else {
+                Ok(())
+            };
+        };
+        let refused =
+            || Error::invalid_state("Backup failover cannot replay the unacknowledged interval");
+        if self.backup_history_gap {
+            return Err(refused());
+        }
+        let connection = &mut self.members[index].connection;
+        if connection.next_sequence_number() != Some(first) {
+            connection
+                .synchronize_send_sequence(first)
+                .map_err(|_| refused())?;
+        }
+        let room = connection
+            .sender_buffer()
+            .map_or(0, |sender| sender.remaining_window_packets());
+        if (room as usize) <= self.backup_history.len() {
+            return Err(refused());
+        }
+        for (sequence, payload) in &self.backup_history {
+            connection
+                .send_shared_with_sequence(payload.clone(), *sequence, now)
+                .map_err(|_| refused())?;
+        }
+        Ok(())
+    }
+
+    /// Keep a sent payload until its carrier's peer acknowledges it.
+    fn record_backup_send(&mut self, index: usize, sequence: u32, payload: Bytes) {
+        self.backup_carrier = Some(self.members[index].id);
+        if self.backup_history.len() >= MAX_BACKUP_HISTORY {
+            self.backup_history.pop_front();
+        }
+        self.backup_history.push_back((sequence, payload));
+        self.trim_backup_history(index);
+    }
+
+    /// Drop what the carrier at `index` has had acknowledged, and note
+    /// whether the history still reaches back to its oldest unacknowledged
+    /// sequence (the bound may have evicted older ones).
+    fn trim_backup_history(&mut self, index: usize) {
+        let Some(oldest) = self.members[index]
+            .connection
+            .sender_buffer()
+            .map(|sender| sender.oldest_unacked_sequence())
+        else {
+            return;
+        };
+        while self
+            .backup_history
+            .front()
+            .is_some_and(|&(front, _)| sequence_less_than(front, oldest))
+        {
+            self.backup_history.pop_front();
+        }
+        self.backup_history_gap = self
+            .backup_history
+            .front()
+            .is_some_and(|&(front, _)| sequence_less_than(oldest, front));
     }
 
     fn sequence_for_send(&self, active: &[usize]) -> Result<u32, Error> {

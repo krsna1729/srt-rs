@@ -346,11 +346,11 @@ pub(crate) fn listener_table(
     table
 }
 
-/// Where this Owner binds a promoted session's connected socket.
+/// Where and how this Owner binds a promoted session's connected socket.
 #[derive(Clone, Copy)]
 struct PromotionIo {
     bind: SocketAddr,
-    buffer_bytes: usize,
+    transport: crate::ResolvedTransportConfig,
 }
 
 /// Layout state of one listener: its member index, the transfers it owes
@@ -392,7 +392,7 @@ impl ListenerRouting {
             .filter(|plan| plan.router.is_some())
             .map(|plan| PromotionIo {
                 bind: plan.bind,
-                buffer_bytes: prepared.transport.socket_buffer_bytes,
+                transport: prepared.transport,
             });
         Self {
             index,
@@ -463,7 +463,7 @@ impl ListenerRouting {
         };
         let (transfers, promoted) = (&mut self.transfers, &mut self.promoted);
         let failed = table.take_promotions(
-            |peer| crate::config::bind_promoted_socket(io.bind, io.buffer_bytes, peer).ok(),
+            |peer| crate::config::bind_promoted_socket(io.bind, &io.transport, peer).ok(),
             |work, socket| match work {
                 PromotionWork::PromoteHere(physical) => {
                     telemetry.record_local_promotion();

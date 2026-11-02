@@ -166,10 +166,15 @@ fn stall_and_fail_over() -> Failover {
         group.member(2).expect("second member").state(),
         GroupMemberState::Active
     );
+    let flight: Vec<u32> = (1..=parked)
+        .rev()
+        .map(|back| cursor.wrapping_sub(back) & SEQUENCE_MASK)
+        .chain([cursor])
+        .collect();
     assert_eq!(
         data_sequences(group.member_mut(2).expect("second member").connection_mut()),
-        vec![cursor],
-        "the promoted leg carries the cursor the stalled leg could not send, once"
+        flight,
+        "the promoted leg replays the stalled flight, then carries the cursor once"
     );
 
     Failover {

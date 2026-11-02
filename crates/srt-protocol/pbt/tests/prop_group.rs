@@ -259,3 +259,102 @@ proptest! {
         }
     }
 }
+
+/// Whether `packets` carry any DATA.
+fn carries_data(packets: &[Vec<u8>]) -> bool {
+    packets.iter().any(|packet| {
+        matches!(
+            srt_proto::wire::SrtPacket::decode(packet),
+            Ok(srt_proto::wire::SrtPacket::Data(_))
+        )
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// Backup failover against srtgo's group buffer model
+    /// (zsiec/srtgo `internal/core/group.go`: `bufferMsg` keeps each sent
+    /// payload until an ACK prunes it, `activate` replays the buffer onto
+    /// the promoted member before new data). The active leg delivers
+    /// `delivered` payloads, the first `acked` of them acknowledged, then
+    /// dies: `lost` more never arrive. The standby takes over for `after`
+    /// sends; its window holds `window` packets, at least
+    /// `MIN_FLOW_WINDOW_PACKETS`. Model: the takeover replays every
+    /// unacknowledged payload, so the k-th send after it fits only while
+    /// `unacked + k + 1 <= window`; the first that does not fit fails, and a
+    /// takeover that cannot fit even the first emits nothing. The receiving
+    /// group delivers exactly the payloads sent successfully, once, in order.
+    #[test]
+    fn backup_failover_matches_the_srtgo_buffer_model(
+        delivered in 0usize..48,
+        acked in prop_oneof![Just(usize::MAX), 0usize..48],
+        lost in prop_oneof![Just(0usize), 0usize..48],
+        after in 1usize..4,
+        window in 3u32..48,
+    ) {
+        let acked = acked.min(delivered);
+        let (caller_a, listener_a) = establish_pair(ConnectionOptions::default());
+        let (caller_b, listener_b) = establish_pair(ConnectionOptions {
+            flow_window_packets: window,
+            ..Default::default()
+        });
+        let mut sender = SrtGroup::new(0x4000_0040, GroupMode::Backup).expect("sender group");
+        sender.add_member(1, 100, caller_a).expect("active");
+        sender.add_member(2, 1, caller_b).expect("standby");
+        let mut receiver = SrtGroup::new(0x4000_0041, GroupMode::Backup).expect("receiver group");
+        receiver.add_member(1, 100, listener_a).expect("active");
+        receiver.add_member(2, 1, listener_b).expect("standby");
+        let payload = |index: usize| vec![u8::try_from(index).expect("small index"); 8];
+        let mut received: Vec<Vec<u8>> = Vec::new();
+        let mut collect = |receiver: &mut SrtGroup, now| {
+            while let Some(packet) = receiver.poll_data(now) {
+                received.push(packet.payload.chunks().flat_map(|chunk| chunk.to_vec()).collect());
+            }
+        };
+
+        let now = ts(100_000);
+        for index in 0..delivered {
+            sender.send(&payload(index), now).expect("the active sends");
+            for packet in drain(sender.member_mut(1).expect("active").connection_mut()) {
+                let _ = receiver.member_mut(1).expect("active").connection_mut().feed_recv_buf(&packet, now);
+            }
+            collect(&mut receiver, now);
+            if index + 1 == acked {
+                let leg = receiver.member_mut(1).expect("active").connection_mut();
+                leg.handle_timer(TimerId::Ack, ts(110_000)).expect("ack timer");
+                for packet in drain(leg) {
+                    let _ = sender.member_mut(1).expect("active").connection_mut().feed_recv_buf(&packet, ts(110_000));
+                }
+            }
+        }
+        for index in delivered..delivered + lost {
+            sender.send(&payload(index), now).expect("the active sends");
+            let _lost = drain(sender.member_mut(1).expect("active").connection_mut());
+        }
+        prop_assert!(sender.mark_member_broken(1));
+
+        let unacked = delivered + lost - acked;
+        let capacity = window.max(srt_proto::MIN_FLOW_WINDOW_PACKETS) as usize;
+        let fitting = (0..after).take_while(|k| unacked + k < capacity).count();
+        let later = ts(120_000);
+        for k in 0..after {
+            let sent = sender.send(&payload(delivered + lost + k), later);
+            prop_assert_eq!(sent.is_ok(), k < fitting, "send {} after the takeover", k);
+            if sent.is_err() {
+                break;
+            }
+        }
+        let takeover = drain(sender.member_mut(2).expect("standby").connection_mut());
+        if fitting == 0 {
+            prop_assert!(!carries_data(&takeover), "a refused takeover emits nothing");
+        }
+        for packet in takeover {
+            let _ = receiver.member_mut(2).expect("standby").connection_mut().feed_recv_buf(&packet, later);
+        }
+        collect(&mut receiver, later);
+        let sent = if fitting == 0 { delivered } else { delivered + lost + fitting };
+        let expected: Vec<Vec<u8>> = (0..sent).map(payload).collect();
+        prop_assert_eq!(received, expected);
+    }
+}

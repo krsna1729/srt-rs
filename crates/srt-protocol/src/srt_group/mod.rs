@@ -2,7 +2,9 @@ mod retirement;
 mod send;
 pub use retirement::GroupRetirement;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use bytes::Bytes;
 
 use crate::error::Error;
 use crate::srt_connection::{ConnectionEvent, ConnectionState, SrtConnection};
@@ -218,7 +220,28 @@ pub struct SrtGroup {
     owned: BTreeSet<u32>,
     /// Packets the `owned` payloads span.
     owned_packets: u32,
+    /// Backup mode: what the carrier sent and its peer has not acknowledged,
+    /// oldest first, so a standby that takes over replays it before new
+    /// payload. Bounded by [`MAX_BACKUP_HISTORY`].
+    backup_history: VecDeque<(u32, Bytes)>,
+    /// The member that carried the last Backup send.
+    backup_carrier: Option<u32>,
+    /// The carrier has unacknowledged packets older than the history holds
+    /// (the bound evicted them): a takeover would leave a hole, so it is
+    /// refused.
+    backup_history_gap: bool,
+    /// Packets the receive side skipped because no member delivered them
+    /// before a later sequence was released.
+    skipped_receive_packets: u64,
 }
+
+/// Floor of a Backup carrier's stability timeout (libsrt's `SRT_TMIN`).
+pub const BACKUP_MIN_STABILITY_TIMEOUT_MICROS: u64 = 60_000;
+
+/// Most unacknowledged Backup sends kept for a takeover replay: half the
+/// output queue, so a replay plus its live traffic never overflows the new
+/// leg's queue (an overflow disconnects it).
+pub const MAX_BACKUP_HISTORY: usize = crate::srt_connection::MAX_OUTPUT_QUEUE_ACTIONS / 2;
 
 impl SrtGroup {
     /// Create an empty group. `group_id` must carry [`SRTGROUP_MASK`], as it
@@ -240,7 +263,24 @@ impl SrtGroup {
             collisions: std::collections::VecDeque::new(),
             owned: BTreeSet::new(),
             owned_packets: 0,
+            backup_history: VecDeque::new(),
+            backup_carrier: None,
+            backup_history_gap: false,
+            skipped_receive_packets: 0,
         })
+    }
+
+    /// How long a Backup member may hold unacknowledged data without hearing
+    /// from its peer before a connected standby takes over:
+    /// `max(60 ms, 2·SRTT + 4·RTTVar)` from its own RTT estimate, as libsrt.
+    pub fn backup_stability_timeout_micros(&self, member_id: u32) -> Option<u64> {
+        let (srtt, rttvar) = self
+            .member(member_id)?
+            .connection
+            .sender_buffer()?
+            .rtt_estimate_micros();
+        let dynamic = 2 * u64::from(srtt) + 4 * u64::from(rttvar);
+        Some(dynamic.max(BACKUP_MIN_STABILITY_TIMEOUT_MICROS))
     }
 
     /// The remote receiving-group ID this group is bound to, once a member
@@ -484,6 +524,74 @@ impl SrtGroup {
         }
     }
 
+    /// Packets the receive side skipped because no member delivered them
+    /// before a later sequence was released: lost on every link.
+    pub fn skipped_receive_packets(&self) -> u64 {
+        self.skipped_receive_packets
+    }
+
+    /// The oldest pending sequence, in wrapping order.
+    fn oldest_pending(&self) -> Option<u32> {
+        self.pending.keys().copied().reduce(|left, right| {
+            if sequence_less_than(right, left) {
+                right
+            } else {
+                left
+            }
+        })
+    }
+
+    /// Whether TLPKTDROP has given up, at `now`, on every sequence before the
+    /// oldest pending one: that packet's give-up point on the member that
+    /// delivered it has passed, and no older sequence's comes later.
+    fn gap_given_up(&self, now: Timestamp) -> bool {
+        let Some(packet) = self
+            .oldest_pending()
+            .and_then(|sequence| self.pending.get(&sequence))
+        else {
+            return false;
+        };
+        self.members
+            .iter()
+            .find(|member| member.id == packet.member_id)
+            .or_else(|| self.members.first())
+            .and_then(|member| member.connection.gives_up_at(packet.source_time))
+            .is_some_and(|at| now >= at)
+    }
+
+    /// The sequence to deliver next: `next`, or -- once members have given
+    /// up on the gap before the oldest pending payload -- that payload,
+    /// counting the skip. A member's release of `next` may still be queued,
+    /// so collect those first; a lifecycle event collected on the way breaks.
+    fn skip_given_up_gap(
+        &mut self,
+        next: u32,
+        now: Timestamp,
+    ) -> std::ops::ControlFlow<GroupEvent, u32> {
+        use std::ops::ControlFlow::{Break, Continue};
+        if self.pending.contains_key(&next) || !self.gap_given_up(now) {
+            return Continue(next);
+        }
+        for _ in 0..MAX_GROUP_MEMBERS {
+            if self.pending.contains_key(&next) || !self.collect_one_event() {
+                break;
+            }
+        }
+        if let Some(event) = self.events.pop_front() {
+            return Break(event);
+        }
+        match self.oldest_pending() {
+            Some(oldest) if !self.pending.contains_key(&next) => {
+                let skipped = oldest.wrapping_sub(next) & 0x7FFF_FFFF;
+                self.skipped_receive_packets = self
+                    .skipped_receive_packets
+                    .saturating_add(u64::from(skipped));
+                Continue(oldest)
+            }
+            _ => Continue(next),
+        }
+    }
+
     /// Return the next deduplicated, in-order payload, discarding any
     /// member-lifecycle events along the way. Applications that need to know
     /// whether the bounded lifecycle drain left more work should use
@@ -551,15 +659,13 @@ impl SrtGroup {
             return Some(event);
         }
 
-        let next = self.next_receive_sequence.or_else(|| {
-            self.pending.keys().copied().reduce(|left, right| {
-                if sequence_less_than(right, left) {
-                    right
-                } else {
-                    left
-                }
-            })
-        })?;
+        let next = self
+            .next_receive_sequence
+            .or_else(|| self.oldest_pending())?;
+        let next = match self.skip_given_up_gap(next, now) {
+            std::ops::ControlFlow::Continue(next) => next,
+            std::ops::ControlFlow::Break(event) => return Some(event),
+        };
         self.next_receive_sequence = Some(next);
         let packet = self.pending.remove(&next)?;
         let following = next.wrapping_add(packet.packet_count) & 0x7FFF_FFFF;

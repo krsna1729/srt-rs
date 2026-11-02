@@ -226,19 +226,110 @@ pub fn recvmsg_batch(
         sizes,
         addrs,
         truncated,
+        &mut [],
     )
+}
+
+/// What the kernel reported about one received message, from its control
+/// messages: when it arrived (`SO_TIMESTAMPNS`, realtime clock) and, for a
+/// GRO-coalesced message (`UDP_GRO`), the size of each segment it carries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecvMeta {
+    /// Arrival time since the Unix epoch, when the socket stamps arrivals.
+    pub arrival_realtime: Option<std::time::Duration>,
+    /// Segment size of a coalesced message; the last segment may be shorter.
+    pub segment_size: Option<u16>,
+}
+
+/// Ask the kernel to stamp each datagram's arrival on `fd`
+/// (`SO_TIMESTAMPNS`), read back through [`RecvMeta::arrival_realtime`].
+pub fn enable_receive_timestamps(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    set_int_option(fd, libc::SOL_SOCKET, libc::SO_TIMESTAMPNS, 1)
+}
+
+/// Let the kernel coalesce same-flow datagrams on `fd` (`UDP_GRO`). Every
+/// receive slot on that socket must then hold a whole coalesced message
+/// ([`srt_proto::wire::MAX_DATAGRAM_SIZE`] bytes), or it is truncated.
+pub fn enable_udp_gro(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    set_int_option(fd, libc::SOL_UDP, libc::UDP_GRO, 1)
+}
+
+fn set_int_option(
+    fd: std::os::fd::RawFd,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: libc::c_int,
+) -> std::io::Result<()> {
+    // SAFETY: `value` is a live c_int for the duration of the call and its
+    // size is passed alongside it.
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            (&value as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Control-message space per received message: one `SCM_TIMESTAMPNS`
+/// timespec and one `UDP_GRO` int, with headers and alignment to spare.
+const CONTROL_WORDS: usize = 16;
+
+/// Read the arrival stamp and GRO segment size from a received message's
+/// control messages.
+///
+/// SAFETY: `msg` must have just been filled by `recvmmsg` with its
+/// `msg_control` pointing at a live buffer of `msg_controllen` bytes.
+unsafe fn recv_meta(msg: &libc::msghdr) -> RecvMeta {
+    let mut meta = RecvMeta::default();
+    // SAFETY: the caller guarantees `msg`'s control buffer; the CMSG macros
+    // walk only within `msg_controllen`.
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msg) };
+    while !cmsg.is_null() {
+        // SAFETY: `cmsg` is a non-null header inside the control buffer.
+        let header = unsafe { &*cmsg };
+        // SAFETY: as above; the payload is read unaligned.
+        let data = unsafe { libc::CMSG_DATA(cmsg) };
+        match (header.cmsg_level, header.cmsg_type) {
+            (libc::SOL_SOCKET, libc::SCM_TIMESTAMPNS) => {
+                // SAFETY: an SCM_TIMESTAMPNS payload is one timespec.
+                let stamp = unsafe { data.cast::<libc::timespec>().read_unaligned() };
+                meta.arrival_realtime = (stamp.tv_sec >= 0)
+                    .then(|| std::time::Duration::new(stamp.tv_sec as u64, stamp.tv_nsec as u32));
+            }
+            (libc::SOL_UDP, libc::UDP_GRO) => {
+                // SAFETY: a UDP_GRO payload is one int, the segment size.
+                let size = unsafe { data.cast::<libc::c_int>().read_unaligned() };
+                meta.segment_size = u16::try_from(size).ok().filter(|&size| size > 0);
+            }
+            _ => {}
+        }
+        // SAFETY: `msg` and `cmsg` are as above.
+        cmsg = unsafe { libc::CMSG_NXTHDR(msg, cmsg) };
+    }
+    meta
 }
 
 /// [`recvmsg_batch`] into caller-provided slots, one per entry of `sizes`
 /// (`slots` must yield at least that many). Lets a receive path land
 /// datagrams directly in a shared arena (`BytesRecvBatch`) instead of
-/// scratch buffers that are copied afterwards.
+/// scratch buffers that are copied afterwards. When `meta` holds an entry per
+/// `sizes` entry, each message's [`RecvMeta`] is read too; an empty `meta`
+/// skips control messages.
 pub fn recvmsg_batch_into<'a>(
     fd: std::os::fd::RawFd,
     slots: impl Iterator<Item = &'a mut [u8]>,
     sizes: &mut [usize],
     addrs: &mut [Option<net::SocketAddr>],
     truncated: &mut [bool],
+    meta: &mut [RecvMeta],
 ) -> std::io::Result<usize> {
     use std::cell::RefCell;
     thread_local! {
@@ -248,6 +339,7 @@ pub fn recvmsg_batch_into<'a>(
         msgs: Vec<libc::mmsghdr>,
         iovs: Vec<libc::iovec>,
         addrs: Vec<libc::sockaddr_storage>,
+        controls: Vec<[u64; CONTROL_WORDS]>,
     }
     impl BatchScratch {
         fn new(n: usize) -> Self {
@@ -272,6 +364,7 @@ pub fn recvmsg_batch_into<'a>(
                         unsafe { std::mem::zeroed() }
                     })
                     .collect(),
+                controls: vec![[0; CONTROL_WORDS]; n],
             }
         }
 
@@ -293,9 +386,13 @@ pub fn recvmsg_batch_into<'a>(
                 // storage before it is interpreted.
                 unsafe { std::mem::zeroed() }
             });
+            self.controls.resize(n, [0; CONTROL_WORDS]);
         }
     }
-    if sizes.len() != addrs.len() || sizes.len() != truncated.len() {
+    if sizes.len() != addrs.len()
+        || sizes.len() != truncated.len()
+        || !(meta.is_empty() || meta.len() == sizes.len())
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
@@ -323,35 +420,22 @@ pub fn recvmsg_batch_into<'a>(
             msgs,
             iovs,
             addrs: storage_addrs,
+            controls,
         } = &mut *scratch;
+        let with_meta = !meta.is_empty();
         addrs.fill(None);
         let mut prepared = 0usize;
-        for (((iov, msg), storage), (buf, size)) in iovs
+        for ((((iov, msg), storage), control), (buf, size)) in iovs
             .iter_mut()
             .take(count)
             .zip(msgs.iter_mut().take(count))
             .zip(storage_addrs.iter_mut().take(count))
+            .zip(controls.iter_mut().take(count))
             .zip(slots.zip(sizes.iter_mut()))
         {
             prepared += 1;
             *size = 0;
-            *iov = libc::iovec {
-                iov_base: buf.as_mut_ptr().cast(),
-                iov_len: buf.len(),
-            };
-            // SAFETY: zeroed sockaddr storage is valid and is filled by the
-            // kernel before any family-specific interpretation.
-            *storage = unsafe { std::mem::zeroed() };
-            *msg = libc::mmsghdr {
-                // SAFETY: all-zero is a valid empty `msghdr`; fields needed
-                // by `recvmmsg` are assigned immediately below.
-                msg_hdr: unsafe { std::mem::zeroed() },
-                msg_len: 0,
-            };
-            msg.msg_hdr.msg_iov = iov;
-            msg.msg_hdr.msg_iovlen = 1;
-            msg.msg_hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
-            msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
+            prepare_entry(msg, iov, storage, with_meta.then_some(control), buf);
         }
         if prepared < count {
             return Err(std::io::Error::new(
@@ -389,9 +473,47 @@ pub fn recvmsg_batch_into<'a>(
             let buf_capacity = iovs[i].iov_len;
             sizes[i] = (msgs[i].msg_len as usize).min(buf_capacity);
             truncated[i] = msgs[i].msg_hdr.msg_flags & libc::MSG_TRUNC != 0;
+            if with_meta {
+                // SAFETY: entry `i` was just filled by `recvmmsg`, its control
+                // pointer set above to `controls[i]`, which is still live.
+                meta[i] = unsafe { recv_meta(&msgs[i].msg_hdr) };
+            }
         }
         Ok(received as usize)
     })
+}
+
+/// Point one `recvmmsg` entry at its slot, its address storage and, when
+/// given, its control buffer. The entry holds raw pointers to all of them,
+/// so they must outlive the syscall that uses it.
+fn prepare_entry(
+    msg: &mut libc::mmsghdr,
+    iov: &mut libc::iovec,
+    storage: &mut libc::sockaddr_storage,
+    control: Option<&mut [u64; CONTROL_WORDS]>,
+    buf: &mut [u8],
+) {
+    *iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    // SAFETY: zeroed sockaddr storage is valid and is filled by the kernel
+    // before any family-specific interpretation.
+    *storage = unsafe { std::mem::zeroed() };
+    *msg = libc::mmsghdr {
+        // SAFETY: all-zero is a valid empty `msghdr`; fields needed by
+        // `recvmmsg` are assigned immediately below.
+        msg_hdr: unsafe { std::mem::zeroed() },
+        msg_len: 0,
+    };
+    msg.msg_hdr.msg_iov = iov;
+    msg.msg_hdr.msg_iovlen = 1;
+    msg.msg_hdr.msg_name = (storage as *mut libc::sockaddr_storage).cast();
+    msg.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
+    if let Some(control) = control {
+        msg.msg_hdr.msg_control = control.as_mut_ptr().cast();
+        msg.msg_hdr.msg_controllen = std::mem::size_of_val(control) as _;
+    }
 }
 
 /// SAFETY: `storage` must have been filled by `recvmmsg` with a valid

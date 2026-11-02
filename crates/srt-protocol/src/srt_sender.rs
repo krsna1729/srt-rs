@@ -1035,6 +1035,12 @@ impl SenderBuffer {
         SenderRto::base_timeout_micros(Some((self.sender_rtt_micros, self.sender_rtt_var_micros)))
     }
 
+    /// This sender's smoothed RTT and RTT variance, in microseconds.
+    #[must_use]
+    pub fn rtt_estimate_micros(&self) -> (u32, u32) {
+        (self.sender_rtt_micros, self.sender_rtt_var_micros)
+    }
+
     /// Start a fresh RTO epoch, returning the timeout to program.
     pub fn rto_start(&mut self) -> u64 {
         self.rto.start(self.rto_base_timeout_micros())
