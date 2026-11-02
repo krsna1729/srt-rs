@@ -118,14 +118,18 @@ fn data_packet(bytes: &[u8]) -> Option<DataPacket> {
 }
 
 fn connected_pair() -> (Endpoint, Endpoint) {
+    connected_pair_with_tsbpd_delay(0)
+}
+
+fn connected_pair_with_tsbpd_delay(tsbpd_delay: u16) -> (Endpoint, Endpoint) {
     let mut caller = Endpoint::new(SrtConnection::new_caller(ConnectionOptions {
         socket_id: 1001,
-        tsbpd_delay: 0,
+        tsbpd_delay,
         ..ConnectionOptions::default()
     }));
     let mut listener = Endpoint::new(SrtConnection::new_listener(ConnectionOptions {
         socket_id: 2001,
-        tsbpd_delay: 0,
+        tsbpd_delay,
         ..ConnectionOptions::default()
     }));
     caller
@@ -172,7 +176,11 @@ struct Outcome {
 /// `drop_data_from` onward (if set), and run the pair for `ticks` real timer
 /// ticks.
 fn run_flight(drop_data_from: Option<usize>, ticks: usize) -> Outcome {
-    let (mut caller, mut listener) = connected_pair();
+    // The receiver must still want a recovered packet: like libsrt, it gives
+    // up a gap once the packet after it is due, so the latency covers the
+    // timeout-driven recovery (320 ms initial timeout, with backoff), as an
+    // SRT latency is configured to.
+    let (mut caller, mut listener) = connected_pair_with_tsbpd_delay(1_000);
     let mut now = Timestamp::from_micros(1_000_000);
     for i in 0..FLIGHT {
         caller
