@@ -2163,15 +2163,18 @@ impl ReceiverBuffer {
         }
     }
 
-    /// How long past its TSBPD deadline a missing packet is still awaited
-    /// before TLPKTDROP gives up on it.
+    /// How long past its TSBPD deadline a missing packet with nothing received
+    /// after it is still awaited before TLPKTDROP gives up on it.
     fn tlpktdrop_threshold_us(&self) -> u64 {
         ((self.tsbpd_delay_us as u128 * 125 / 100) as u64).max(1_000_000) // Minimum 1 second.
     }
 
-    /// When TLPKTDROP gives up on a packet the sender queued at
-    /// `source_time` (in this receiver's clock): its deadline plus the
-    /// threshold. `None` without TSBPD.
+    /// When a group stops waiting for the gap ahead of a packet this member
+    /// released, the sender having queued it at `source_time` (in this
+    /// receiver's clock): its deadline plus the TLPKTDROP threshold. This
+    /// receiver gives up its own gaps sooner, once the next packet is due
+    /// (see `drop_too_late`); libsrt's group reader does not wait the
+    /// threshold either (VENDOR.md). `None` without TSBPD.
     pub(crate) fn gives_up_at(&self, source_time: Timestamp) -> Option<Timestamp> {
         self.tsbpd_enabled.then(|| {
             Timestamp::from_micros(
@@ -2197,28 +2200,30 @@ impl ReceiverBuffer {
             .loss_list
             .iter()
             .filter(|&seq| {
-                let estimated_delivery = self
+                let now = now.as_micros();
+                if let Some(packet) = self.packets.get(seq) {
+                    return now > self.delivery_time(packet).as_micros() + tlpktdrop_threshold;
+                }
+                let next_packet = self
                     .packets
-                    .get(seq)
-                    .map(|packet| self.delivery_time(packet).as_micros())
-                    .unwrap_or_else(|| {
-                        let next_packet = self
-                            .packets
-                            .successor_after(seq)
-                            .and_then(|next_seq| self.packets.get(next_seq));
-                        next_packet.map_or_else(
-                            || {
-                                let base = self.tsbpd_time_base + self.tsbpd_delay_us;
-                                if self.wrapping_period_active {
-                                    base + MAX_TIMESTAMP + 1
-                                } else {
-                                    base
-                                }
-                            },
-                            |entry| self.delivery_time(entry).as_micros(),
-                        )
-                    });
-                now.as_micros() > estimated_delivery + tlpktdrop_threshold
+                    .successor_after(seq)
+                    .and_then(|next_seq| self.packets.get(next_seq));
+                match next_packet {
+                    // Like libsrt (`CUDT::tsbpd` drops up to the first
+                    // received packet once it is due): the gap goes when the
+                    // packet after it is due. The 1 s floor of the threshold
+                    // is the sender's drop rule, not the receiver's.
+                    Some(next) => now >= self.delivery_time(next).as_micros(),
+                    None => {
+                        let base = self.tsbpd_time_base + self.tsbpd_delay_us;
+                        let estimated_delivery = if self.wrapping_period_active {
+                            base + MAX_TIMESTAMP + 1
+                        } else {
+                            base
+                        };
+                        now > estimated_delivery + tlpktdrop_threshold
+                    }
+                }
             })
             .collect();
 
@@ -3955,6 +3960,30 @@ mod tests {
         // now = 2_000_000 > 820_000 + 1_000_000 = 1_820_000 なので削除される
         let dropped = buf.drop_too_late(Timestamp::from_micros(2_000_000));
         assert_eq!(dropped, vec![1000]);
+    }
+
+    /// Like libsrt's receiver (`CUDT::tsbpd`, which drops up to the first
+    /// received packet once its play time comes), a loss that is never
+    /// resent holds back the packet after it only until that packet is due,
+    /// not a further `max(1.25 x latency, 1 s)`: that floor is the sender's
+    /// drop rule (`SRT_TLPKTDROP_MINTHRESHOLD_MS`).
+    #[test]
+    fn a_lost_packet_is_given_up_when_the_next_one_is_due() {
+        let start = Timestamp::from_micros(1_000_000);
+        let mut buf = ReceiverBuffer::new(1000, 120, start, 500_000);
+        // 1000 never arrives; 1001 plays at 500_000 + 200_000 + 120_000.
+        buf.receive(make_packet(1001, 200_000), start);
+        let due = Timestamp::from_micros(820_000);
+
+        let before = Timestamp::from_micros(819_999);
+        assert!(buf.drop_too_late(before).is_empty());
+        assert!(buf.pop_ready(before).is_none());
+
+        assert_eq!(buf.drop_too_late(due), vec![1000]);
+        assert_eq!(
+            buf.pop_ready(due).map(|packet| packet.sequence_number),
+            Some(1001)
+        );
     }
 
     #[test]

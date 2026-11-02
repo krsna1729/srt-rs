@@ -4563,8 +4563,9 @@ impl SrtConnection {
         self.negotiated_feature(srt_flags::TLPKTDROP, srt_flags::TLPKTDROP)
     }
 
-    /// When this connection's TLPKTDROP gives up on a packet the sender
-    /// queued at `source_time`; `None` when it never does.
+    /// When a group stops waiting for the gap ahead of a packet this
+    /// connection released, queued by the sender at `source_time`; `None`
+    /// when it never does (see `ReceiverBuffer::gives_up_at`).
     pub(crate) fn gives_up_at(&self, source_time: Timestamp) -> Option<Timestamp> {
         if !(self.tsbpd_enabled() && self.tlpktdrop_enabled()) {
             return None;
@@ -5461,13 +5462,21 @@ mod tests {
 
     /// Default-options caller/listener pair, already `Connected`.
     fn connected_pair() -> (SrtConnection, SrtConnection) {
+        connected_pair_with_tsbpd_delay(ConnectionOptions::default().tsbpd_delay)
+    }
+
+    /// Caller/listener pair negotiated at `tsbpd_delay` ms, already
+    /// `Connected`.
+    fn connected_pair_with_tsbpd_delay(tsbpd_delay: u16) -> (SrtConnection, SrtConnection) {
         let mut caller = SrtConnection::new_caller(ConnectionOptions {
             socket_id: 1,
+            tsbpd_delay,
             ..ConnectionOptions::default()
         });
         let mut listener = SrtConnection::new_listener(ConnectionOptions {
             socket_id: 2,
             syn_cookie: Some(7),
+            tsbpd_delay,
             ..ConnectionOptions::default()
         });
         drive_handshake_to_connected(&mut caller, &mut listener);
@@ -5589,7 +5598,12 @@ mod tests {
 
     impl FlightHarness {
         fn new(dropped_first_transmissions: &[usize]) -> Self {
-            let (caller, listener) = connected_pair();
+            // These tests are about how the sender recovers a loss, so the
+            // receiver must still want the packet when it comes back: the
+            // latency covers the timeout-driven recovery, as an SRT latency
+            // is configured to. The receiver gives up a gap once the packet
+            // after it is due, like libsrt.
+            let (caller, listener) = connected_pair_with_tsbpd_delay(FLIGHT_TSBPD_DELAY_MS);
             Self {
                 caller,
                 listener,
@@ -5749,6 +5763,9 @@ mod tests {
     }
 
     const FLIGHT: usize = 4;
+    /// Above the 320 ms initial sender timeout plus the longest blocked-TX
+    /// stretch these tests use (600 ms), below their shortest run (2 s).
+    const FLIGHT_TSBPD_DELAY_MS: u16 = 1_000;
 
     /// Control: with nothing dropped, every payload arrives and the sender
     /// retransmits nothing. Without this the tail tests could pass or fail for a
@@ -10928,17 +10945,17 @@ mod tests {
         )
         .expect("the peer's SHUTDOWN is accepted");
 
-        // Both messages are past their deadlines, but the hole between them
-        // has not expired yet: TLPKTDROP's threshold is at least one second.
-        conn.handle_timer(TimerId::Ack, Timestamp::from_micros(500_000))
+        // The hole is given up when the message after it is due (60 us +
+        // 120 ms latency), like libsrt: one tick before, nothing moves.
+        conn.handle_timer(TimerId::Ack, Timestamp::from_micros(120_059))
             .expect("ACK tick");
         assert!(conn.poll_event().is_none(), "the hole has not expired yet");
         assert_eq!(conn.state(), ConnectionState::Connected);
 
-        // Once the hole expires, TLPKTDROP retires it (and with it the
-        // message that can never complete), the later message is delivered,
-        // and only then does the peer close become terminal.
-        conn.handle_timer(TimerId::Ack, Timestamp::from_micros(1_200_000))
+        // Once the later message is due, TLPKTDROP retires the hole (and with
+        // it the message that can never complete), the later message is
+        // delivered, and only then does the peer close become terminal.
+        conn.handle_timer(TimerId::Ack, Timestamp::from_micros(120_060))
             .expect("ACK tick");
         let delivered = conn
             .poll_event()
