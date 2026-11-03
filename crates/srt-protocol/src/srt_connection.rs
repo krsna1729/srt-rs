@@ -8158,11 +8158,11 @@ mod tests {
     /// forced Full ACK: that coupled the Full ACK rate to packets/64.
     #[test]
     #[cfg_attr(
-        all(miri, not(feature = "miri-extended")),
-        ignore = "simulates one second in 10 us steps (100k steps x 4 configurations) under    \
-                  Miri; the rate bound is proven outside Miri, and it holds no unsafe or     \
-                  ownership pattern the cheaper receiver tests do not cover. Run in the      \
-                  miri-extended scheduled job."
+        miri,
+        ignore = "simulates one second in 10 us steps (100k steps x 4 configurations): over   \
+                  90 minutes under Miri, past any job budget. The rate bound is proven      \
+                  outside Miri, and it holds no unsafe or ownership pattern the cheaper     \
+                  receiver tests do not cover, so the miri-extended job skips it too."
     )]
     fn a_saturated_receiver_sends_at_most_two_full_acks_per_ack_interval() {
         const INTERVAL: u64 = crate::receiver::ACK_INTERVAL_MICROS;
@@ -9549,11 +9549,11 @@ mod tests {
     /// below it, the listener refuses before committing anything.
     #[test]
     #[cfg_attr(
-        all(miri, not(feature = "miri-extended")),
-        ignore = "real KM handshakes derive their KEK via 2048 PBKDF2-HMAC-SHA1 iterations   \
-                  (per the SRT spec) on each side under Miri, which dominates this job's     \
-                  time; the MSS arithmetic is unrelated to PBKDF2. Run in the               \
-                  miri-extended scheduled job."
+        miri,
+        ignore = "eight real KM handshakes, each deriving its KEK via 2048 PBKDF2-HMAC-SHA1  \
+                  iterations per side (per the SRT spec): about 75 minutes under Miri. The   \
+                  MSS arithmetic is unrelated to PBKDF2, and the other KM handshake tests    \
+                  cover the same code under Miri, so the miri-extended job skips it too."
     )]
     fn the_mss_floor_leaves_room_for_the_gcm_tag_on_both_families() {
         let options = |socket_id: u32, cipher_mode: CipherMode| ConnectionOptions {
