@@ -80,7 +80,7 @@ jobs:
     # ignore = ...)]`-marked, since that scale is already proven by the
     # default `cargo test` run and would otherwise dominate this job's time as
     # the test suite grows -- run those under Miri too, at full scale, in the
-    # weekly/dispatch-triggered `miri-extended` leg below instead of on every
+    # weekly/dispatch-triggered `miri-extended` job below instead of on every
     # push.
     timeout-minutes: 45
     steps:
@@ -88,14 +88,39 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: rustup toolchain install nightly --profile minimal --component miri,rust-src
       - run: cargo +nightly miri setup
-      - name: Miri test (fast set on every push/PR; full set on schedule/dispatch)
-        run: |
-          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "miri-extended: running the full tail-recovery test scale too"
-            cargo +nightly miri test -p srt-proto --features miri-extended srt_connection::tests
-          else
-            cargo +nightly miri test -p srt-proto srt_connection::tests
-          fi
+      - name: Miri test (fast set)
+        run: cargo +nightly miri test -p srt-proto srt_connection::tests
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows
+
+  miri-extended:
+    name: Miri extended (${{ matrix.partition }}/3)
+    needs: quality
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    # Miri runs one test at a time, and the extended set (mostly KM
+    # handshakes' PBKDF2) outgrew one 45-minute job: every scheduled run was
+    # cancelled from 2026-10-05 on. It runs as parallel nextest processes
+    # split across three jobs instead. On hosted runners the partitions took
+    # 5, 5 and 21 minutes of test time (run 41571914552); the budget is about
+    # twice the slowest.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - run: rustup toolchain install nightly --profile minimal --component miri,rust-src
+      - run: cargo +nightly miri setup
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Miri test (full tail-recovery and handshake scale)
+        run: >-
+          cargo +nightly miri nextest run -p srt-proto --features miri-extended
+          --no-fail-fast --partition hash:${{ matrix.partition }}/3 srt_connection::tests
         env:
           MIRIFLAGS: -Zmiri-tree-borrows
 
