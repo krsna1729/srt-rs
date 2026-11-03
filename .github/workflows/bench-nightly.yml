@@ -31,6 +31,8 @@ jobs:
     # whole job (and all its output) being killed by this ceiling.
     timeout-minutes: 360
     steps:
+      # Exploration below gets whatever the job has left; it measures from here.
+      - run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p srt-bench
@@ -65,35 +67,53 @@ jobs:
             ./target/release/srt-bench matrix --plan "$plan" --reps 1 --out nightly.tsv
             echo "::endgroup::"
           done
-      # The real nightly sweep: full throughput-matrix.plan (768 cells,
-      # documented), not axis-trimmed -- budgeted 5h leaving 1h margin in
-      # the 6h ceiling for setup and the report/upload steps. `timeout`
-      # exit 124 is the EXPECTED time-box outcome, not a failure: whatever
-      # is in nightly.tsv by then is still a real, useful partial data
-      # point, appended to (not overwritten by) the small plans above. Any
-      # other non-zero status is a crash and fails the job. A partial
-      # campaign keeps its artifact but must not update trend charts (only
-      # complete comparable campaigns chart).
-      - name: Run throughput-matrix.plan (time-boxed)
+      # The charted trend: docs/plans/throughput-trend.plan, a fixed 48-cell
+      # subset of the sweep below sized to finish every night (about 30-45
+      # minutes). It has no time box: a chart point is always the same cells
+      # measured to completion, and any non-zero status fails the job.
+      - name: Run throughput-trend.plan (charted)
+        id: trend
+        run: ./target/release/srt-bench matrix --plan docs/plans/throughput-trend.plan --reps 1 --out trend.tsv
+      # Exploration: full throughput-matrix.plan (768 cells, documented), not
+      # axis-trimmed. It gets the job time left, minus 20 minutes for the
+      # report/chart/upload steps, and has not finished in 5h (about 510
+      # cells in 2026-10), so it never feeds the chart. `timeout` exit 124 is
+      # the EXPECTED time-box outcome, not a failure: whatever is in
+      # nightly.tsv by then is still a real, useful partial data point,
+      # appended to (not overwritten by) the small plans above. Any other
+      # non-zero status is a crash and fails the job.
+      - name: Run throughput-matrix.plan (time-boxed, remaining budget)
         id: sweep
         run: |
+          budget=$(( JOB_START + 340 * 60 - $(date +%s) ))
+          echo "budget=${budget}s"
+          if [ "$budget" -lt 600 ]; then
+            echo "partial=true" >> "$GITHUB_OUTPUT"
+            echo "SKIPPED: under 10 minutes left for the sweep."
+            exit 0
+          fi
           # NB: `status=0; ... || status=$?` instead of running timeout bare:
           # GitHub executes `run:` steps under `bash -e`, so a bare failing
           # command would kill the script before `status=$?` is reached.
           status=0
-          timeout 5h ./target/release/srt-bench matrix --plan docs/plans/throughput-matrix.plan \
+          timeout "${budget}s" ./target/release/srt-bench matrix --plan docs/plans/throughput-matrix.plan \
             --reps 1 --out nightly.tsv || status=$?
           if [ $status -eq 124 ]; then
             echo "partial=true" >> "$GITHUB_OUTPUT"
-            echo "TIME-BOXED: sweep hit the 5h budget; nightly.tsv is partial data."
+            echo "TIME-BOXED: sweep hit its ${budget}s budget; nightly.tsv is partial data."
           elif [ $status -ne 0 ]; then
             exit $status
           fi
       - name: Report
         if: always()
         run: |
-          if [ "${{ steps.sweep.outputs.partial }}" = "true" ]; then echo "## status: PARTIAL (time-boxed, not a complete campaign)"; echo; fi
-          echo "## rows so far: $(($(wc -l < nightly.tsv) - 1))"
+          if [ -f trend.tsv ]; then
+            echo "## trend (throughput-trend.plan): median by runtime"
+            ./target/release/srt-bench report trend.tsv --by runtime
+            echo
+          fi
+          if [ "${{ steps.sweep.outputs.partial }}" = "true" ]; then echo "## sweep status: PARTIAL (time-boxed, not a complete campaign)"; echo; fi
+          echo "## sweep rows so far: $(($(wc -l < nightly.tsv) - 1))"
           echo
           echo "## median by runtime"
           ./target/release/srt-bench report nightly.tsv --by runtime
@@ -104,9 +124,9 @@ jobs:
           echo "## median by encryption"
           ./target/release/srt-bench report nightly.tsv --by encryption
           echo
-          echo "## cells that did not fully establish"
+          echo "## cells that did not fully establish (sweep and trend)"
           awk -F'\t' '
-            NR==1 { for (i=1;i<=NF;i++) h[$i]=i; next }
+            FNR==1 { for (i=1;i<=NF;i++) h[$i]=i; next }
             {
               # A bonded listener admits one logical stream per group, so its
               # expected count is logical_streams; callers count physical legs.
@@ -117,26 +137,31 @@ jobs:
               n++
             }
             END { if (!n) print "(none)" }
-          ' nightly.tsv
+          ' nightly.tsv $(ls trend.tsv 2>/dev/null)
       - name: Convert to benchmark-action JSON
-        if: always()
-        run: ./target/release/srt-bench report nightly.tsv --format github-benchmark --out nightly-benchmark.json
+        if: always() && steps.trend.outcome == 'success'
+        run: ./target/release/srt-bench report trend.tsv --format github-benchmark --out nightly-benchmark.json
       - name: Update GitHub Pages trend chart
-        # Partial (time-boxed) campaigns keep their TSV artifact above but
-        # never move the trend: the chart compares complete campaigns only.
-        if: always() && steps.sweep.outcome == 'success' && steps.sweep.outputs.partial != 'true'
+        # Only the fixed trend plan charts: every point is the same 48 cells
+        # measured to completion. The time-boxed sweep keeps its TSV
+        # artifact but never moves the trend.
+        if: always() && steps.trend.outcome == 'success'
         uses: benchmark-action/github-action-benchmark@v1.22.2
         with:
           tool: "customBiggerIsBetter"
           output-file-path: nightly-benchmark.json
           gh-pages-branch: gh-pages
-          benchmark-data-dir-path: dev/bench-nightly
+          # A fresh series: dev/bench-nightly holds 2026-10 points measured on
+          # throughput-matrix.plan, a different cell set from this plan.
+          benchmark-data-dir-path: dev/bench-nightly-trend
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auto-push: true
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: bench-nightly-tsv-${{ github.run_id }}
-          path: nightly.tsv
+          path: |
+            nightly.tsv
+            trend.tsv
           if-no-files-found: error
           retention-days: 90

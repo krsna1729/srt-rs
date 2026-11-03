@@ -1,0 +1,30 @@
+# Fixed throughput trend: the cells Bench nightly and Bench weekly chart.
+# A trend point is only comparable when every run measures the same cells to
+# completion, so this plan is small enough to always finish (about 30-45
+# minutes on a hosted runner) and spreads over the axes of
+# throughput-matrix.plan with the same fixed baseline. That plan stays the
+# time-boxed exploration sweep; its partial runs never move the trend.
+#
+# 3 runtimes x 2 ingress x 2 encryption x 2 connections x 2 bitrates
+# = 48 cells.
+#
+#   srt-bench matrix --plan docs/plans/throughput-trend.plan \
+#     --reps 1 --out scratch/trend.tsv
+
+runtime             = mio,tokio,compio
+ingress             = per-port,reuseport-multi:4
+egress              = per-connection
+encryption          = plain,128
+connections         = 200,1200
+# Source payload rate; pacing is set relative to it, as in
+# throughput-matrix.plan.
+bitrate             = 1000000,4000000
+srt-bandwidth       = input-relative:25
+
+# Baseline controls, identical to throughput-matrix.plan.
+promotion           = all
+cookie-routing      = on
+batch               = on
+sock-buf            = 16m
+bond                = none
+connect-concurrency = 50

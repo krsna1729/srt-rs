@@ -23,6 +23,8 @@ jobs:
       contents: write
     timeout-minutes: 360
     steps:
+      # The slice below gets whatever the job has left; it measures from here.
+      - run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p srt-bench
@@ -33,29 +35,18 @@ jobs:
             ./target/release/srt-bench matrix --plan "$plan" --reps 3 --out weekly.tsv
             echo "::endgroup::"
           done
-      # Same fixed plan, same reps, every week -> the one part of this
-      # workflow meant for trend comparison across weeks, not just this
-      # week's snapshot.
-      - name: Run throughput-matrix.plan in full (time-boxed, 3h budget)
-        id: sweep-throughput
-        run: |
-          # NB: `status=0; ... || status=$?` — GitHub runs steps under
-          # `bash -e`, so a bare failing command would kill the script
-          # before a later `status=$?` is reached.
-          status=0
-          timeout 3h ./target/release/srt-bench matrix --plan docs/plans/throughput-matrix.plan \
-            --reps 1 --out throughput.tsv || status=$?
-          if [ $status -eq 124 ]; then
-            echo "partial=true" >> "$GITHUB_OUTPUT"
-            echo "TIME-BOXED: throughput sweep hit the 3h budget; throughput.tsv is partial data."
-          elif [ $status -ne 0 ]; then
-            exit $status
-          fi
+      # The charted series: the fixed throughput-trend.plan cells with 3 reps,
+      # steadier than nightly's single rep. It has no time box: every point is
+      # the same cells measured to completion, and any non-zero status fails
+      # the job. The full throughput-matrix.plan runs nightly as exploration.
+      - name: Run throughput-trend.plan (charted, 3 reps)
+        id: trend
+        run: ./target/release/srt-bench matrix --plan docs/plans/throughput-trend.plan --reps 3 --out trend.tsv
       # full-matrix.plan is the exhaustive investigation tool (raw product
       # 4,423,680; see the enumeration pin test for the current kept count),
-      # not something any realistic budget finishes in one pass. Given the
-      # remaining ~2h30m, treat it as a slowly-rotating exploration instead
-      # of a trend series: seed by ISO
+      # not something any realistic budget finishes in one pass. It gets the
+      # job time left, minus 20 minutes for the report/chart/upload steps, as
+      # a slowly-rotating exploration instead of a trend series: seed by ISO
       # week number so consecutive weeks sample different regions
       # (`--order interleaved` already rotates the broad axes within one
       # run so even a partial slice stays broadly representative).
@@ -63,9 +54,18 @@ jobs:
         id: sweep-slice
         run: |
           week_seed=$(date +%V)
-          echo "seed=$week_seed"
+          budget=$(( JOB_START + 340 * 60 - $(date +%s) ))
+          echo "seed=$week_seed budget=${budget}s"
+          if [ "$budget" -lt 600 ]; then
+            echo "partial=true" >> "$GITHUB_OUTPUT"
+            echo "SKIPPED: under 10 minutes left for the slice."
+            exit 0
+          fi
+          # NB: `status=0; ... || status=$?` — GitHub runs steps under
+          # `bash -e`, so a bare failing command would kill the script
+          # before a later `status=$?` is reached.
           status=0
-          timeout 150m ./target/release/srt-bench matrix --plan docs/plans/full-matrix.plan \
+          timeout "${budget}s" ./target/release/srt-bench matrix --plan docs/plans/full-matrix.plan \
             --order interleaved --seed "$week_seed" --reps 1 --out full-matrix-slice.tsv || status=$?
           if [ $status -eq 124 ]; then
             echo "partial=true" >> "$GITHUB_OUTPUT"
@@ -76,19 +76,19 @@ jobs:
       - name: Report
         if: always()
         run: |
-          echo "## throughput-matrix.plan: median by runtime"
-          ./target/release/srt-bench report throughput.tsv --by runtime 2>/dev/null || echo "(no data)"
+          echo "## throughput-trend.plan: median by runtime"
+          ./target/release/srt-bench report trend.tsv --by runtime 2>/dev/null || echo "(no data)"
           echo
-          echo "## throughput-matrix.plan: median by ingress,egress"
-          ./target/release/srt-bench report throughput.tsv --by ingress,egress 2>/dev/null || echo "(no data)"
+          echo "## throughput-trend.plan: median by ingress,egress"
+          ./target/release/srt-bench report trend.tsv --by ingress,egress 2>/dev/null || echo "(no data)"
           echo
-          echo "## throughput-matrix.plan: median by encryption"
-          ./target/release/srt-bench report throughput.tsv --by encryption 2>/dev/null || echo "(no data)"
+          echo "## throughput-trend.plan: median by encryption"
+          ./target/release/srt-bench report trend.tsv --by encryption 2>/dev/null || echo "(no data)"
           echo
           echo "## full-matrix.plan slice: rows covered this week: $(($(wc -l < full-matrix-slice.tsv 2>/dev/null || echo 1) - 1))"
           echo
           echo "## cells that did not fully establish"
-          for f in weekly.tsv throughput.tsv full-matrix-slice.tsv; do
+          for f in weekly.tsv trend.tsv full-matrix-slice.tsv; do
             [ -f "$f" ] || continue
             awk -F'\t' -v src="$f" '
               NR==1 { for (i=1;i<=NF;i++) h[$i]=i; next }
@@ -104,25 +104,23 @@ jobs:
               END { if (!n) print src ": (none)" }
             ' "$f"
           done
-      # throughput.tsv specifically -- same plan and reps every week, the
-      # one file here meant for week-over-week comparison. weekly.tsv and
-      # full-matrix-slice.tsv don't cover the same cells run to run
-      # (different reps / a rotating seed), so charting them wouldn't be
+      # trend.tsv specifically -- the same plan and reps every week, run to
+      # completion, the one file here meant for week-over-week comparison.
+      # weekly.tsv and full-matrix-slice.tsv don't cover the same cells run to
+      # run (a rotating seed, a time box), so charting them wouldn't be
       # comparing like with like.
       - name: Convert to benchmark-action JSON
-        if: always()
-        run: ./target/release/srt-bench report throughput.tsv --format github-benchmark --out weekly-benchmark.json
+        if: always() && steps.trend.outcome == 'success'
+        run: ./target/release/srt-bench report trend.tsv --format github-benchmark --out weekly-benchmark.json
       - name: Update GitHub Pages trend chart
-        # throughput.tsv specifically is the week-over-week comparable series:
-        # a partial (time-boxed) campaign keeps its artifact but never moves
-        # the trend.
-        if: always() && steps.sweep-throughput.outcome == 'success' && steps.sweep-throughput.outputs.partial != 'true'
+        if: always() && steps.trend.outcome == 'success'
         uses: benchmark-action/github-action-benchmark@v1.22.2
         with:
           tool: "customBiggerIsBetter"
           output-file-path: weekly-benchmark.json
           gh-pages-branch: gh-pages
-          benchmark-data-dir-path: dev/bench-weekly
+          # Paired with the nightly's dev/bench-nightly-trend series.
+          benchmark-data-dir-path: dev/bench-weekly-trend
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auto-push: true
       - uses: actions/upload-artifact@v7
@@ -131,7 +129,7 @@ jobs:
           name: bench-weekly-tsv-${{ github.run_id }}
           path: |
             weekly.tsv
-            throughput.tsv
+            trend.tsv
             full-matrix-slice.tsv
           if-no-files-found: warn
           retention-days: 90
