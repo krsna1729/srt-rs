@@ -636,7 +636,7 @@ fn send_to_libsrt_listener_with_on_connect(
             ));
         }
         if listener.cipher_mode == CipherMode::Gcm {
-            input_uri.push_str("&cryptomode=aes-gcm");
+            input_uri.push_str("&cryptomode=2");
         }
         if let Some(stream_id) = listener.stream_id {
             input_uri.push_str(&format!("&streamid={stream_id}"));
@@ -1827,7 +1827,7 @@ fn libsrt_gcm_caller_sends_to_rust_listener() {
         Some(("interop-passphrase", KeyLength::Aes128)),
         Some(("interop-passphrase", KeyLength::Aes128)),
         None,
-        Some("cryptomode=aes-gcm"),
+        Some("cryptomode=2"),
     );
     assert!(
         result.connected,
