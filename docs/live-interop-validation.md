@@ -232,6 +232,17 @@ when they have installed a capable library.
    make libsrt's process-global initialization and teardown independent. The
    interop binary therefore serializes only its real-libsrt cases; ordinary
    unit, property, and loom tests remain parallel.
+4. **Robotweax 0.3.2 as a second reference**: the same suite runs against
+   Robotweax's `srt-live-transmit` build (version-bound to Haivision 1.5.7
+   sources) by putting it first on `PATH`. Every Rust-caller direction
+   passes, including GCM, loss recovery, and key refresh, as do the native
+   Owner caller and Robotweax's plaintext caller. Its encrypted callers do
+   not: right after connecting, Robotweax sends a fresh KMREQ for the
+   *current* key index with a new salt and SEK. This receiver accepts only
+   the next key generation and fails closed on a same-index rekey, so
+   Robotweax never begins sending data. Haivision does not send this
+   message. Accepting it would weaken replay protection; this remains an
+   open compatibility difference, not a passing result.
 
 The automated suite is the reproducible form of the manual results. On a
 developer machine without the optional tools and development library, the
