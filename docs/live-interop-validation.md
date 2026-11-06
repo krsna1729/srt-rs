@@ -237,12 +237,14 @@ when they have installed a capable library.
    sources) by putting it first on `PATH`. Every Rust-caller direction
    passes, including GCM, loss recovery, and key refresh, as do the native
    Owner caller and Robotweax's plaintext caller. Its encrypted callers do
-   not: right after connecting, Robotweax sends a fresh KMREQ for the
-   *current* key index with a new salt and SEK. This receiver accepts only
-   the next key generation and fails closed on a same-index rekey, so
-   Robotweax never begins sending data. Haivision does not send this
-   message. Accepting it would weaken replay protection; this remains an
-   open compatibility difference, not a passing result.
+   not. Right after connecting, Robotweax was observed to send a fresh KMREQ
+   for the *current* key index with a new salt and SEK. This receiver accepts
+   only the next key generation and fails closed on a same-index rekey, so
+   Robotweax never begins sending data. Haivision does not send this message.
+   The cause is not established: Robotweax may be rejecting this receiver's
+   handshake KMRSP and re-keying. Accepting a same-index rekey would weaken
+   replay protection. This remains an open compatibility difference, not a
+   passing result.
 
 The automated suite is the reproducible form of the manual results. On a
 developer machine without the optional tools and development library, the
