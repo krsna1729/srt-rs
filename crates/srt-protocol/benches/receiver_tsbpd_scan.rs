@@ -74,5 +74,34 @@ fn bench_buffered_tsbpd(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_buffered_tsbpd);
+/// Repeated rejected DATA still asks whether retained data is deliverable.
+/// Keep an unchanged descending-timestamp window outside the timed loop.
+fn bench_blocked_head(c: &mut Criterion) {
+    let mut group = c.benchmark_group("receiver_tsbpd_blocked_head");
+    group.sample_size(30);
+    for window in [8192, 65_536] {
+        let mut receiver =
+            ReceiverBuffer::with_buffer_size(0, 120, Timestamp::default(), 0, window);
+        for sequence in 0..window {
+            receiver.receive(
+                DataPacket::new(
+                    sequence,
+                    sequence,
+                    100_000_000 - sequence,
+                    1,
+                    bytes::Bytes::from_static(b"x"),
+                ),
+                Timestamp::from_micros(1),
+            );
+        }
+        assert_eq!(receiver.stats().packets_in_buffer, window);
+        assert!(receiver.pop_ready(Timestamp::from_micros(2)).is_none());
+        group.bench_function(window.to_string(), |b| {
+            b.iter(|| black_box(receiver.pop_ready(black_box(Timestamp::from_micros(2)))));
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_buffered_tsbpd, bench_blocked_head);
 criterion_main!(benches);

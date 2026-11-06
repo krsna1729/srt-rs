@@ -986,35 +986,16 @@ pub struct DropRangeSummary {
     pub losses_removed: u32,
 }
 
-/// Whether retained packets' delivery times never decrease in circular
-/// sequence order from the oldest retained packet. When they do not, the
-/// oldest packet is also the earliest due, so a not-deliverable oldest packet
-/// means nothing is deliverable and the full candidate scan is skipped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeliveryOrder {
-    Ordered,
-    /// Not known; the next not-deliverable pop walks the window to find out.
-    Unknown,
-    /// This packet was due after its circular successor when last checked;
-    /// rechecked in O(1) before walking again.
-    DescentAfter(u32),
-}
-
 /// Receive buffer.
 #[derive(Debug)]
 pub struct ReceiverBuffer {
     /// Received packets in an adaptive sparse/dense packet window.
     packets: AdaptiveReceiverPacketWindow<ReceivedPacket, 8>,
 
-    delivery_seq_hint: Option<u32>,
-
     /// Circularly oldest packet still retained locally. Unlike
     /// `expected_seq`, this does not advance until TSBPD delivery or an
     /// explicit drop retires the packet, so it anchors alias-free live span.
     oldest_retained_seq: Option<u32>,
-
-    /// Kept across inserts, re-derived on demand; see [`DeliveryOrder`].
-    delivery_order: DeliveryOrder,
 
     /// The next expected sequence number.
     expected_seq: u32,
@@ -1150,7 +1131,7 @@ pub struct ReceiverBuffer {
     link_capacity_estimator: LinkCapacityEstimator,
 
     #[cfg(test)]
-    delivery_scan_calls: Cell<usize>,
+    delivery_time_checks: Cell<usize>,
 
     #[cfg(test)]
     receive_expected_sequence_scans: Cell<usize>,
@@ -1196,9 +1177,7 @@ impl ReceiverBuffer {
         let max_buffer_size = max_buffer_size.clamp(1, MAX_FLOW_WINDOW);
         Self {
             packets: AdaptiveReceiverPacketWindow::new(max_buffer_size, 4),
-            delivery_seq_hint: None,
             oldest_retained_seq: None,
-            delivery_order: DeliveryOrder::Ordered,
             expected_seq: initial_seq,
             loss_detection_frontier: initial_seq.wrapping_sub(1) & 0x7FFF_FFFF,
             last_advertised_buffer: 0,
@@ -1241,7 +1220,7 @@ impl ReceiverBuffer {
             rate_estimator: ReceivingRateEstimator::new(start_time),
             link_capacity_estimator: LinkCapacityEstimator::new(),
             #[cfg(test)]
-            delivery_scan_calls: Cell::new(0),
+            delivery_time_checks: Cell::new(0),
             #[cfg(test)]
             receive_expected_sequence_scans: Cell::new(0),
             #[cfg(test)]
@@ -1252,7 +1231,6 @@ impl ReceiverBuffer {
     /// Enable/disable TSBPD.
     pub fn set_tsbpd_enabled(&mut self, enabled: bool) {
         self.tsbpd_enabled = enabled;
-        self.delivery_order = DeliveryOrder::Unknown;
     }
 
     /// Set per-connection ACK coalesce knobs. Values are clamped to
@@ -1466,7 +1444,6 @@ impl ReceiverBuffer {
             let ts = packet_timestamp as u64;
             if ts >= WRAPPING_PERIOD_START && !self.wrapping_period_active {
                 self.wrapping_period_active = true;
-                self.delivery_order = DeliveryOrder::Unknown;
             }
         }
     }
@@ -1541,7 +1518,6 @@ impl ReceiverBuffer {
     }
 
     fn insert_retained_packet(&mut self, seq: u32, packet: ReceivedPacket) {
-        self.track_delivery_order(seq, &packet);
         let replaced = self
             .packets
             .insert(seq, packet)
@@ -1550,109 +1526,19 @@ impl ReceiverBuffer {
             replaced.is_none(),
             "duplicate packet passed receive preflight"
         );
-        debug_assert_eq!(self.oldest_retained_seq, self.delivery_seq_hint);
         if self
             .oldest_retained_seq
             .is_none_or(|oldest| sequence_less_than(seq, oldest))
         {
             self.oldest_retained_seq = Some(seq);
-            self.delivery_seq_hint = Some(seq);
         }
-    }
-
-    /// Keep `delivery_order` across inserting `seq`. Proven only against the
-    /// packets right before and after it; an insert after a gap it cannot see
-    /// across leaves the order unknown. Inserts never restore lost order.
-    fn track_delivery_order(&mut self, seq: u32, packet: &ReceivedPacket) {
-        if self.packets.is_empty() {
-            self.delivery_order = DeliveryOrder::Ordered;
-            return;
-        }
-        if self.delivery_order != DeliveryOrder::Ordered {
-            return;
-        }
-        let due = self.delivery_time(packet);
-        let after_previous = match self.packets.get(seq.wrapping_sub(1) & SEQUENCE_MASK) {
-            Some(previous) => self.delivery_time(previous) <= due,
-            None => self
-                .oldest_retained_seq
-                .is_some_and(|oldest| sequence_less_than(seq, oldest)),
-        };
-        // `receive` classified `seq` first: at the loss-detection frontier it
-        // is the newest sequence seen, so nothing retained comes after it and
-        // the append skips the wrap-around successor search.
-        let before_next = seq == self.loss_detection_frontier
-            || self
-                .retained_successor(seq)
-                .is_none_or(|next| due <= self.delivery_time(next));
-        if !(after_previous && before_next) {
-            self.delivery_order = DeliveryOrder::Unknown;
-        }
-    }
-
-    /// The retained packet circularly right after `seq`, if any (not the
-    /// wrap back to the oldest when `seq` is the newest).
-    fn retained_successor(&self, seq: u32) -> Option<&ReceivedPacket> {
-        self.packets
-            .successor_after(seq)
-            .filter(|&next| sequence_less_than(seq, next))
-            .and_then(|next| self.packets.get(next))
-    }
-
-    /// Whether `delivery_order` holds, re-deriving it unless a recorded
-    /// descent is still there.
-    fn delivery_order_holds(&mut self) -> bool {
-        match self.delivery_order {
-            DeliveryOrder::Ordered => return true,
-            DeliveryOrder::DescentAfter(seq) if self.descends_after(seq) => return false,
-            DeliveryOrder::DescentAfter(_) | DeliveryOrder::Unknown => {}
-        }
-        self.delivery_order = self.derive_delivery_order();
-        self.delivery_order == DeliveryOrder::Ordered
-    }
-
-    fn descends_after(&self, seq: u32) -> bool {
-        self.packets.get(seq).is_some_and(|entry| {
-            self.retained_successor(seq)
-                .is_some_and(|next| self.delivery_time(next) < self.delivery_time(entry))
-        })
-    }
-
-    /// Walk the retained packets in circular order from the oldest and stop
-    /// at the first one due before its predecessor.
-    fn derive_delivery_order(&self) -> DeliveryOrder {
-        let Some(mut seq) = self.oldest_retained_seq else {
-            return DeliveryOrder::Ordered;
-        };
-        let Some(mut due) = self.packets.get(seq).map(|entry| self.delivery_time(entry)) else {
-            return DeliveryOrder::Unknown;
-        };
-        for _ in 1..self.packets.len() {
-            let Some(next) = self.packets.successor_after(seq) else {
-                break;
-            };
-            let Some(next_due) = self
-                .packets
-                .get(next)
-                .map(|entry| self.delivery_time(entry))
-            else {
-                break;
-            };
-            if next_due < due {
-                return DeliveryOrder::DescentAfter(seq);
-            }
-            (seq, due) = (next, next_due);
-        }
-        DeliveryOrder::Ordered
     }
 
     fn remove_retained_packet(&mut self, seq: u32) -> Option<ReceivedPacket> {
         let packet = self.packets.remove(seq)?;
-        debug_assert_eq!(self.oldest_retained_seq, self.delivery_seq_hint);
         if self.oldest_retained_seq == Some(seq) {
             let next = self.next_sequence_after(seq);
             self.oldest_retained_seq = next;
-            self.delivery_seq_hint = next;
         }
         Some(packet)
     }
@@ -1684,6 +1570,9 @@ impl ReceiverBuffer {
     }
 
     fn delivery_time(&self, entry: &ReceivedPacket) -> Timestamp {
+        #[cfg(test)]
+        self.delivery_time_checks
+            .set(self.delivery_time_checks.get().saturating_add(1));
         if !self.tsbpd_enabled {
             return entry.recv_time;
         }
@@ -1761,7 +1650,6 @@ impl ReceiverBuffer {
             if (WRAPPING_PERIOD_END_MIN..=WRAPPING_PERIOD_END_MAX).contains(&ts) {
                 self.tsbpd_time_base += MAX_TIMESTAMP + 1;
                 self.wrapping_period_active = false;
-                self.delivery_order = DeliveryOrder::Unknown;
             }
         }
 
@@ -1783,71 +1671,21 @@ impl ReceiverBuffer {
 
     /// Find the deliverable sequence number.
     ///
-    /// 31-bit sequence numbers use circular order with wrap at 0x7FFF_FFFF.
-    /// SRT spec says TSBPD delivers "in order, but based on timestamps" --
-    /// delivery must follow circular order, not numeric.
-    ///
-    /// If the circular minimum packet is deliverable, return it directly.
-    /// If it is not, and delivery times are known to follow sequence order
-    /// ([`DeliveryOrder`]), nothing else is deliverable either. Otherwise fall
-    /// back to a full candidate scan to preserve out-of-order timestamp
-    /// handling.
-    ///
-    /// `has_gap` uses the loss bitmap's bounded summary lookup -- "is there a
-    /// loss before seq" is equivalent to "is the circular minimum before
-    /// seq". This avoids scanning every loss for every packet candidate.
-    fn find_deliverable_seq(&mut self, now: Timestamp) -> Option<u32> {
-        let loss_list_min = self.loss_list.first();
-        // Fast path 1: hint is deliverable right now (no gap before it).
-        if let Some(seq) = self.delivery_seq_hint
-            && let Some(entry) = self.packets.get(seq)
-            && (!self.tsbpd_enabled || self.delivery_time(entry) <= now)
-            && !loss_list_min.is_some_and(|min| sequence_less_than(min, seq))
+    /// Live TSBPD preserves circular sequence order even when timestamps
+    /// decrease (SRT draft §7.1; libsrt v1.5.7 `CRcvBuffer::isRcvDataReady`).
+    /// A future head blocks later packets; searching for another due packet
+    /// both reorders the stream and lets one DATA force a window-sized scan.
+    fn find_deliverable_seq(&self, now: Timestamp) -> Option<u32> {
+        let sequence = self.oldest_retained_seq?;
+        if self
+            .loss_list
+            .first()
+            .is_some_and(|loss| sequence_less_than(loss, sequence))
         {
-            return Some(seq);
-        }
-
-        // The retained hint gives the loss-recovery steady state an O(1)
-        // oldest-packet lookup. Across sequence wrap, fall back to the full
-        // circular comparison below.
-        if let (Some(min), Some(oldest)) = (loss_list_min, self.oldest_retained_seq)
-            && !sequence_less_than(min, oldest)
-            && oldest >= self.expected_seq
-            && let Some(entry) = self.packets.get(oldest)
-        {
-            if !self.tsbpd_enabled || self.delivery_time(entry) <= now {
-                return Some(oldest);
-            }
             return None;
         }
-
-        if self.delivery_order_holds() {
-            return None;
-        }
-        self.scan_deliverable_seq(now)
-    }
-
-    /// The circularly earliest packet that is due with no loss before it:
-    /// the answer `find_deliverable_seq` shortcuts.
-    fn scan_deliverable_seq(&self, now: Timestamp) -> Option<u32> {
-        #[cfg(test)]
-        self.delivery_scan_calls
-            .set(self.delivery_scan_calls.get().saturating_add(1));
-
-        let loss_list_min = self.loss_list.first();
-        let mut best: Option<u32> = None;
-        for (seq, entry) in self.packets.iter() {
-            let time_ok = !self.tsbpd_enabled || self.delivery_time(entry) <= now;
-            let has_gap = loss_list_min.is_some_and(|min| sequence_less_than(min, seq));
-            if time_ok && !has_gap {
-                // Keep the circularly earlier of best and seq.
-                best = match best {
-                    Some(b) if sequence_less_than(b, seq) => Some(b),
-                    _ => Some(seq),
-                };
-            }
-        }
-        best
+        let entry = self.packets.get(sequence)?;
+        (!self.tsbpd_enabled || self.delivery_time(entry) <= now).then_some(sequence)
     }
 
     /// Return the nearest buffered sequence strictly after `sequence_number`
@@ -1858,7 +1696,6 @@ impl ReceiverBuffer {
 
     fn refresh_retained_hints(&mut self) {
         let oldest = self.packets.first_from(self.expected_seq);
-        self.delivery_seq_hint = oldest;
         self.oldest_retained_seq = oldest;
     }
 
@@ -1887,8 +1724,8 @@ impl ReceiverBuffer {
         self.packets.heap_bytes()
     }
     #[cfg(test)]
-    fn delivery_scan_calls(&self) -> usize {
-        self.delivery_scan_calls.get()
+    pub(crate) fn delivery_time_checks(&self) -> usize {
+        self.delivery_time_checks.get()
     }
 
     #[cfg(test)]
@@ -1984,8 +1821,8 @@ impl ReceiverBuffer {
         self.packets.is_empty()
     }
 
-    /// The earliest TSBPD delivery deadline among packets still held, if
-    /// any.
+    /// The next pending delivery deadline in circular sequence order, if any.
+    /// A later packet's earlier timestamp cannot bypass this head.
     ///
     /// This buffer stores individually retained packets and message
     /// fragments, not necessarily complete messages -- a returned deadline
@@ -2000,10 +1837,9 @@ impl ReceiverBuffer {
     /// incomplete tail that can never be delivered.
     #[must_use]
     pub fn earliest_pending_deadline(&self) -> Option<Timestamp> {
-        self.packets
-            .iter()
-            .map(|(_, entry)| self.delivery_time(entry))
-            .min()
+        self.oldest_retained_seq
+            .and_then(|sequence| self.packets.get(sequence))
+            .map(|entry| self.delivery_time(entry))
     }
 
     /// Whether the last periodic Full ACK advertised a full receive window
@@ -2349,7 +2185,6 @@ impl ReceiverBuffer {
         if oldest_was_dropped {
             let next = self.next_sequence_after(last_seq);
             self.oldest_retained_seq = next;
-            self.delivery_seq_hint = next;
         }
         packets_removed
     }
@@ -3815,24 +3650,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tsbpd_ready_search_is_not_repeated_for_the_buffered_window() {
-        let mut buf = ReceiverBuffer::new(0, 250, Timestamp::from_micros(0), 0);
-
-        for seq in 0..512u32 {
-            let now_us = (u64::from(seq) + 1) * 1_316;
-            let now = Timestamp::from_micros(now_us);
-            buf.receive(make_packet(seq, now_us as u32), now);
-            let _ = buf.pop_ready(now);
-        }
-
-        assert!(
-            buf.delivery_scan_calls() < 256,
-            "buffered TSBPD search scanned {} times",
-            buf.delivery_scan_calls()
-        );
-    }
-
-    #[test]
     fn test_in_order_receive_does_not_search_for_a_future_sequence() {
         let mut buf = ReceiverBuffer::new(0, 250, Timestamp::from_micros(0), 0);
 
@@ -3887,7 +3704,7 @@ mod tests {
     }
 
     #[test]
-    fn in_order_receive_and_pop_use_delivery_hint_without_map_scan() {
+    fn in_order_receive_and_pop_preserve_sequence_order() {
         let mut buf = ReceiverBuffer::new(0, 120, Timestamp::from_micros(0), 0);
         buf.set_tsbpd_enabled(false);
         let now = Timestamp::from_micros(1_000);
@@ -3901,8 +3718,6 @@ mod tests {
                 Some(seq)
             );
         }
-
-        assert_eq!(buf.delivery_scan_calls(), 0);
     }
 
     #[test]
@@ -3919,23 +3734,44 @@ mod tests {
     }
 
     #[test]
-    fn test_tsbpd_ready_search_falls_back_for_out_of_order_timestamps() {
+    fn tsbpd_head_blocks_later_packets_with_earlier_timestamps() {
         let mut buf = ReceiverBuffer::new(0, 120, Timestamp::from_micros(0), 0);
-        let received_at = Timestamp::from_micros(0);
-
-        buf.receive(make_packet(0, 1_000_000), received_at);
-        buf.receive(make_packet(1, 0), received_at);
-
+        buf.receive(make_packet(0, 1_000_000), Timestamp::from_micros(0));
+        buf.receive(make_packet(1, 0), Timestamp::from_micros(0));
+        assert!(buf.pop_ready(Timestamp::from_micros(200_000)).is_none());
         assert_eq!(
-            buf.pop_ready(Timestamp::from_micros(200_000))
-                .map(|packet| packet.sequence_number),
-            Some(1)
+            buf.earliest_pending_deadline(),
+            Some(Timestamp::from_micros(1_120_000))
         );
-        assert_eq!(
-            buf.pop_ready(Timestamp::from_micros(1_200_000))
-                .map(|packet| packet.sequence_number),
-            Some(0)
-        );
+        for sequence in [0, 1] {
+            assert_eq!(
+                buf.pop_ready(Timestamp::from_micros(1_120_000))
+                    .map(|packet| packet.sequence_number),
+                Some(sequence)
+            );
+        }
+    }
+
+    #[test]
+    fn tsbpd_future_head_readiness_work_does_not_scale_with_window() {
+        for window in [32, MAX_FLOW_WINDOW] {
+            let mut buf = ReceiverBuffer::with_buffer_size(0, 120, Timestamp::default(), 0, window);
+            for sequence in 0..window {
+                buf.receive(
+                    make_packet(sequence, 100_000_000 - sequence),
+                    Timestamp::from_micros(1),
+                );
+            }
+            assert_eq!(buf.stats().packets_in_buffer, window);
+            let before = buf.delivery_time_checks();
+            for _ in 0..64 {
+                assert!(buf.pop_ready(Timestamp::from_micros(2)).is_none());
+            }
+            assert!(
+                buf.delivery_time_checks() - before <= 64,
+                "each unsuccessful readiness check may inspect only the head"
+            );
+        }
     }
 
     #[test]
@@ -4923,18 +4759,15 @@ mod tests {
     }
 
     #[test]
-    fn drop_range_repairs_deleted_delivery_hint() {
+    fn drop_range_at_head_preserves_successor_delivery() {
         let now = Timestamp::from_micros(1_000);
         let mut buf = ReceiverBuffer::new(100, 120, Timestamp::from_micros(0), 0);
         buf.set_tsbpd_enabled(false);
         for seq in 100..103 {
             buf.receive(make_packet(seq, seq), now);
         }
-        assert_eq!(buf.delivery_seq_hint, Some(100));
 
         buf.drop_range(100, 100).expect("single-packet range");
-        assert_eq!(buf.delivery_seq_hint, Some(101));
-        let scans_before = buf.delivery_scan_calls();
         assert_eq!(
             buf.pop_ready(now).map(|packet| packet.sequence_number),
             Some(101)
@@ -4943,11 +4776,10 @@ mod tests {
             buf.pop_ready(now).map(|packet| packet.sequence_number),
             Some(102)
         );
-        assert_eq!(buf.delivery_scan_calls(), scans_before);
     }
 
     #[test]
-    fn wrapped_drop_range_repairs_hint_to_successor_after_range() {
+    fn wrapped_drop_range_preserves_successor_delivery() {
         const MAX_SEQUENCE: u32 = 0x7FFF_FFFF;
         let now = Timestamp::from_micros(1_000);
         let mut buf = ReceiverBuffer::new(MAX_SEQUENCE - 2, 120, Timestamp::from_micros(0), 0);
@@ -4955,15 +4787,12 @@ mod tests {
         for seq in [MAX_SEQUENCE - 2, MAX_SEQUENCE - 1, MAX_SEQUENCE, 0, 1, 2] {
             buf.receive(make_packet(seq, seq), now);
         }
-        assert_eq!(buf.delivery_seq_hint, Some(MAX_SEQUENCE - 2));
 
         let summary = buf
             .drop_range(MAX_SEQUENCE - 2, 0)
             .expect("bounded wrapped range");
         assert_eq!(summary.sequence_count, 4);
         assert_eq!(summary.packets_removed, 4);
-        assert_eq!(buf.delivery_seq_hint, Some(1));
-        let scans_before = buf.delivery_scan_calls();
         assert_eq!(
             buf.pop_ready(now).map(|packet| packet.sequence_number),
             Some(1)
@@ -4972,7 +4801,6 @@ mod tests {
             buf.pop_ready(now).map(|packet| packet.sequence_number),
             Some(2)
         );
-        assert_eq!(buf.delivery_scan_calls(), scans_before);
     }
 
     #[test]
@@ -4992,7 +4820,6 @@ mod tests {
         }
         assert_eq!(buf.packets.len(), RETAINED_PACKETS as usize);
         assert!(buf.packets.len() < buf.max_buffer_size as usize);
-        assert_eq!(buf.delivery_seq_hint, Some(0));
 
         let summary = buf
             .drop_range(DROPPED_SEQUENCE, DROPPED_SEQUENCE)
@@ -5002,7 +4829,6 @@ mod tests {
         assert_eq!(summary.losses_removed, 0);
         assert_eq!(buf.packets.len(), RETAINED_PACKETS as usize - 1);
         assert!(!buf.packets.contains_key(DROPPED_SEQUENCE));
-        assert_eq!(buf.delivery_seq_hint, Some(0));
     }
 
     #[test]
@@ -5041,7 +4867,6 @@ mod tests {
         assert!(buf.loss_list.is_empty());
         assert!(buf.packets.is_empty());
         assert_eq!(buf.loss_list.first(), None);
-        assert_eq!(buf.delivery_seq_hint, None);
         assert_eq!(buf.expected_sequence(), DEFAULT_FLOW_WINDOW);
     }
 
@@ -5063,102 +4888,57 @@ mod tests {
         assert_eq!(buf.expected_sequence(), 105);
     }
 
-    /// A connection drains after every DATA packet until `pop_ready` returns
-    /// `None`; with deadlines in sequence order that last call must not scan
-    /// the whole window.
     #[test]
-    fn in_order_stream_drained_per_packet_never_scans() {
-        let mut buf = ReceiverBuffer::new(0, 250, Timestamp::from_micros(0), 0);
-        let mut delivered = 0;
-        for seq in 0..1_000u32 {
-            let now_us = u64::from(seq) * 1_316;
-            let now = Timestamp::from_micros(now_us);
-            buf.receive(make_packet(seq, now_us as u32), now);
-            while buf.pop_ready(now).is_some() {
-                delivered += 1;
-            }
-        }
-        assert!(delivered > 800, "the stream flowed: {delivered} delivered");
-        assert_eq!(buf.delivery_scan_calls(), 0);
-    }
-
-    /// A retransmission due after the packet that follows it breaks the order
-    /// even when the order was just established: once it is the oldest, the
-    /// packet after it is due first and must still be found by the scan.
-    #[test]
-    fn a_hole_filled_late_with_a_later_deadline_is_not_taken_as_ordered() {
-        let mut buf = ReceiverBuffer::new(0, 100, Timestamp::from_micros(0), 0);
+    fn tsbpd_recovered_head_blocks_an_earlier_deadline() {
+        let mut buf = ReceiverBuffer::new(0, 100, Timestamp::default(), 0);
         let at = |ms: u64| Timestamp::from_micros(ms * 1_000);
         buf.receive(make_packet(0, 0), at(0));
         buf.receive(make_packet(2, 20_000), at(1));
-        // Nothing is due yet; this pop establishes the order 0 -> 2.
-        assert!(buf.pop_ready(at(50)).is_none());
-        buf.receive(make_packet(1, 30_000), at(60));
         assert_eq!(buf.pop_ready(at(100)).map(|p| p.sequence_number), Some(0));
-        assert_eq!(buf.pop_ready(at(125)).map(|p| p.sequence_number), Some(2));
-    }
-
-    #[derive(Debug, Clone)]
-    enum OrderStep {
-        Receive { offset: u32, jitter_ms: u32 },
-        Advance { ms: u32 },
-        Pop,
-    }
-
-    fn order_step() -> impl proptest::strategy::Strategy<Value = OrderStep> {
-        use proptest::prelude::*;
-        prop_oneof![
-            4 => (0..48u32, 0..40u32)
-                .prop_map(|(offset, jitter_ms)| OrderStep::Receive { offset, jitter_ms }),
-            2 => (0..60u32).prop_map(|ms| OrderStep::Advance { ms }),
-            3 => Just(OrderStep::Pop),
-        ]
+        assert!(buf.pop_ready(at(125)).is_none(), "the missing head blocks");
+        buf.receive(make_packet(1, 30_000), at(125));
+        assert!(
+            buf.pop_ready(at(125)).is_none(),
+            "the recovered head is not due"
+        );
+        for sequence in [1, 2] {
+            assert_eq!(
+                buf.pop_ready(at(130)).map(|packet| packet.sequence_number),
+                Some(sequence)
+            );
+        }
     }
 
     proptest::proptest! {
-        /// What the scan shortcut relies on: whenever delivery order holds
-        /// (kept across inserts or re-derived by the walk), the full scan's
-        /// answer is nothing or the oldest retained packet. Packets arrive in
-        /// order, out of order and after gaps, with timestamps 10 ms apart
-        /// plus up to 39 ms of jitter, so some are due before packets up to
-        /// three positions earlier.
         #[test]
-        fn delivery_order_means_only_the_oldest_can_be_due(
-            steps in proptest::collection::vec(order_step(), 1..200)
+        fn tsbpd_delivery_matches_a_sequence_ordered_queue(
+            initial in 0..=SEQUENCE_MASK,
+            timestamps in proptest::collection::vec(0..2_000_000u32, 1..64),
         ) {
-            let mut buf = ReceiverBuffer::new(0, 100, Timestamp::from_micros(0), 0);
-            let mut now_ms = 0u64;
-            for step in steps {
-                let now = Timestamp::from_micros(now_ms * 1_000);
-                match step {
-                    OrderStep::Receive { offset, jitter_ms } => {
-                        let seq = buf.expected_sequence() + offset;
-                        let ts_ms = u64::from(seq) * 10 + u64::from(jitter_ms);
-                        buf.receive(make_packet(seq, (ts_ms * 1_000) as u32), now);
+            let mut buf = ReceiverBuffer::new(initial, 120, Timestamp::default(), 0);
+            // Reverse arrival fills gaps, including across sequence wrap.
+            for offset in (0..timestamps.len()).rev() {
+                let sequence = initial.wrapping_add(offset as u32) & SEQUENCE_MASK;
+                buf.receive(make_packet(sequence, timestamps[offset]), Timestamp::default());
+            }
+            let mut times: Vec<u64> = timestamps.iter().map(|&ts| u64::from(ts) + 120_000).collect();
+            times.sort_unstable();
+            let mut head = 0;
+            for now in times {
+                loop {
+                    let expected = timestamps.get(head)
+                        .filter(|&&ts| u64::from(ts) + 120_000 <= now)
+                        .map(|_| initial.wrapping_add(head as u32) & SEQUENCE_MASK);
+                    let actual = buf.pop_ready(Timestamp::from_micros(now))
+                        .map(|packet| packet.sequence_number);
+                    proptest::prop_assert_eq!(actual, expected);
+                    if expected.is_none() {
+                        break;
                     }
-                    OrderStep::Advance { ms } => now_ms += u64::from(ms),
-                    OrderStep::Pop => {
-                        buf.pop_ready(now);
-                    }
-                }
-                // Now, and the last instant before the oldest packet is due:
-                // if order holds, nothing may be due there.
-                let just_before_oldest = buf
-                    .oldest_retained_seq
-                    .and_then(|seq| buf.packets.get(seq))
-                    .map(|oldest| buf.delivery_time(oldest).as_micros().saturating_sub(1));
-                let probes = [Some(now_ms * 1_000), just_before_oldest];
-                if buf.delivery_order_holds() {
-                    for at in probes.into_iter().flatten() {
-                        let scanned = buf.scan_deliverable_seq(Timestamp::from_micros(at));
-                        proptest::prop_assert!(
-                            scanned.is_none() || scanned == buf.oldest_retained_seq,
-                            "order holds but {scanned:?} is due at {at} before the oldest {:?}",
-                            buf.oldest_retained_seq
-                        );
-                    }
+                    head += 1;
                 }
             }
+            proptest::prop_assert_eq!(head, timestamps.len());
         }
     }
 }
