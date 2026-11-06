@@ -4513,6 +4513,7 @@ impl SrtConnection {
 
     fn send_induction_request(&mut self, now: Timestamp) {
         let mut hs = HandshakePacket::new_induction_request(self.options.socket_id);
+        hs.initial_packet_seq = self.initial_seq;
         hs.flow_window = self.flight_capacity_packets();
         let pkt = hs.encode(self.relative_timestamp(now), 0);
         self.queue_handshake_control_packet(pkt, now);
@@ -5430,6 +5431,68 @@ mod tests {
         assert!(error.reason.contains("version"));
         assert_eq!(caller.state(), ConnectionState::Disconnected);
         assert_eq!(caller.peer_socket_id(), 0);
+    }
+
+    #[test]
+    fn handshake_and_first_data_keep_the_same_initial_sequence() {
+        let next_wire = |conn: &mut SrtConnection| {
+            drain_outputs(conn)
+                .into_iter()
+                .find_map(|output| match output {
+                    ConnectionOutput::SendPacket(wire) => Some(wire),
+                    _ => None,
+                })
+                .expect("one protocol datagram")
+        };
+        let handshake_sequence = |wire: &[u8]| {
+            let SrtPacket::Control(packet) = SrtPacket::decode(wire).unwrap() else {
+                panic!("handshake control packet");
+            };
+            HandshakePacket::decode(&packet).unwrap().initial_packet_seq
+        };
+        for initial in [17, 0x7fff_fffe] {
+            let mut caller = SrtConnection::new_caller(ConnectionOptions {
+                socket_id: 1,
+                initial_seq: Some(initial),
+                ..Default::default()
+            });
+            let mut listener = SrtConnection::new_listener(ConnectionOptions {
+                socket_id: 2,
+                syn_cookie: Some(7),
+                ..Default::default()
+            });
+            caller.connect(Timestamp::default()).unwrap();
+            let induction = next_wire(&mut caller);
+            listener
+                .feed_recv_buf(&induction, Timestamp::from_micros(1))
+                .unwrap();
+            caller
+                .feed_recv_buf(&next_wire(&mut listener), Timestamp::from_micros(2))
+                .unwrap();
+            let conclusion = next_wire(&mut caller);
+            listener
+                .feed_recv_buf(&conclusion, Timestamp::from_micros(3))
+                .unwrap();
+            caller
+                .feed_recv_buf(&next_wire(&mut listener), Timestamp::from_micros(4))
+                .unwrap();
+            caller
+                .send(b"first", Timestamp::from_micros(10_000))
+                .unwrap();
+            let SrtPacket::Data(first) = SrtPacket::decode(&next_wire(&mut caller)).unwrap() else {
+                panic!("the first DATA packet");
+            };
+            // A cookie-based listener can bind the challenge to the INDUCTION
+            // ISN. Neither CONCLUSION nor the first DATA may change that value.
+            assert_eq!(
+                [
+                    handshake_sequence(&induction),
+                    handshake_sequence(&conclusion)
+                ],
+                [first.sequence_number; 2]
+            );
+            assert_eq!(first.sequence_number, initial);
+        }
     }
 
     /// Drive a full caller/listener handshake to `Connected` on both ends,
