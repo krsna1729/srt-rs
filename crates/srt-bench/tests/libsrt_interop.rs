@@ -444,6 +444,9 @@ fn receive_live_from_udp_source(
 
     let mut conn = SrtConnection::new_listener(ConnectionOptions {
         socket_id: 0x2000_0001,
+        // This standalone protocol fixture has no admission PeerTable to issue
+        // a cookie. Robotweax requires a nonzero challenge before CONCLUSION.
+        syn_cookie: Some(7),
         congestion_control: "live".to_string(),
         passphrase: listener_encryption.map(|(passphrase, _)| passphrase.to_string()),
         key_length: listener_encryption.map_or(KeyLength::Aes128, |(_, key_length)| key_length),
