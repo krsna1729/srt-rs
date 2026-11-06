@@ -10832,6 +10832,86 @@ mod tests {
         assert_peer_shutdown_terminal(&mut conn);
     }
 
+    #[test]
+    fn replayed_data_cannot_repeat_window_sized_delivery_work() {
+        let mut conn = tsbpd_listener(120, false, 32);
+        let now = Timestamp::from_micros(2_000);
+        let mut replay = Vec::new();
+        for sequence in 0..32 {
+            let packet = DataPacket::new(
+                sequence,
+                sequence,
+                100_000_000 - sequence,
+                conn.options.socket_id,
+                Bytes::from_static(b"retained"),
+            );
+            let mut wire = Vec::new();
+            packet.encode(&mut wire).expect("encode DATA");
+            conn.feed_recv_buf(&wire, now).expect("receive DATA");
+            if sequence == 0 {
+                replay = wire;
+            }
+        }
+        let checks = conn.receiver.as_ref().unwrap().delivery_time_checks();
+        for _ in 0..64 {
+            conn.feed_recv_buf(&replay, now)
+                .expect("receive duplicate DATA");
+        }
+        let receiver = conn.receiver.as_ref().unwrap();
+        assert!(receiver.delivery_time_checks() - checks <= 64);
+        assert_eq!(receiver.stats().packets_in_buffer, 32);
+        assert_eq!(receiver.stats().total_duplicates, 64);
+        assert_eq!(conn.pending_data_events, 0);
+
+        conn.handle_timer(TimerId::Ack, Timestamp::from_micros(100_120_000))
+            .expect("release the head and its successors");
+        for sequence in 0..32 {
+            assert!(matches!(
+                conn.poll_event(),
+                Some(ConnectionEvent::DataReceived { sequence_number, .. })
+                    if sequence_number == sequence
+            ));
+        }
+    }
+
+    #[test]
+    fn peer_shutdown_waits_for_the_sequence_head_not_the_minimum_timestamp() {
+        let mut conn = tsbpd_listener(8_000, false, 8);
+        let arrived = Timestamp::from_micros(2_000);
+        for (sequence, timestamp, payload) in
+            [(0, 4_000_000, &b"first"[..]), (1, 0, &b"second"[..])]
+        {
+            conn.handle_data_packet(
+                DataPacket::new(sequence, sequence, timestamp, 0, payload.to_vec().into()),
+                arrived,
+            )
+            .expect("receive DATA");
+        }
+        conn.handle_shutdown(arrived).expect("peer shutdown");
+        drain_outputs(&mut conn);
+        for now in [5_002_000, 8_000_000] {
+            conn.handle_timer(TimerId::Inactivity, Timestamp::from_micros(now))
+                .expect("inactivity tick");
+            assert_eq!(conn.state(), ConnectionState::Connected);
+            assert!(
+                conn.poll_event().is_none(),
+                "the later sequence cannot bypass the head"
+            );
+            assert!(drain_outputs(&mut conn).into_iter().any(|output| matches!(
+                output,
+                ConnectionOutput::SetTimer {
+                    id: TimerId::Inactivity,
+                    duration_micros,
+                } if duration_micros == 12_000_000 - now
+            )));
+        }
+        conn.handle_timer(TimerId::Inactivity, Timestamp::from_micros(12_000_000))
+            .expect("head deadline");
+        assert_delivered_payload(&mut conn, b"first");
+        assert_delivered_payload(&mut conn, b"second");
+        assert_peer_shutdown_terminal(&mut conn);
+    }
+
     /// Assert the next event is the payload the connection delivered.
     fn assert_delivered_payload(conn: &mut SrtConnection, expected: &[u8]) {
         let delivered = conn.poll_event().expect("the payload is delivered");

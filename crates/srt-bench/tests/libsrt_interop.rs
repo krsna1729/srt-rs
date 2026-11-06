@@ -1083,6 +1083,35 @@ fn rust_live_caller_sends_stream_to_libsrt_listener() {
     );
 }
 
+/// Live TSBPD must preserve sequence order, not sort messages by their source
+/// timestamps. Exercise the reference receiver with a decreasing timestamp pair.
+#[test]
+fn live_listener_preserves_sequence_order_with_decreasing_timestamps() {
+    let _guard = interop_test_lock();
+    if !command_available("srt-live-transmit") {
+        eprintln!("skipping: srt-live-transmit not on PATH");
+        return;
+    }
+    let (result, output) = send_to_libsrt_listener_with_on_connect(
+        LiveOptions::default(),
+        LiveOptions::default(),
+        Duration::from_secs(10),
+        |conn, now| {
+            conn.send(b"first-", Timestamp::from_micros(now.as_micros() + 250_000))
+                .expect("send future head");
+            conn.send(b"second", now)
+                .expect("send earlier timestamp behind the head");
+        },
+    );
+    assert!(result.connected, "{:?}", result.events);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"first-second");
+}
+
 /// The inverse of `libsrt_caller_recovers_payload_under_5pct_loss`: Rust
 /// drives recovery while a real libsrt live listener receives the recovered
 /// byte stream through the same deterministic 5% DATA loss pattern.
