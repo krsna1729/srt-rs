@@ -44,6 +44,13 @@ lossy single-socket proxy at ~0.9 Mbps input cannot provide.
   be given `transtype=live`… but then its `sendfile2` API trips libsrt's own
   "LiveCC: invalid API use" guard. Use `srt-live-transmit` for interop with a
   live-mode peer.
+- AEAD-enabled `srt-live-transmit` takes `cryptomode=2` (an integer
+  `SRTO_CRYPTOMODE`), not `cryptomode=aes-gcm`. Distro builds without the preview
+  feature skip these tests; that is not a passing GCM interop result.
+  libsrt selects its legacy AEAD nonce and AAD layout for a peer advertising
+  SRT 1.5.3 or older. Our GCM uses the 1.5.4+ layout, so connections advertise
+  1.5.4 (`gcm_caller_advertises_the_modern_aead_wire_version`). Peers that
+  only implement the legacy 1.5.2-1.5.3 AEAD layout remain unsupported.
 - Handshake packet from the crafted-python probe must be the full 64-byte
   frame (16 header + 48 CIF incl. 16-byte peer IP).
 

@@ -566,7 +566,10 @@ impl Default for ConnectionOptions {
             key_length: KeyLength::Aes128,
             cipher_mode: CipherMode::Ctr,
             tsbpd_delay: 120,
-            srt_version: 0x010500, // 1.5.0
+            // Advertise the first version whose AES-GCM nonce and AAD match
+            // `crypto::build_gcm_iv` and `DataPacket::gcm_aad`; 1.5.3 and
+            // older select libsrt's incompatible legacy AEAD format.
+            srt_version: 0x010504,
             stream_id: None,
             congestion_control: "live".to_string(),
             group_extension: None,
@@ -6598,6 +6601,40 @@ mod tests {
         assert!(err.reason.contains("encryption"), "{}", err.reason);
         assert_eq!(caller.next_sequence_number(), Some(next));
         assert!(caller.poll_output().unwrap().is_none());
+    }
+
+    /// libsrt 1.5.3 and older use a different AES-GCM nonce and AAD layout.
+    /// A peer that advertises such a version is decrypted in that layout, so
+    /// the default HSREQ must name a version that uses our modern format.
+    #[test]
+    fn gcm_caller_advertises_the_modern_aead_wire_version() {
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            passphrase: Some("interop-passphrase".to_owned()),
+            cipher_mode: CipherMode::Gcm,
+            ..Default::default()
+        });
+        caller.connect(Timestamp::default()).unwrap();
+        while caller.poll_output().unwrap().is_some() {}
+        let mut response = HandshakePacket::new_induction_response(2, 7, 2);
+        response.flow_window = DEFAULT_FLOW_WINDOW;
+        caller
+            .handle_handshake_caller(response, 0, Timestamp::from_micros(1))
+            .unwrap();
+        let conclusion = std::iter::from_fn(|| caller.poll_output().unwrap())
+            .find_map(|output| match output {
+                ConnectionOutput::SendPacket(wire) => Some(wire),
+                _ => None,
+            })
+            .expect("CONCLUSION");
+        let SrtPacket::Control(packet) = SrtPacket::decode(&conclusion).unwrap() else {
+            panic!("CONCLUSION is a control packet");
+        };
+        let version = HandshakePacket::decode(&packet)
+            .unwrap()
+            .get_hs_extension()
+            .unwrap()
+            .srt_version;
+        assert!(version >= 0x010504, "{version:#08x}");
     }
 
     /// P03: GCM's 16-byte tag is real wire overhead on top of the header
