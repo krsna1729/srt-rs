@@ -242,16 +242,18 @@ fn an_unreachable_broadcast_leg_is_degradation_not_collision() {
     assert_eq!(callers.group_faults_pending(), 0);
 }
 
-/// A response with no GROUP extension carries no identity and binds nothing,
-/// as in libsrt: it neither collides nor blocks a later identified leg.
+/// A response with no GROUP extension means the receiver did not understand
+/// the group: libsrt's bonded initiator refuses that leg (`SRT_REJ_GROUP`),
+/// so it never carries the bond. It is not a receiving-group collision, and
+/// a later identified leg still binds and carries.
 #[test]
-fn a_response_without_group_identity_is_not_checked() {
+fn a_response_without_group_identity_is_refused() {
     let (a, b) = (addr(11001), addr(11002));
     let (mut callers, id) = two_leg_caller(a, b);
-    // Leg A's receiver names no group; leg B's names one. Neither collides.
+    // Leg A's receiver names no group; leg B's names one.
     let mut receivers = [Receiver::without_identity(), Receiver::new(0x7002)];
     pump(&mut callers, &mut receivers, &[(a, 0), (b, 1)], 0..12);
-    assert_eq!(group_of(&callers, id).aggregate.active_legs, 2);
+    assert_eq!(group_of(&callers, id).aggregate.active_legs, 1);
     assert!(faults(&mut callers).is_empty());
 }
 

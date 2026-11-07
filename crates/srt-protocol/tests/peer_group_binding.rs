@@ -2,8 +2,9 @@
 //!
 //! A bonded group has exactly one remote receiving group. The first member
 //! whose handshake response carries a GROUP extension binds the group to that
-//! ID, every later member must report the same one, a response without the
-//! extension is admitted without binding, and a mismatch breaks only that
+//! ID, every later member must report the same one, a leg whose response
+//! omits the extension is refused by its own handshake (libsrt's
+//! `SRT_REJ_GROUP`), and a mismatch breaks only that
 //! member. The binding is a property of the group, not of the leg that set it,
 //! and it is never released: a failed holder does not let a different
 //! receiving group in.
@@ -109,6 +110,41 @@ impl PendingLeg {
         }
         panic!("leg did not connect");
     }
+
+    /// Add this leg and deliver its handshake once: the listener's response
+    /// must be refused by the member's connection, which never connects.
+    fn join_expecting_refusal(self, group: &mut SrtGroup, member_id: u32) {
+        let Self {
+            caller,
+            mut listener,
+        } = self;
+        group
+            .add_member(member_id, 1, caller)
+            .expect("member admitted");
+        let mut refused = false;
+        for round in 0..2 {
+            let now = ts(round * 10_000);
+            let member = group.member_mut(member_id).expect("member");
+            for packet in packets_from(member.connection_mut()) {
+                listener
+                    .feed_recv_buf(&packet, now)
+                    .expect("request decodes");
+            }
+            let member = group.member_mut(member_id).expect("member");
+            for packet in packets_from(&mut listener) {
+                refused |= member.connection_mut().feed_recv_buf(&packet, now).is_err();
+            }
+        }
+        assert!(refused, "the response without GROUP is refused");
+        assert_ne!(
+            group
+                .member(member_id)
+                .expect("member")
+                .connection()
+                .state(),
+            ConnectionState::Connected
+        );
+    }
 }
 
 fn group() -> SrtGroup {
@@ -146,23 +182,21 @@ fn the_first_group_report_binds_and_a_matching_leg_is_admitted() {
     );
 }
 
+/// libsrt's bonded initiator refuses a response without the mirror GROUP
+/// extension (`SRT_REJ_GROUP`): the listener did not understand the group.
+/// Such a leg never connects, binds nothing and never becomes active.
 #[test]
-fn a_leg_without_a_group_report_is_admitted_without_binding() {
+fn a_leg_without_a_group_report_is_refused_before_it_connects() {
     let mut group = group();
-    PendingLeg::new(None).join(&mut group, 1);
-    assert!(group.can_send());
-    assert_eq!(
-        group.peer_group_id(),
-        None,
-        "a response without a GROUP extension carries no identity to bind"
-    );
-    assert_eq!(
+    PendingLeg::new(None).join_expecting_refusal(&mut group, 1);
+    assert!(!group.can_send(), "the refused leg cannot carry the group");
+    assert_eq!(group.peer_group_id(), None);
+    assert_ne!(
         group.member(1).expect("first member").state(),
         GroupMemberState::Active
     );
 
-    // The next member to report an identity binds the group for every later
-    // one, no matter that an earlier leg was admitted first.
+    // A later leg that reports an identity binds the group as usual.
     PendingLeg::new(Some(0x4000_2002)).join(&mut group, 2);
     assert!(group.can_send());
     assert_eq!(group.peer_group_id(), Some(0x4000_2002));

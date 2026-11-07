@@ -184,6 +184,10 @@ HSv5 negotiation follows libsrt 1.5.7:
 - A peer whose STREAM flag declares the other transmission API (stream/file
   versus message/live) is refused before `Connected`: a listener answers
   `SRT_REJ_MESSAGEAPI`, a caller fails its attempt.
+- A caller that sent GROUP requires the listener's mirror GROUP extension
+  and fails its attempt without one (libsrt `SRT_REJ_GROUP`); a listener
+  accepting bonded callers must therefore set a receiving group. Direct
+  callers are unaffected.
 
 ## Testing
 

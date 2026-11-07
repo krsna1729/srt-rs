@@ -303,8 +303,9 @@ impl SrtGroup {
     /// Bind the group to, or check the member against, the remote receiving
     /// group named by the member's handshake response. Returns `false` (and
     /// records the collision) when the member reports a different one. A
-    /// response without a GROUP extension carries no identity and is not
-    /// checked, exactly as in libsrt.
+    /// member that sent GROUP never connects without a GROUP response (its
+    /// handshake refuses it, as libsrt's `SRT_REJ_GROUP` does); a member that
+    /// sent none has no identity to check.
     fn admit_peer_group(&mut self, index: usize) -> bool {
         self.members[index].peer_group_admitted = true;
         let Some(actual) = self.members[index]

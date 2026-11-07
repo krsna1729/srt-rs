@@ -3588,6 +3588,20 @@ impl SrtConnection {
         Err(self.refuse_peer(SRT_REJ_MESSAGEAPI, reason, now))
     }
 
+    /// A caller that asked for group membership requires the listener's
+    /// mirror GROUP extension: one that omits it did not understand the
+    /// group, and libsrt's bonded initiator refuses it with `SRT_REJ_GROUP`
+    /// (`interpretSrtHandshake`) rather than running the leg ungrouped. A
+    /// caller that sent no GROUP is unaffected.
+    fn reject_missing_group_response(&mut self, hs: &HandshakePacket) -> Result<(), Error> {
+        if self.options.group_extension.is_none() || hs.get_group_extension().is_some() {
+            return Ok(());
+        }
+        Err(self.fail_caller_handshake(
+            "peer did not answer this caller's GROUP extension (SRT_REJ_GROUP)",
+        ))
+    }
+
     fn handle_caller_conclusion(
         &mut self,
         hs: HandshakePacket,
@@ -3607,6 +3621,7 @@ impl SrtConnection {
         self.reject_peer_mss(&hs, now)?;
         self.reject_unsupported_packet_filter(&hs, now)?;
         self.reject_message_api_mismatch(&hs, now)?;
+        self.reject_missing_group_response(&hs)?;
         self.apply_peer_mss(&hs);
 
         self.peer_socket_id = hs.socket_id;
@@ -10576,6 +10591,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A caller that sent GROUP refuses a response without one (libsrt
+    /// `SRT_REJ_GROUP`); a direct caller that sent none still connects.
+    #[test]
+    fn caller_requires_a_group_response_only_when_it_sent_group() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        let grouped_caller = ConnectionOptions {
+            socket_id: 1,
+            group_extension: Some(GroupExtensionData {
+                group_id: SRTGROUP_MASK | 0x31,
+                group_type: GroupType::Broadcast,
+                flags: 0,
+                weight: 1,
+            }),
+            ..ConnectionOptions::default()
+        };
+        let attempt = handshake_with_options(&plain, &plain, grouped_caller, listener_options());
+        attempt.listener_result.expect("listener answers");
+        let error = attempt
+            .caller_result
+            .expect_err("no mirror GROUP in the response");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_ne!(attempt.caller.state(), ConnectionState::Connected);
+
+        let direct = handshake_with_rewrites(&plain, &plain, listener_options());
+        direct
+            .caller_result
+            .expect("a direct caller needs no GROUP");
+        assert_eq!(direct.caller.state(), ConnectionState::Connected);
     }
 
     /// A peer that negotiates packet-filter behaviour gets a refusal, not a

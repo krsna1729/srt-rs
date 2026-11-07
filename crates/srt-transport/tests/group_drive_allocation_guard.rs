@@ -57,8 +57,16 @@ impl Peer {
         socket.set_nonblocking(true).expect("peer is nonblocking");
         Self {
             socket,
+            // A bonded caller refuses a response without the receiving
+            // group's mirror GROUP extension, as libsrt does.
             connection: SrtConnection::new_listener(srt_proto::ConnectionOptions {
                 tsbpd_delay: 0,
+                group_extension: Some(srt_proto::handshake::GroupExtensionData {
+                    group_id: srt_proto::handshake::SRTGROUP_MASK | 0x77,
+                    group_type: srt_proto::handshake::GroupType::Broadcast,
+                    flags: 0,
+                    weight: 1,
+                }),
                 ..Default::default()
             }),
             caller: None,

@@ -200,6 +200,10 @@ resolver with `ListenerPeerPolicy { group: Set(Some(GroupConfig::new(id, mode)))
 - A caller pins the first responder's id and treats a different one as a group
   collision (libsrt: `SRT_REJ_GROUP`; srt-rs: `CallerGroupFault`). Address,
   hostname, port and socket id never define a bond.
+- A bonded caller refuses a response that carries no GROUP extension at all
+  (libsrt: `SRT_REJ_GROUP`; srt-rs: the leg's handshake fails and it never
+  becomes active), so a listener that accepts bonded callers must set a
+  receiving group.
 - Direct callers, which send no GROUP request, never receive a GROUP response,
   whatever the policy carries. They need no receiving-group identity.
 - The receiving group id is independent of delivery mode; Broadcast and Backup
