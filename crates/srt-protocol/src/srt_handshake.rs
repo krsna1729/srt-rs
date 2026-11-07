@@ -338,8 +338,30 @@ pub struct GroupExtensionData {
     pub weight: u16,
 }
 
+impl GroupExtensionData {
+    /// Whether a libsrt peer accepts this GROUP extension: the ID carries
+    /// [`SRTGROUP_MASK`] and the type is one libsrt defines (below
+    /// `SRT_GTYPE_E_END`: undefined, broadcast, backup). libsrt's
+    /// `interpretGroup` refuses anything else (core.cpp:3317-3331), so an
+    /// outbound GROUP must satisfy it; a received one is still decoded raw
+    /// for policy inspection.
+    #[must_use]
+    pub const fn is_valid_for_libsrt(&self) -> bool {
+        self.group_id & SRTGROUP_MASK != 0
+            && matches!(self.group_type.to_u8(), 0..=MAX_LIBSRT_GROUP_TYPE)
+    }
+}
+
+/// Highest group type libsrt 1.5.7 defines (`SRT_GTYPE_BACKUP`).
+const MAX_LIBSRT_GROUP_TYPE: u8 = 2;
+
 /// Libsrt's marker bit for group identifiers.
 pub const SRTGROUP_MASK: u32 = 1 << 30;
+
+/// `SRT_REJ_GROUP`: incompatible group. Used when a listener's own GROUP
+/// extension is one libsrt would refuse
+/// ([`GroupExtensionData::is_valid_for_libsrt`]).
+pub const SRT_REJ_GROUP: i32 = 15;
 
 /// Synchronize group data on message boundaries.
 pub const GFLAG_SYNCONMSG: u8 = 0x01;

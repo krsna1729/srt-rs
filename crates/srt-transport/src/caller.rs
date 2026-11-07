@@ -3803,6 +3803,33 @@ mod tests {
         assert!(table.bonded_stats().is_empty());
     }
 
+    /// The CONCLUSION with its GROUP type rewritten on the wire: a caller
+    /// refuses to emit a type libsrt does not define, but a listener must
+    /// still classify one it receives.
+    fn with_wire_group_type(
+        conclusion: &[u8],
+        group_type: srt_proto::handshake::GroupType,
+    ) -> Vec<u8> {
+        let SrtPacket::Control(control) = SrtPacket::decode(conclusion).expect("decodes") else {
+            panic!("CONCLUSION is a control packet");
+        };
+        let mut handshake = HandshakePacket::decode(&control).expect("handshake decodes");
+        let group = handshake.get_group_extension().expect("caller sent GROUP");
+        handshake
+            .extensions
+            .retain(|ext| ext.ext_type != srt_proto::handshake::ExtensionType::Group);
+        handshake.add_group_extension(srt_proto::handshake::GroupExtensionData {
+            group_type,
+            ..group
+        });
+        let mut bytes = Vec::new();
+        handshake
+            .encode(control.timestamp, control.dest_socket_id)
+            .encode(&mut bytes)
+            .expect("CONCLUSION encodes");
+        bytes
+    }
+
     #[test]
     fn bonded_inputs_reject_unknown_group_type_with_bad_mode() {
         let peer = "127.0.0.1:10000".parse().expect("address");
@@ -3816,7 +3843,7 @@ mod tests {
                 socket_id: 0x1111,
                 group_extension: Some(srt_proto::handshake::GroupExtensionData {
                     group_id: srt_proto::handshake::SRTGROUP_MASK | 42,
-                    group_type: srt_proto::handshake::GroupType::Unknown(3),
+                    group_type: srt_proto::handshake::GroupType::Broadcast,
                     flags: 0,
                     weight: 1,
                 }),
@@ -3825,6 +3852,8 @@ mod tests {
             &options,
             &telemetry,
         );
+        let conclusion =
+            with_wire_group_type(&conclusion, srt_proto::handshake::GroupType::Unknown(3));
 
         assert_eq!(
             table.admit(

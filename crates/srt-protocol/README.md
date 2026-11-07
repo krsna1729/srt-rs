@@ -216,6 +216,13 @@ Packets carry what libsrt 1.5.7 emits:
   configured with one refuses callers with `SRT_REJ_CONGESTION`. Received
   handshakes with an empty SID, or an empty or over-16-byte congestion
   block, fail to decode, as libsrt refuses them.
+- An outbound GROUP extension must carry an `SRTGROUP_MASK` ID and a group
+  type libsrt defines (undefined, broadcast, backup):
+  `GroupExtensionData::is_valid_for_libsrt`. `connect`,
+  `set_group_extension` (now returning `Result`) and
+  `set_listener_group_extension` refuse another; a listener configured with
+  one through `ConnectionOptions` refuses bonded callers with
+  `SRT_REJ_GROUP`. Received GROUP values are still decoded raw for policy.
 
 ## Testing
 

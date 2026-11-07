@@ -21,7 +21,7 @@ use crate::srt_handshake::{
     DEFAULT_FLOW_WINDOW, DEFAULT_MTU, GroupExtensionData, HS_VERSION_5, HandshakePacket,
     HandshakeState, HandshakeType, IpFamily, KmError, KmMessage, MAX_CONGESTION_NAME_BYTES,
     MAX_FLOW_WINDOW, SRT_MAGIC_CODE, SRT_REJ_CONGESTION, SRT_REJ_CRYPTO, SRT_REJ_FILTER,
-    SRT_REJ_MESSAGEAPI, SRT_REJ_ROGUE, SRT_REJ_VERSION, srt_flags,
+    SRT_REJ_GROUP, SRT_REJ_MESSAGEAPI, SRT_REJ_ROGUE, SRT_REJ_VERSION, srt_flags,
 };
 use crate::srt_packet::{
     ControlPacket, ControlType, DataHeader, DataPacket, DatagramClass, PendingData,
@@ -908,6 +908,17 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) {
     }
 }
 
+/// Refuse an outbound GROUP extension a libsrt peer would refuse.
+fn ensure_libsrt_group(group: GroupExtensionData) -> Result<(), Error> {
+    if group.is_valid_for_libsrt() {
+        return Ok(());
+    }
+    Err(Error::invalid_data(
+        "GROUP extension needs an SRTGROUP_MASK group ID and a libsrt group type \
+         (undefined, broadcast or backup)",
+    ))
+}
+
 fn normalize_buffer_options(mut options: ConnectionOptions) -> ConnectionOptions {
     if options.socket_id == 0 {
         options.socket_id = random_nonzero_socket_id();
@@ -1563,12 +1574,17 @@ impl SrtConnection {
         Ok(())
     }
 
-    /// Set or clear listener-side GROUP metadata before CONCLUSION.
+    /// Set or clear listener-side GROUP metadata before CONCLUSION. A group
+    /// libsrt would refuse ([`GroupExtensionData::is_valid_for_libsrt`]) is
+    /// an error.
     pub fn set_listener_group_extension(
         &mut self,
         group: Option<GroupExtensionData>,
     ) -> Result<(), Error> {
         self.ensure_listener_policy_window()?;
+        if let Some(group) = group {
+            ensure_libsrt_group(group)?;
+        }
         self.options.group_extension = group;
         Ok(())
     }
@@ -1616,8 +1632,12 @@ impl SrtConnection {
     }
 
     /// Set listener-side GROUP metadata before processing the conclusion.
-    pub fn set_group_extension(&mut self, group: GroupExtensionData) {
+    /// A group libsrt would refuse
+    /// ([`GroupExtensionData::is_valid_for_libsrt`]) is an error.
+    pub fn set_group_extension(&mut self, group: GroupExtensionData) -> Result<(), Error> {
+        ensure_libsrt_group(group)?;
         self.options.group_extension = Some(group);
+        Ok(())
     }
 
     /// Configure retry spacing and the deadline for the whole handshake.
@@ -1663,6 +1683,9 @@ impl SrtConnection {
                 "congestion_control must be 1 to 16 bytes, the names libsrt accepts",
             ));
         }
+        self.options
+            .group_extension
+            .map_or(Ok(()), ensure_libsrt_group)?;
 
         self.start_time = Some(now);
         self.handshake_started_at = Some(now);
@@ -3611,6 +3634,30 @@ impl SrtConnection {
         ))
     }
 
+    /// A listener answers a GROUP request with its own GROUP extension; one
+    /// libsrt would refuse (configured through `ConnectionOptions`) is not
+    /// emitted: the caller is refused with `SRT_REJ_GROUP`.
+    fn reject_invalid_own_group(
+        &mut self,
+        hs: &HandshakePacket,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        let answers_group = hs.get_group_extension().is_some();
+        if !answers_group
+            || self
+                .options
+                .group_extension
+                .is_none_or(|group| group.is_valid_for_libsrt())
+        {
+            return Ok(());
+        }
+        Err(self.refuse_peer(
+            SRT_REJ_GROUP,
+            "configured GROUP extension is one libsrt refuses",
+            now,
+        ))
+    }
+
     /// Reject a handshake in which the peer negotiates packet-filter
     /// behaviour this implementation does not provide.
     ///
@@ -3901,6 +3948,7 @@ impl SrtConnection {
         self.reject_peer_without_rexmit_flag(&hs, now)?;
         self.reject_legacy_gcm_peer(&hs, now)?;
         self.reject_unemittable_congestion(now)?;
+        self.reject_invalid_own_group(&hs, now)?;
         self.apply_peer_mss(&hs);
         self.note_peer_flow_window(hs.flow_window);
 
@@ -5609,6 +5657,88 @@ mod tests {
             assert_eq!(answered.is_ok(), emittable, "{name:?}: {answered:?}");
             let expected = (!emittable).then_some(SRT_REJ_CONGESTION);
             assert_eq!(rejection_reason(&mut listener), expected, "{name:?}");
+        }
+    }
+
+    /// GROUP extensions paired with whether libsrt accepts them
+    /// (`interpretGroup`, core.cpp:3317-3331).
+    fn group_cases() -> [(GroupExtensionData, bool); 5] {
+        let group = |group_id, group_type| GroupExtensionData {
+            group_id,
+            group_type,
+            flags: 0,
+            weight: 1,
+        };
+        [
+            (group(SRTGROUP_MASK | 42, GroupType::Broadcast), true),
+            (group(SRTGROUP_MASK | 42, GroupType::Backup), true),
+            (group(SRTGROUP_MASK | 42, GroupType::Undefined), true),
+            (group(42, GroupType::Broadcast), false),
+            (group(SRTGROUP_MASK | 42, GroupType::Unknown(3)), false),
+        ]
+    }
+
+    /// An outbound GROUP libsrt would refuse is a configuration error, on
+    /// both setters and at `connect` before anything is sent.
+    #[test]
+    fn outbound_groups_libsrt_refuses_are_configuration_errors() {
+        for (group, valid) in group_cases() {
+            let mut caller = SrtConnection::new_caller(ConnectionOptions {
+                group_extension: Some(group),
+                ..ConnectionOptions::default()
+            });
+            let started = caller.connect(Timestamp::default());
+            assert_eq!(started.is_ok(), valid, "{group:?}: {started:?}");
+            let sent = drain_outputs(&mut caller)
+                .iter()
+                .any(|output| matches!(output, ConnectionOutput::SendPacket(_)));
+            assert_eq!(sent, valid, "{group:?}");
+
+            let mut listener = SrtConnection::new_listener(listener_options());
+            let set = listener.set_group_extension(group);
+            assert_eq!(set.is_ok(), valid, "{group:?}");
+            let mut listener = SrtConnection::new_listener(listener_options());
+            let set = listener.set_listener_group_extension(Some(group));
+            assert_eq!(set.is_ok(), valid, "{group:?}");
+        }
+    }
+
+    /// A listener whose configured GROUP libsrt would refuse answers a
+    /// bonded caller with `SRT_REJ_GROUP` instead of emitting it; a direct
+    /// caller, which gets no GROUP back, is unaffected.
+    #[test]
+    fn listener_refuses_bonded_callers_when_its_own_group_is_invalid() {
+        let (bonded, _) = group_cases()[0];
+        for (caller_group, (group, valid)) in [Some(bonded), None]
+            .into_iter()
+            .flat_map(|caller_group| group_cases().map(|case| (caller_group, case)))
+        {
+            let answers = valid || caller_group.is_none();
+            let mut caller = SrtConnection::new_caller(ConnectionOptions {
+                socket_id: 1,
+                group_extension: caller_group,
+                ..ConnectionOptions::default()
+            });
+            let mut listener = SrtConnection::new_listener(ConnectionOptions {
+                group_extension: Some(group),
+                ..listener_options()
+            });
+            caller.connect(Timestamp::default()).unwrap();
+            listener
+                .feed_recv_buf(&next_wire(&mut caller), Timestamp::from_micros(1))
+                .unwrap();
+            caller
+                .feed_recv_buf(&next_wire(&mut listener), Timestamp::from_micros(2))
+                .unwrap();
+            let answered =
+                listener.feed_recv_buf(&next_wire(&mut caller), Timestamp::from_micros(3));
+            assert_eq!(
+                answered.is_ok(),
+                answers,
+                "{caller_group:?} -> {group:?}: {answered:?}"
+            );
+            let expected = (!answers).then_some(SRT_REJ_GROUP);
+            assert_eq!(rejection_reason(&mut listener), expected, "{group:?}");
         }
     }
 
