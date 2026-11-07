@@ -3725,7 +3725,10 @@ impl SrtConnection {
         self.handshake_state = HandshakeState::Completed;
         self.handshake_started_at = None;
         self.set_state(ConnectionState::Connected);
-        self.start_time = Some(now);
+        // `start_time` stays the epoch `connect` stamped: the INDUCTION and
+        // CONCLUSION already carried it, and the listener's TSBPD base is
+        // derived from that CONCLUSION timestamp (libsrt stamps its start
+        // time once, when the socket opens).
 
         let tsbpd_time_base = now.as_micros().saturating_sub(hsreq_timestamp as u64);
         self.init_buffers(now, hs.initial_packet_seq, tsbpd_time_base);

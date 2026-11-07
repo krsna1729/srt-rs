@@ -97,9 +97,10 @@ fn establish_connection(
     let now = ts(0);
     caller.connect(now).map_err(|e| e.to_string())?;
 
-    // 最大 10 ラウンドで接続確立を試みる
-    for i in 0..10 {
-        let now = ts(i * 10_000);
+    // 最大 10 ラウンドで接続確立を試みる. Every round runs at the connect
+    // instant: the listener's TSBPD base comes from the CONCLUSION
+    // timestamp, so the handshake must see the same zero transit as DATA.
+    for _ in 0..10 {
         exchange_packets(caller, listener, now);
 
         if caller.state() == ConnectionState::Connected

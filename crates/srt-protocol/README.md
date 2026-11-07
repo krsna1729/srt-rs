@@ -198,6 +198,15 @@ HSv5 negotiation follows libsrt 1.5.7:
   `connect` refuses a local `srt_version` of 1.5.3 or older with GCM.
   `SrtConnection::peer_srt_version` reports the peer's advertised version.
 
+### Wire emission
+
+Packets carry what libsrt 1.5.7 emits:
+
+- A caller stamps one timestamp epoch at `connect` and keeps it for its
+  handshake, DATA and control packets. The listener's TSBPD base comes from
+  the CONCLUSION timestamp, so DATA is held for its latency however long the
+  handshake took.
+
 ## Testing
 
 ```sh

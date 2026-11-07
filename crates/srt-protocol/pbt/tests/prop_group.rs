@@ -26,9 +26,11 @@ fn establish_pair(options: ConnectionOptions) -> (SrtConnection, SrtConnection) 
         ..options
     });
     caller.connect(ts(0)).expect("caller connects");
-    for round in 0..10 {
-        transfer(&mut caller, &mut listener, ts(round * 10_000));
-        transfer(&mut listener, &mut caller, ts(round * 10_000));
+    // A zero-transit handshake: the listener's TSBPD base comes from the
+    // CONCLUSION timestamp, so it must see the same transit as DATA.
+    for _ in 0..10 {
+        transfer(&mut caller, &mut listener, ts(0));
+        transfer(&mut listener, &mut caller, ts(0));
         if caller.state() == ConnectionState::Connected
             && listener.state() == ConnectionState::Connected
         {

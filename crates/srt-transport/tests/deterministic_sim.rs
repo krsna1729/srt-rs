@@ -45,9 +45,10 @@ fn connected_pair() -> (SrtConnection, SrtConnection) {
         ..Default::default()
     });
     caller.connect(Timestamp::default()).unwrap();
-    // Handshake.
-    for i in 0..10 {
-        let now = Timestamp::from_micros(i * 10_000);
+    // Handshake over a zero-transit link: the listener's TSBPD base comes
+    // from the CONCLUSION timestamp, so it must see the same transit as DATA.
+    for _ in 0..10 {
+        let now = Timestamp::default();
         while let Some(out) = caller
             .poll_output()
             .expect("exact-size output materializes")

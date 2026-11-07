@@ -41,15 +41,17 @@ fn establish_pair(options: ConnectionOptions) -> (SrtConnection, SrtConnection) 
         ..options
     });
     caller.connect(ts(0)).expect("caller should connect");
-    for round in 0..10 {
+    // A zero-transit handshake: the listener's TSBPD base comes from the
+    // CONCLUSION timestamp, so it must see the same transit as DATA.
+    for _ in 0..10 {
         for packet in packets_from(&mut caller) {
             listener
-                .feed_recv_buf(&packet, ts(round * 10_000))
+                .feed_recv_buf(&packet, ts(0))
                 .expect("request should decode");
         }
         for packet in packets_from(&mut listener) {
             caller
-                .feed_recv_buf(&packet, ts(round * 10_000))
+                .feed_recv_buf(&packet, ts(0))
                 .expect("response should decode");
         }
         if caller.state() == ConnectionState::Connected
