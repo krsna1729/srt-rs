@@ -3,7 +3,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use proptest::prelude::*;
-use srt_proto::crypto::{CipherMode, KeyFlag, KeyLength};
+use srt_proto::crypto::{CipherMode, KeyFlag, KeyLength, KmKeySelection};
 use srt_proto::handshake::{
     ExtensionType, HandshakeExtension, HandshakePacket, HandshakeType, KmError, KmMessage,
 };
@@ -116,23 +116,27 @@ fn arb_handshake_packet_ipv6() -> impl Strategy<Value = HandshakePacket> {
         )
 }
 
-/// KmMessage の生成
+/// KmMessage の生成 (KK = even, odd, or both keys)
 fn arb_km_message() -> impl Strategy<Value = KmMessage> {
     (
-        prop::sample::select(vec![KeyFlag::Even, KeyFlag::Odd]),
+        prop::sample::select(vec![
+            KmKeySelection::Even,
+            KmKeySelection::Odd,
+            KmKeySelection::Both,
+        ]),
         prop::sample::select(vec![
             KeyLength::Aes128,
             KeyLength::Aes192,
             KeyLength::Aes256,
         ]),
         any::<[u8; 16]>(), // salt
-                           // wrapped_key サイズ: key_length + 8 bytes
     )
-        .prop_flat_map(|(key_flag, key_length, salt)| {
-            let wrapped_key_len = key_length.len() + 8;
+        .prop_flat_map(|(keys, key_length, salt)| {
+            // wrapped_key サイズ: key_count * key_length + 8 bytes
+            let wrapped_key_len = keys.key_count() * key_length.len() + 8;
             prop::collection::vec(any::<u8>(), wrapped_key_len..=wrapped_key_len).prop_map(
                 move |wrapped_key| {
-                    KmMessage::new(key_flag, key_length, salt, wrapped_key, CipherMode::Ctr)
+                    KmMessage::new(keys, key_length, salt, wrapped_key, CipherMode::Ctr)
                 },
             )
         })
@@ -440,7 +444,7 @@ proptest! {
         let encoded = km.encode();
         let decoded = KmMessage::decode(&encoded).expect("decode should succeed");
 
-        prop_assert_eq!(km.key_flag, decoded.key_flag);
+        prop_assert_eq!(km.keys, decoded.keys);
         prop_assert_eq!(km.key_length, decoded.key_length);
         prop_assert_eq!(km.salt, decoded.salt);
         prop_assert_eq!(km.wrapped_key, decoded.wrapped_key);
@@ -459,7 +463,7 @@ proptest! {
         let km_result = decoded.get_km_request().expect("should have km request");
         let decoded_km = km_result.expect("km decode should succeed");
 
-        prop_assert_eq!(km.key_flag, decoded_km.key_flag);
+        prop_assert_eq!(km.keys, decoded_km.keys);
         prop_assert_eq!(km.key_length, decoded_km.key_length);
         prop_assert_eq!(km.salt, decoded_km.salt);
         prop_assert_eq!(km.wrapped_key, decoded_km.wrapped_key);
@@ -478,7 +482,7 @@ proptest! {
         let km_result = decoded.get_km_response().expect("should have km response");
         let decoded_km = km_result.expect("should be Some(KmMessage)");
 
-        prop_assert_eq!(km.key_flag, decoded_km.key_flag);
+        prop_assert_eq!(km.keys, decoded_km.keys);
         prop_assert_eq!(km.key_length, decoded_km.key_length);
         prop_assert_eq!(km.salt, decoded_km.salt);
         prop_assert_eq!(km.wrapped_key, decoded_km.wrapped_key);

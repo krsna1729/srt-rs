@@ -20,7 +20,7 @@ use std::net::IpAddr;
 use crate::buf::{
     read_bytes, read_u8, read_u16, read_u32, write_bytes, write_u8, write_u16, write_u32,
 };
-use crate::crypto_impl::{KeyFlag, KeyLength};
+use crate::crypto_impl::{KeyLength, KmKeySelection};
 use crate::error::Error;
 use crate::srt_packet::{ControlPacket, ControlType, MAX_DATAGRAM_SIZE, SRT_HEADER_SIZE};
 
@@ -798,10 +798,7 @@ impl HandshakePacket {
     pub fn add_km_error(&mut self, error: KmError) {
         self.extensions.push(HandshakeExtension {
             ext_type: ExtensionType::KmRsp,
-            // libsrt copies SRT_KM_STATE into the KM payload as a native
-            // 32-bit word before the handshake codec performs its own word
-            // swapping. The resulting extension bytes are little-endian.
-            data: (error as u32).to_le_bytes().to_vec(),
+            data: error.to_state_bytes().to_vec(),
         });
         self.extension_field |= extension_flags::KMREQ;
     }
@@ -824,12 +821,10 @@ impl HandshakePacket {
         for ext in &self.extensions {
             if ext.ext_type == ExtensionType::KmRsp {
                 // An error response is 4 bytes.
-                if ext.data.len() == 4 {
-                    let error_code =
-                        u32::from_le_bytes([ext.data[0], ext.data[1], ext.data[2], ext.data[3]]);
-                    if let Some(km_error) = KmError::from_u32(error_code) {
-                        return Err(km_error);
-                    }
+                if let Ok(state) = <[u8; 4]>::try_from(ext.data.as_slice())
+                    && let Some(km_error) = KmError::from_state_bytes(state)
+                {
+                    return Err(km_error);
                 }
                 // A normal KM message.
                 match KmMessage::decode(&ext.data) {
@@ -1010,7 +1005,7 @@ fn validate_extension_data(ext_type: ExtensionType, data: &[u8]) -> Result<(), E
             let Ok(code) = <[u8; 4]>::try_from(data) else {
                 return Err(Error::invalid_data("KMRSP error payload must be 4 bytes"));
             };
-            KmError::from_u32(u32::from_le_bytes(code))
+            KmError::from_state_bytes(code)
                 .map(|_| ())
                 .ok_or_else(|| Error::invalid_data("unknown KMRSP error code"))
         }
@@ -1154,8 +1149,8 @@ pub struct KmMessage {
     pub version: u8,
     /// Packet type (PT): 4 bits, KMmsg = 2.
     pub packet_type: u8,
-    /// Key flag (KK): 2 bits.
-    pub key_flag: KeyFlag,
+    /// Key selection (KK): 2 bits -- the even key, the odd key, or both.
+    pub keys: KmKeySelection,
     /// KEK index: usually 0 (default stream key).
     pub keki: u32,
     /// Cipher: AES-CTR = 2, AES-GCM = 4.
@@ -1168,7 +1163,7 @@ pub struct KmMessage {
     pub key_length: KeyLength,
     /// Salt (16 bytes).
     pub salt: [u8; 16],
-    /// Wrapped SEK.
+    /// Wrapped SEK(s): one AES key wrap of the selected keys, even first.
     pub wrapped_key: Vec<u8>,
 }
 
@@ -1206,7 +1201,7 @@ pub mod stream_encapsulation {
 impl KmMessage {
     /// Create a new KM message.
     pub fn new(
-        key_flag: KeyFlag,
+        keys: impl Into<KmKeySelection>,
         key_length: KeyLength,
         salt: [u8; 16],
         wrapped_key: Vec<u8>,
@@ -1219,7 +1214,7 @@ impl KmMessage {
         Self {
             version: KM_VERSION,
             packet_type: KM_PACKET_TYPE,
-            key_flag,
+            keys: keys.into(),
             keki: 0,
             cipher,
             auth,
@@ -1239,7 +1234,7 @@ impl KmMessage {
         write_u8(&mut buf, first_byte);
         write_u16(&mut buf, KM_SIGNATURE);
         // Resv1 (6 bits) | KK (2 bits)
-        write_u8(&mut buf, self.key_flag.to_kk_field());
+        write_u8(&mut buf, self.keys.to_kk_field());
 
         // KEKI (32 bits)
         write_u32(&mut buf, self.keki);
@@ -1292,7 +1287,7 @@ impl KmMessage {
         Ok(Self {
             version: header.version,
             packet_type: header.packet_type,
-            key_flag: header.key_flag,
+            keys: header.keys,
             keki: header.keki,
             cipher: header.cipher,
             auth: header.auth,
@@ -1311,7 +1306,7 @@ const KM_HEADER_LEN: usize = 16;
 struct KmHeader {
     version: u8,
     packet_type: u8,
-    key_flag: KeyFlag,
+    keys: KmKeySelection,
     keki: u32,
     cipher: u8,
     auth: u8,
@@ -1346,7 +1341,7 @@ impl KmHeader {
         if kk_byte & !0b11 != 0 {
             return Err(Error::invalid_data("KM KK reserved bits are set"));
         }
-        let key_flag = KeyFlag::from_kk_field(kk_byte)
+        let keys = KmKeySelection::from_kk_field(kk_byte)
             .ok_or_else(|| Error::invalid_data("invalid KK field"))?;
 
         let keki = read_u32(buf)?;
@@ -1369,7 +1364,7 @@ impl KmHeader {
         Ok(Self {
             version,
             packet_type,
-            key_flag,
+            keys,
             keki,
             cipher,
             auth,
@@ -1400,7 +1395,7 @@ impl KmHeader {
         {
             return Err(Error::invalid_data("unsupported KM message parameters"));
         }
-        let expected_remaining = self.salt_len + self.key_length.len() + 8;
+        let expected_remaining = self.salt_len + self.keys.key_count() * self.key_length.len() + 8;
         if remaining != expected_remaining {
             return Err(Error::invalid_data(format!(
                 "KM message length mismatch: expected {expected_remaining} bytes after header, got {remaining}"
@@ -1435,6 +1430,24 @@ impl KmError {
             _ => None,
         }
     }
+
+    /// The four-byte KMRSP body reporting this state, for both the
+    /// handshake extension and the runtime control packet.
+    ///
+    /// libsrt stores `SRT_KM_STATE` as a native 32-bit word and pre-swaps
+    /// it to cancel the channel's own word conversion
+    /// (`srtcore/crypto.cpp`, `srtcore/core.cpp`), so on the little-endian
+    /// hosts it ships on the bytes are little-endian: NOSECRET is
+    /// `03 00 00 00`.
+    pub fn to_state_bytes(self) -> [u8; 4] {
+        (self as u32).to_le_bytes()
+    }
+
+    /// Decode a four-byte KMRSP state body written by
+    /// [`Self::to_state_bytes`]; `None` for an unknown state.
+    pub fn from_state_bytes(bytes: [u8; 4]) -> Option<Self> {
+        Self::from_u32(u32::from_le_bytes(bytes))
+    }
 }
 
 /// Decode a datagram straight into a [`HandshakePacket`], or `None` if it
@@ -1459,6 +1472,7 @@ pub fn peek_handshake(datagram: &[u8]) -> Option<HandshakePacket> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto_impl::KeyFlag;
 
     /// Deterministic fixture salt for wire-format tests.
     ///
@@ -1673,7 +1687,7 @@ mod tests {
 
         assert_eq!(decoded.version, 1);
         assert_eq!(decoded.packet_type, 2);
-        assert_eq!(decoded.key_flag, KeyFlag::Even);
+        assert_eq!(decoded.keys, KmKeySelection::Even);
         assert_eq!(decoded.cipher, cipher_type::AES_CTR);
         assert_eq!(decoded.key_length, KeyLength::Aes128);
         assert_eq!(decoded.salt, salt);
@@ -1707,8 +1721,36 @@ mod tests {
         let km = km_result
             .expect("the KM request should be Some")
             .expect("decoding the KM message should succeed");
-        assert_eq!(km.key_flag, KeyFlag::Even);
+        assert_eq!(km.keys, KmKeySelection::Even);
         assert_eq!(km.key_length, KeyLength::Aes128);
+    }
+
+    /// KM-3: KK = 3 announces both keys, and the wrapped blob must then
+    /// hold two SEKs plus the eight-byte AES-KW overhead (72 bytes in all
+    /// for AES-128 with a 16-byte salt); a single-key selector must hold
+    /// one.
+    #[test]
+    fn km_message_length_follows_the_selected_key_count() {
+        let salt = fixture_salt();
+        let both = KmMessage::new(
+            KmKeySelection::Both,
+            KeyLength::Aes128,
+            salt,
+            // Non-secret placeholder bytes: the codec only checks the length.
+            (0..2 * 16 + 8).map(|index| 0x5A ^ index as u8).collect(),
+            crate::crypto_impl::CipherMode::Ctr,
+        );
+        let encoded = both.encode();
+        assert_eq!(encoded.len(), 72);
+        assert_eq!(encoded[3], 0b11);
+        assert_eq!(KmMessage::decode(&encoded).expect("both-key KM"), both);
+
+        let mut one_key_body = encoded.clone();
+        one_key_body.truncate(16 + 16 + 16 + 8);
+        assert!(KmMessage::decode(&one_key_body).is_err());
+        let mut single_selector = encoded;
+        single_selector[3] = KeyFlag::Odd.to_kk_field();
+        assert!(KmMessage::decode(&single_selector).is_err());
     }
 
     #[test]

@@ -1009,7 +1009,14 @@ dependencies = [
 name = "pbt"
 version = "0.0.0"
 dependencies = [
+ "aes",
+ "aes-gcm",
+ "aes-kw",
+ "cipher",
+ "ctr",
+ "pbkdf2",
  "proptest",
+ "sha1",
  "srt-proto",
 ]
 
