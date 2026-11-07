@@ -2645,6 +2645,25 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Instant;
 
+    /// Admission options of a listener that accepts bonded callers and
+    /// answers them from a receiving group: a bonded caller refuses a
+    /// response without the mirror GROUP extension, as libsrt does
+    /// (`SRT_REJ_GROUP`).
+    fn bonded_listener_options(socket_id: u32) -> AdmissionOptions {
+        let mut options = AdmissionOptions::basic(socket_id, 0, true);
+        options.bonded_inputs = BondedInputPolicy::Accept;
+        options.connection_template = Some(ConnectionOptions {
+            group_extension: Some(srt_proto::handshake::GroupExtensionData {
+                group_id: srt_proto::handshake::SRTGROUP_MASK | 0x99,
+                group_type: srt_proto::handshake::GroupType::Broadcast,
+                flags: 0,
+                weight: 1,
+            }),
+            ..ConnectionOptions::default()
+        });
+        options
+    }
+
     fn induction(socket_id: u32) -> Vec<u8> {
         let packet = HandshakePacket::new_induction_request(socket_id).encode(0, 0);
         let mut bytes = Vec::new();
@@ -3787,8 +3806,7 @@ mod tests {
     #[test]
     fn bonded_inputs_reject_unknown_group_type_with_bad_mode() {
         let peer = "127.0.0.1:10000".parse().expect("address");
-        let mut options = AdmissionOptions::basic(0x2222, 0, true);
-        options.bonded_inputs = BondedInputPolicy::Accept;
+        let options = bonded_listener_options(0x2222);
         let telemetry = IngressTelemetry::new();
         let mut table = PeerTable::new();
         let (mut caller, conclusion) = prepare_conclusion_with_options(
@@ -3837,8 +3855,7 @@ mod tests {
     fn opted_in_bonded_inputs_share_one_logical_event_stream_and_telemetry() {
         let first = "127.0.0.1:10000".parse().expect("address");
         let second = "127.0.0.1:10001".parse().expect("address");
-        let mut options = AdmissionOptions::basic(0x2222, 0, true);
-        options.bonded_inputs = BondedInputPolicy::Accept;
+        let options = bonded_listener_options(0x2222);
         let telemetry = IngressTelemetry::new();
         let mut table = PeerTable::new();
         let group_id = srt_proto::handshake::SRTGROUP_MASK | 42;
@@ -4008,8 +4025,7 @@ mod tests {
     fn bonded_inputs_reject_a_conflicting_group_mode() {
         let first = "127.0.0.1:10000".parse().expect("address");
         let second = "127.0.0.1:10001".parse().expect("address");
-        let mut options = AdmissionOptions::basic(0x2222, 0, true);
-        options.bonded_inputs = BondedInputPolicy::Accept;
+        let options = bonded_listener_options(0x2222);
         let telemetry = IngressTelemetry::new();
         let mut table = PeerTable::new();
         let group_id = srt_proto::handshake::SRTGROUP_MASK | 42;
@@ -4221,8 +4237,7 @@ mod tests {
             .collect();
         // Leg i's 4-tuple reaches member i until a connected socket moves it.
         let mut route = [0usize, 1];
-        let mut options = AdmissionOptions::basic(900, 0, true);
-        options.bonded_inputs = BondedInputPolicy::Accept;
+        let options = bonded_listener_options(900);
         let telemetry = IngressTelemetry::new();
         let (mut relocations, mut bind_failures) = (0, 0);
         let mut outbound = Vec::new();
@@ -4486,8 +4501,7 @@ mod tests {
             .expect("grouped caller is admitted");
 
         let mut listeners = PeerTable::new();
-        let mut options = AdmissionOptions::basic(900, 0, true);
-        options.bonded_inputs = BondedInputPolicy::Accept;
+        let options = bonded_listener_options(900);
         let telemetry = IngressTelemetry::new();
         for round in 0..8 {
             pump_caller_table(
@@ -4642,8 +4656,7 @@ mod tests {
             .expect("grouped caller admitted");
 
         let mut listeners = PeerTable::new();
-        let mut options = AdmissionOptions::basic(999, 0, true);
-        options.bonded_inputs = BondedInputPolicy::Accept;
+        let options = bonded_listener_options(999);
         let telemetry = IngressTelemetry::new();
         for round in 0..8 {
             pump_caller_table(
@@ -5025,8 +5038,7 @@ mod tests {
         ) {
             let first = "127.0.0.1:10000".parse().expect("address");
             let second = "127.0.0.1:10001".parse().expect("address");
-            let mut options = AdmissionOptions::basic(0x2222, 0, true);
-            options.bonded_inputs = BondedInputPolicy::Accept;
+            let options = bonded_listener_options(0x2222);
             let telemetry = IngressTelemetry::new();
             let mut table = PeerTable::new();
             let group_id = srt_proto::handshake::SRTGROUP_MASK | group_suffix;

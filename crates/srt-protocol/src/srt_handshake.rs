@@ -142,6 +142,15 @@ pub const SRT_REJ_VERSION: i32 = 8;
 /// peers disagree about whether recovery filtering exists.
 pub const SRT_REJ_FILTER: i32 = 14;
 
+/// `SRT_REJ_MESSAGEAPI`: the peers declare different transmission APIs
+/// (STREAM flag), which libsrt refuses in `processSrtMsg_HSREQ`.
+pub const SRT_REJ_MESSAGEAPI: i32 = 12;
+
+/// `SRT_REJ_CRYPTO`: conflicting cryptographic configurations (libsrt
+/// builds with the AEAD API). Used when an AES-GCM session would need
+/// libsrt's legacy (SRT 1.5.3 and older) GCM layout.
+pub const SRT_REJ_CRYPTO: i32 = 17;
+
 /// Default flow window size.
 pub const DEFAULT_FLOW_WINDOW: u32 = 8192;
 
@@ -678,33 +687,57 @@ impl HandshakePacket {
         }
     }
 
-    /// Add an HSREQ extension.
-    pub fn add_hs_extension(&mut self, srt_version: u32, srt_flags: u32, tsbpd_delay: u16) {
-        let mut data = Vec::new();
-        write_u32(&mut data, srt_version);
-        write_u32(&mut data, srt_flags);
-        write_u16(&mut data, tsbpd_delay); // Receiver TSBPD delay
-        write_u16(&mut data, tsbpd_delay); // Sender TSBPD delay
-
-        self.extensions.push(HandshakeExtension {
-            ext_type: ExtensionType::HsReq,
-            data,
-        });
-        self.extension_field |= extension_flags::HSREQ;
+    /// Add an HSREQ extension carrying the RCV (`recv_tsbpd_delay`: this
+    /// side's receive latency) and SND (`send_tsbpd_delay`: the latency
+    /// proposed for the peer's receive direction) halves separately.
+    pub fn add_hs_extension(
+        &mut self,
+        srt_version: u32,
+        srt_flags: u32,
+        recv_tsbpd_delay: u16,
+        send_tsbpd_delay: u16,
+    ) {
+        self.push_hs_block(
+            ExtensionType::HsReq,
+            srt_version,
+            srt_flags,
+            recv_tsbpd_delay,
+            send_tsbpd_delay,
+        );
     }
 
-    /// Add an HSRSP extension.
-    pub fn add_hs_response(&mut self, srt_version: u32, srt_flags: u32, tsbpd_delay: u16) {
-        let mut data = Vec::new();
+    /// Add an HSRSP extension; the halves have the same meaning as in
+    /// [`Self::add_hs_extension`], seen from the responder.
+    pub fn add_hs_response(
+        &mut self,
+        srt_version: u32,
+        srt_flags: u32,
+        recv_tsbpd_delay: u16,
+        send_tsbpd_delay: u16,
+    ) {
+        self.push_hs_block(
+            ExtensionType::HsRsp,
+            srt_version,
+            srt_flags,
+            recv_tsbpd_delay,
+            send_tsbpd_delay,
+        );
+    }
+
+    fn push_hs_block(
+        &mut self,
+        ext_type: ExtensionType,
+        srt_version: u32,
+        srt_flags: u32,
+        recv_tsbpd_delay: u16,
+        send_tsbpd_delay: u16,
+    ) {
+        let mut data = Vec::with_capacity(12);
         write_u32(&mut data, srt_version);
         write_u32(&mut data, srt_flags);
-        write_u16(&mut data, tsbpd_delay);
-        write_u16(&mut data, tsbpd_delay);
-
-        self.extensions.push(HandshakeExtension {
-            ext_type: ExtensionType::HsRsp,
-            data,
-        });
+        write_u16(&mut data, recv_tsbpd_delay);
+        write_u16(&mut data, send_tsbpd_delay);
+        self.extensions.push(HandshakeExtension { ext_type, data });
         self.extension_field |= extension_flags::HSREQ;
     }
 
@@ -1648,7 +1681,12 @@ mod tests {
     #[test]
     fn test_hs_extension() {
         let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
-        hs.add_hs_extension(0x010500, srt_flags::TSBPDSND | srt_flags::TSBPDRCV, 120);
+        hs.add_hs_extension(
+            0x010500,
+            srt_flags::TSBPDSND | srt_flags::TSBPDRCV,
+            120,
+            120,
+        );
 
         let packet = hs.encode(1000, 0);
         let decoded = HandshakePacket::decode(&packet)
@@ -1708,7 +1746,7 @@ mod tests {
         );
 
         let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 2, true);
-        hs.add_hs_extension(0x010500, srt_flags::TSBPDSND | srt_flags::CRYPT, 120);
+        hs.add_hs_extension(0x010500, srt_flags::TSBPDSND | srt_flags::CRYPT, 120, 120);
         hs.add_km_request(&km_message);
 
         let packet = hs.encode(1000, 0);
@@ -1756,7 +1794,7 @@ mod tests {
     #[test]
     fn test_km_error_response() {
         let mut hs = HandshakePacket::new_conclusion_response(1, 2, 3, 0, true);
-        hs.add_hs_response(0x010500, 0, 120);
+        hs.add_hs_response(0x010500, 0, 120, 120);
         hs.add_km_error(KmError::BadSecret);
         assert_eq!(
             hs.extensions
@@ -2192,7 +2230,7 @@ mod tests {
     /// A well-formed HSv5 CONCLUSION request: the HSREQ flag with its record.
     fn conclusion_with_hs() -> HandshakePacket {
         let mut hs = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
-        hs.add_hs_extension(0x0001_0500, 0, 120);
+        hs.add_hs_extension(0x0001_0500, 0, 120, 120);
         hs
     }
 

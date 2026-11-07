@@ -20,7 +20,7 @@ use crate::sender_rto::RtoArm;
 use crate::srt_handshake::{
     DEFAULT_FLOW_WINDOW, DEFAULT_MTU, GroupExtensionData, HS_VERSION_5, HandshakePacket,
     HandshakeState, HandshakeType, IpFamily, KmError, KmMessage, MAX_FLOW_WINDOW, SRT_MAGIC_CODE,
-    SRT_REJ_FILTER, SRT_REJ_ROGUE, SRT_REJ_VERSION, srt_flags,
+    SRT_REJ_CRYPTO, SRT_REJ_FILTER, SRT_REJ_MESSAGEAPI, SRT_REJ_ROGUE, SRT_REJ_VERSION, srt_flags,
 };
 use crate::srt_packet::{
     ControlPacket, ControlType, DataHeader, DataPacket, DatagramClass, PendingData,
@@ -165,6 +165,9 @@ pub const MIN_FLOW_WINDOW_PACKETS: u32 = 32;
 // HSv5 requires SRT 1.3.0 or newer. The peer flow-window field is signed
 // 32-bit and must advertise at least two packets.
 const MIN_HSV5_SRT_VERSION: u32 = 0x010300;
+/// Newest SRT version for which libsrt uses its legacy AES-GCM nonce/AAD
+/// layout (`crypto.cpp`: peers at or below 1.5.3), which is not supported.
+const LEGACY_GCM_MAX_SRT_VERSION: u32 = 0x010503;
 const MIN_PEER_FLOW_WINDOW: u32 = 2;
 
 /// libsrt-compatible zero padding (4 bytes).
@@ -846,6 +849,18 @@ pub struct SrtConnection {
     peer_congestion_control: Option<String>,
     /// SRT capability flags advertised by the peer's handshake extension.
     peer_srt_flags: Option<u32>,
+    /// Negotiated TSBPD delay of this side's receive direction, in ms.
+    ///
+    /// HSv5 negotiates each direction separately (libsrt
+    /// `m_iTsbPdDelay_ms`): the peer's SND half proposes it.
+    rcv_tsbpd_delay: u16,
+    /// Negotiated TSBPD delay of the peer's receive direction, in ms: this
+    /// side's sender drop horizon (libsrt `m_iPeerTsbPdDelay_ms`), proposed
+    /// by the peer's RCV half.
+    peer_tsbpd_delay: u16,
+    /// SRT version the peer advertised in its HSREQ/HSRSP (libsrt
+    /// `SRTO_PEERVERSION`), once the CONCLUSION has been checked.
+    peer_srt_version: Option<u32>,
     /// The peer's advertised SRT flow window (its receive capacity, in
     /// packets); zero means it advertised nothing usable.
     ///
@@ -1268,6 +1283,9 @@ impl SrtConnection {
             role: ConnectionRole::Caller,
             state: ConnectionState::Disconnected,
             handshake_state: HandshakeState::Initial,
+            rcv_tsbpd_delay: options.tsbpd_delay,
+            peer_tsbpd_delay: options.tsbpd_delay,
+            peer_srt_version: None,
             options,
             peer_socket_id: 0,
             syn_cookie: 0,
@@ -1322,6 +1340,9 @@ impl SrtConnection {
             role: ConnectionRole::Listener,
             state: ConnectionState::Listening,
             handshake_state: HandshakeState::Initial,
+            rcv_tsbpd_delay: options.tsbpd_delay,
+            peer_tsbpd_delay: options.tsbpd_delay,
+            peer_srt_version: None,
             options,
             peer_socket_id: 0,
             syn_cookie: 0,
@@ -1402,6 +1423,12 @@ impl SrtConnection {
     /// Return the bonding group metadata advertised by the peer.
     pub fn peer_group_extension(&self) -> Option<GroupExtensionData> {
         self.peer_group_extension
+    }
+
+    /// Return the SRT version the peer advertised in its handshake
+    /// extension (libsrt `SRTO_PEERVERSION`), e.g. `0x010504` for 1.5.4.
+    pub fn peer_srt_version(&self) -> Option<u32> {
+        self.peer_srt_version
     }
 
     /// Return the SRT socket ID advertised by the peer during handshake.
@@ -1613,6 +1640,15 @@ impl SrtConnection {
         if self.role != ConnectionRole::Caller {
             return Err(Error::invalid_state("only caller can initiate connection"));
         }
+        if self.options.passphrase.is_some()
+            && self.options.cipher_mode == CipherMode::Gcm
+            && self.options.srt_version <= LEGACY_GCM_MAX_SRT_VERSION
+        {
+            return Err(Error::crypto_error(
+                "AES-GCM needs an srt_version of 1.5.4 or newer: libsrt peers use the \
+                 unsupported legacy GCM layout with 1.5.3 and older",
+            ));
+        }
 
         self.start_time = Some(now);
         self.handshake_started_at = Some(now);
@@ -1672,11 +1708,8 @@ impl SrtConnection {
     /// data via `set_pacing_demand`.
     fn init_buffers(&mut self, now: Timestamp, peer_initial_seq: u32, tsbpd_time_base: u64) {
         let negotiated_window = self.negotiated_flow_window();
-        let mut sender = SenderBuffer::new(
-            self.initial_seq,
-            negotiated_window,
-            self.options.tsbpd_delay,
-        );
+        let mut sender =
+            SenderBuffer::new(self.initial_seq, negotiated_window, self.peer_tsbpd_delay);
         if let Some(max_bw) = self.options.max_bandwidth_bytes_per_sec {
             sender.set_max_bandwidth(max_bw);
         } else if let Some(input_bw) = self.options.input_bandwidth_bytes_per_sec {
@@ -1686,7 +1719,7 @@ impl SrtConnection {
         self.sender = Some(sender);
         let mut receiver = ReceiverBuffer::with_buffer_size(
             peer_initial_seq,
-            self.options.tsbpd_delay,
+            self.rcv_tsbpd_delay,
             now,
             tsbpd_time_base,
             self.options
@@ -3486,12 +3519,20 @@ impl SrtConnection {
     /// for a NAK loss record, and under GCM room for the authentication tag
     /// plus one byte of application data, so a negotiated session can always
     /// carry DATA (`effective_max_payload_size` subtracts the tag).
-    ///
-    /// The cipher is already known when the CONCLUSION is checked: the
-    /// caller built its crypto context (or configured one) before sending,
-    /// and a listener reads it from the peer's KMREQ.
     fn min_negotiated_payload(&self, hs: &HandshakePacket) -> usize {
-        let cipher = match self.role {
+        if self.handshake_cipher(hs) == Some(CipherMode::Gcm) {
+            MIN_NEGOTIATED_PAYLOAD_SIZE.max(GCM_TAG_LEN + 1)
+        } else {
+            MIN_NEGOTIATED_PAYLOAD_SIZE
+        }
+    }
+
+    /// The cipher this handshake negotiates. It is already known when the
+    /// CONCLUSION is checked: the caller built its crypto context (or
+    /// configured one) before sending, and a listener reads it from the
+    /// peer's KMREQ.
+    fn handshake_cipher(&self, hs: &HandshakePacket) -> Option<CipherMode> {
+        match self.role {
             ConnectionRole::Caller => match self.crypto.as_deref() {
                 Some(crypto) => Some(crypto.cipher_mode()),
                 None => self
@@ -3504,12 +3545,35 @@ impl SrtConnection {
                 .get_km_request()
                 .and_then(Result::ok)
                 .and_then(|km| CipherMode::from_km(&km)),
-        };
-        if cipher == Some(CipherMode::Gcm) {
-            MIN_NEGOTIATED_PAYLOAD_SIZE.max(GCM_TAG_LEN + 1)
-        } else {
-            MIN_NEGOTIATED_PAYLOAD_SIZE
         }
+    }
+
+    /// Refuse an AES-GCM session in which either side advertises SRT 1.5.3
+    /// or older. libsrt selects its legacy GCM nonce/AAD layout for such a
+    /// peer (`core.cpp:6295-6303`, `crypto.cpp:184,500-504`), which this
+    /// implementation does not support, so the session would fail to
+    /// decrypt. A listener answers `SRT_REJ_CRYPTO`, libsrt's code for
+    /// conflicting cryptographic configurations.
+    fn reject_legacy_gcm_peer(
+        &mut self,
+        hs: &HandshakePacket,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        if self.handshake_cipher(hs) != Some(CipherMode::Gcm) {
+            return Ok(());
+        }
+        let peer_legacy = hs
+            .get_hs_extension()
+            .is_some_and(|extension| extension.srt_version <= LEGACY_GCM_MAX_SRT_VERSION);
+        if !peer_legacy && self.options.srt_version > LEGACY_GCM_MAX_SRT_VERSION {
+            return Ok(());
+        }
+        Err(self.refuse_peer(
+            SRT_REJ_CRYPTO,
+            "AES-GCM with an SRT 1.5.3-or-older advertisement selects libsrt's legacy GCM \
+             layout, which this implementation does not support",
+            now,
+        ))
     }
 
     /// Reject a handshake in which the peer negotiates packet-filter
@@ -3540,6 +3604,86 @@ impl SrtConnection {
         }
     }
 
+    /// Refuse the handshake in progress: a caller fails its attempt, a
+    /// listener answers with an HSv5 rejection carrying `reason_code`.
+    fn refuse_peer(&mut self, reason_code: i32, reason: &str, now: Timestamp) -> Error {
+        match self.role {
+            ConnectionRole::Caller => self.fail_caller_handshake(reason),
+            ConnectionRole::Listener => match self.reject(reason_code, now) {
+                Ok(()) => Error::handshake_rejected(reason),
+                Err(error) => error,
+            },
+        }
+    }
+
+    /// Reject a peer whose HS extension declares the other transmission
+    /// API: STREAM set means the stream (file) API, clear the message
+    /// (live) API. libsrt refuses the mismatch with `SRT_REJ_MESSAGEAPI`
+    /// (`processSrtMsg_HSREQ`) instead of running a session in which the
+    /// two peers disagree about message boundaries.
+    fn reject_message_api_mismatch(
+        &mut self,
+        hs: &HandshakePacket,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        let Some(extension) = hs.get_hs_extension() else {
+            return Ok(());
+        };
+        let peer_stream = extension.srt_flags & srt_flags::STREAM != 0;
+        let local_stream = self.negotiated_srt_flags() & srt_flags::STREAM != 0;
+        if peer_stream == local_stream {
+            return Ok(());
+        }
+        let reason = if local_stream {
+            "peer declares the message API but this side uses the stream (file) API"
+        } else {
+            "peer declares the stream API but this side uses the message (live) API"
+        };
+        Err(self.refuse_peer(SRT_REJ_MESSAGEAPI, reason, now))
+    }
+
+    /// Refuse a peer that does not advertise REXMITFLG.
+    ///
+    /// Without it, DATA bit 26 is part of a legacy 27-bit message number
+    /// instead of the retransmission flag this implementation always sets
+    /// and decodes. libsrt has advertised it unconditionally in every HSREQ
+    /// since 1.2.0 and echoes it in its HSRSP to a requester that sent it
+    /// (`fillSrtHandshake_HSREQ`, `fillSrtHandshake_HSRSP`), so every
+    /// peer at the 1.3.0 HSv5 floor carries it; one that omits it is
+    /// inconsistent with its own version, refused with `SRT_REJ_ROGUE` as
+    /// an HSv5 peer claiming a pre-1.3.0 version is.
+    fn reject_peer_without_rexmit_flag(
+        &mut self,
+        hs: &HandshakePacket,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        if hs
+            .get_hs_extension()
+            .is_none_or(|extension| extension.srt_flags & srt_flags::REXMITFLG != 0)
+        {
+            return Ok(());
+        }
+        Err(self.refuse_peer(
+            SRT_REJ_ROGUE,
+            "peer does not advertise REXMITFLG, which every SRT 1.3.0+ peer does",
+            now,
+        ))
+    }
+
+    /// A caller that asked for group membership requires the listener's
+    /// mirror GROUP extension: one that omits it did not understand the
+    /// group, and libsrt's bonded initiator refuses it with `SRT_REJ_GROUP`
+    /// (`interpretSrtHandshake`) rather than running the leg ungrouped. A
+    /// caller that sent no GROUP is unaffected.
+    fn reject_missing_group_response(&mut self, hs: &HandshakePacket) -> Result<(), Error> {
+        if self.options.group_extension.is_none() || hs.get_group_extension().is_some() {
+            return Ok(());
+        }
+        Err(self.fail_caller_handshake(
+            "peer did not answer this caller's GROUP extension (SRT_REJ_GROUP)",
+        ))
+    }
+
     fn handle_caller_conclusion(
         &mut self,
         hs: HandshakePacket,
@@ -3558,6 +3702,10 @@ impl SrtConnection {
         self.reject_unusable_peer_flow_window(&hs, now)?;
         self.reject_peer_mss(&hs, now)?;
         self.reject_unsupported_packet_filter(&hs, now)?;
+        self.reject_message_api_mismatch(&hs, now)?;
+        self.reject_peer_without_rexmit_flag(&hs, now)?;
+        self.reject_legacy_gcm_peer(&hs, now)?;
+        self.reject_missing_group_response(&hs)?;
         self.apply_peer_mss(&hs);
 
         self.peer_socket_id = hs.socket_id;
@@ -3696,6 +3844,9 @@ impl SrtConnection {
 
         self.reject_peer_mss(&hs, now)?;
         self.reject_unsupported_packet_filter(&hs, now)?;
+        self.reject_message_api_mismatch(&hs, now)?;
+        self.reject_peer_without_rexmit_flag(&hs, now)?;
+        self.reject_legacy_gcm_peer(&hs, now)?;
         self.apply_peer_mss(&hs);
         self.note_peer_flow_window(hs.flow_window);
 
@@ -4583,12 +4734,58 @@ impl SrtConnection {
         flags
     }
 
+    /// Record the peer's HSREQ/HSRSP capabilities and negotiate each
+    /// latency direction the way libsrt does
+    /// (`processSrtMsg_HSREQ`/`processSrtMsg_HSRSP`): the peer's SND half
+    /// concerns this side's receive delay, its RCV half the reverse
+    /// direction, each only when the matching TSBPD flag is set. An HSREQ's
+    /// halves are proposals the larger of which wins; an HSRSP's halves are
+    /// the responder's already-negotiated results.
     fn apply_peer_handshake_extension(&mut self, hs: &HandshakePacket) {
+        let configured = self.options.tsbpd_delay;
+        self.rcv_tsbpd_delay = configured;
+        self.peer_tsbpd_delay = configured;
         let Some(extension) = hs.get_hs_extension() else {
             return;
         };
-        self.options.tsbpd_delay = self.options.tsbpd_delay.max(extension.recv_tsbpd_delay);
+        let peer_sends = extension.srt_flags & srt_flags::TSBPDSND != 0;
+        let peer_receives = extension.srt_flags & srt_flags::TSBPDRCV != 0;
+        let (rcv, peer) = match self.role {
+            ConnectionRole::Listener => (
+                configured.max(extension.send_tsbpd_delay),
+                configured.max(extension.recv_tsbpd_delay),
+            ),
+            ConnectionRole::Caller => (extension.send_tsbpd_delay, extension.recv_tsbpd_delay),
+        };
+        if peer_sends {
+            self.rcv_tsbpd_delay = rcv;
+        }
+        if peer_receives {
+            self.peer_tsbpd_delay = peer;
+        }
         self.peer_srt_flags = Some(extension.srt_flags);
+        self.peer_srt_version = Some(extension.srt_version);
+    }
+
+    /// Flags and (RCV, SND) latency halves of this listener's HSRSP.
+    ///
+    /// TSBPDSND, and the SND half carrying the peer's negotiated receive
+    /// delay, are only answered when the peer declared TSBPDRCV (libsrt
+    /// `fillSrtHandshake_HSRSP`).
+    fn hs_response_fields(&self) -> (u32, u16, u16) {
+        let mut flags = self.negotiated_srt_flags();
+        if self
+            .peer_srt_flags
+            .is_none_or(|peer| peer & srt_flags::TSBPDRCV == 0)
+        {
+            flags &= !srt_flags::TSBPDSND;
+        }
+        let snd = if flags & srt_flags::TSBPDSND != 0 {
+            self.peer_tsbpd_delay
+        } else {
+            0
+        };
+        (flags, self.rcv_tsbpd_delay, snd)
     }
 
     fn negotiated_feature(&self, local_flag: u32, peer_flag: u32) -> bool {
@@ -4616,8 +4813,11 @@ impl SrtConnection {
         self.receiver.as_ref()?.gives_up_at(source_time)
     }
 
+    /// Periodic NAK reports are this side's own receive policy, independent
+    /// of the peer's NAKREPORT, which only says whether the peer will send
+    /// them to us (libsrt `fillSrtHandshake_HSRSP`, `checkNAKTimer`).
     fn periodic_nak_enabled(&self) -> bool {
-        self.negotiated_feature(srt_flags::PERIODICNAK, srt_flags::PERIODICNAK)
+        self.negotiated_srt_flags() & srt_flags::PERIODICNAK != 0
     }
 
     fn send_induction_response(&mut self, now: Timestamp) {
@@ -4638,11 +4838,14 @@ impl SrtConnection {
     }
 
     fn send_conclusion_request(&mut self, now: Timestamp) -> Result<(), Error> {
-        let encryption_field = if self.options.passphrase.is_some() {
-            self.options.key_length.to_encryption_field()
-        } else {
-            0
-        };
+        // Advertise the key length the KMREQ actually uses: the crypto
+        // context may have adopted the listener's advertised length, as
+        // libsrt's `checkUpdateCryptoKeyLen` updates its own advertisement.
+        // A caller with a passphrase built its context at INDUCTION.
+        let encryption_field = self
+            .crypto
+            .as_deref()
+            .map_or(0, |crypto| crypto.key_length().to_encryption_field());
 
         let has_encryption = self.options.passphrase.is_some();
         tracing::debug!(
@@ -4662,7 +4865,12 @@ impl SrtConnection {
 
         let flags = self.negotiated_srt_flags();
 
-        hs.add_hs_extension(self.options.srt_version, flags, self.options.tsbpd_delay);
+        hs.add_hs_extension(
+            self.options.srt_version,
+            flags,
+            self.options.tsbpd_delay,
+            self.options.tsbpd_delay,
+        );
 
         // Declare our congestion control mode. A real libsrt peer that
         // declares its own mode refuses to transmit if we declare none at
@@ -4735,9 +4943,8 @@ impl SrtConnection {
         );
         hs.flow_window = self.flight_capacity_packets();
 
-        let flags = self.negotiated_srt_flags();
-
-        hs.add_hs_response(self.options.srt_version, flags, self.options.tsbpd_delay);
+        let (flags, rcv_delay, snd_delay) = self.hs_response_fields();
+        hs.add_hs_response(self.options.srt_version, flags, rcv_delay, snd_delay);
 
         // Declare our congestion control mode (see send_conclusion_request).
         hs.add_congestion_extension(&self.options.congestion_control);
@@ -4773,8 +4980,8 @@ impl SrtConnection {
             true,
         );
         hs.flow_window = self.flight_capacity_packets();
-        let flags = self.negotiated_srt_flags();
-        hs.add_hs_response(self.options.srt_version, flags, self.options.tsbpd_delay);
+        let (flags, rcv_delay, snd_delay) = self.hs_response_fields();
+        hs.add_hs_response(self.options.srt_version, flags, rcv_delay, snd_delay);
         hs.add_km_error(error);
         // A GROUP extension in the RESPONSE names the RECEIVING group and is
         // only meaningful (and, for libsrt callers, only legal) when the caller
@@ -6816,8 +7023,8 @@ mod tests {
 
         assert_eq!(caller.state(), ConnectionState::Connected);
         assert_eq!(listener.state(), ConnectionState::Connected);
-        assert_eq!(caller.options.tsbpd_delay, 500);
-        assert_eq!(listener.options.tsbpd_delay, 500);
+        assert_eq!(negotiated_delays_micros(&caller), (500_000, 500_000));
+        assert_eq!(negotiated_delays_micros(&listener), (500_000, 500_000));
         assert!(
             caller
                 .receiver
@@ -6834,18 +7041,65 @@ mod tests {
         );
     }
 
+    /// A peer without TSBPDSND/TLPKTDROP disables those negotiated live
+    /// features, but its missing NAKREPORT does not stop this side's own
+    /// periodic loss reports: that flag describes the peer's reporting.
     #[test]
     fn peer_capabilities_disable_optional_live_behaviour() {
         let mut conn = SrtConnection::new_listener(ConnectionOptions::default());
         let mut peer = HandshakePacket::new_conclusion_request(1, 0, 0, 0, false);
-        peer.add_hs_extension(0x010500, srt_flags::CRYPT | srt_flags::REXMITFLG, 120);
+        peer.add_hs_extension(0x010500, srt_flags::CRYPT | srt_flags::REXMITFLG, 120, 120);
         conn.apply_peer_handshake_extension(&peer);
         conn.init_buffers(Timestamp::from_micros(0), 0, 0);
 
         assert!(!conn.tsbpd_enabled());
         assert!(!conn.tlpktdrop_enabled());
-        assert!(!conn.periodic_nak_enabled());
+        assert!(conn.periodic_nak_enabled());
         assert!(!conn.receiver.as_ref().expect("receiver").tsbpd_enabled());
+    }
+
+    /// A libsrt peer with `SRTO_NAKREPORT=0` clears NAKREPORT in its HSREQ.
+    /// libsrt keeps reporting its own losses periodically regardless
+    /// (`m_config.bRcvNakReport` alone gates `checkNAKTimer`), so this side
+    /// must too: after the first NAK is lost, the timer repeats the report.
+    #[test]
+    fn local_periodic_nak_repeats_losses_when_the_peer_clears_nakreport() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        let mut no_nakreport = plain;
+        no_nakreport.hs_flags_clear = srt_flags::PERIODICNAK;
+        let mut attempt = handshake_with_rewrites(&no_nakreport, &plain, listener_options());
+        attempt.listener_result.expect("listener accepts");
+        let listener = &mut attempt.listener;
+        let first = listener.initial_seq;
+        let gap_end = (first + 2) & SEQUENCE_MASK;
+        listener.receiver.as_mut().expect("receiver").receive(
+            DataPacket::new(gap_end, 1, 1, 0, Vec::new().into()),
+            Timestamp::from_micros(10_000),
+        );
+        drain_outputs(listener);
+
+        listener
+            .handle_timer(TimerId::Nak, Timestamp::from_micros(1_000_000))
+            .expect("NAK timer");
+        let outputs = drain_outputs(listener);
+        let naks = outputs
+            .iter()
+            .filter(|output| {
+                matches!(output, ConnectionOutput::SendPacket(bytes)
+                    if matches!(SrtPacket::decode(bytes), Ok(SrtPacket::Control(ControlPacket { control_type: ControlType::Nak, .. }))))
+            })
+            .count();
+        assert!(naks > 0, "the outstanding loss is reported again");
+        assert!(
+            outputs.iter().any(|output| matches!(
+                output,
+                ConnectionOutput::SetTimer {
+                    id: TimerId::Nak,
+                    ..
+                }
+            )),
+            "the periodic NAK timer stays armed"
+        );
     }
 
     #[test]
@@ -9492,6 +9746,11 @@ mod tests {
         flow_window: Option<u32>,
         handshake_version: Option<u32>,
         srt_version: Option<u32>,
+        /// HS extension flags to clear, then to set.
+        hs_flags_clear: u32,
+        hs_flags_set: u32,
+        /// HS extension (RCV, SND) latency halves.
+        latency: Option<(u16, u16)>,
     }
 
     impl HandshakeRewrite {
@@ -9504,6 +9763,9 @@ mod tests {
                 flow_window: None,
                 handshake_version: None,
                 srt_version: None,
+                hs_flags_clear: 0,
+                hs_flags_set: 0,
+                latency: None,
             }
         }
     }
@@ -9534,6 +9796,7 @@ mod tests {
                 extension.srt_version,
                 extension.srt_flags | srt_flags::PACKET_FILTER,
                 extension.recv_tsbpd_delay,
+                extension.send_tsbpd_delay,
             );
         }
         if rewrite.filter_extension {
@@ -9543,21 +9806,34 @@ mod tests {
             });
             handshake.extension_field |= extension_flags::CONFIG;
         }
-        if let Some(version) = rewrite.srt_version {
-            for extension in &mut handshake.extensions {
-                if matches!(
-                    extension.ext_type,
-                    ExtensionType::HsReq | ExtensionType::HsRsp
-                ) && extension.data.len() >= 4
-                {
-                    extension.data[..4].copy_from_slice(&version.to_be_bytes());
-                }
+        for extension in &mut handshake.extensions {
+            if matches!(
+                extension.ext_type,
+                ExtensionType::HsReq | ExtensionType::HsRsp
+            ) && extension.data.len() == 12
+            {
+                rewrite_hs_block(&mut extension.data, rewrite);
             }
         }
         let rewritten = handshake.encode(control.timestamp, control.dest_socket_id);
         let mut bytes = Vec::new();
         rewritten.encode(&mut bytes).expect("re-encodes");
         bytes
+    }
+
+    /// Apply a rewrite's version, flag and latency overrides to one raw
+    /// 12-byte HSREQ/HSRSP block.
+    fn rewrite_hs_block(data: &mut [u8], rewrite: &HandshakeRewrite) {
+        if let Some(version) = rewrite.srt_version {
+            data[..4].copy_from_slice(&version.to_be_bytes());
+        }
+        let flags = u32::from_be_bytes(data[4..8].try_into().expect("four bytes"));
+        let flags = (flags & !rewrite.hs_flags_clear) | rewrite.hs_flags_set;
+        data[4..8].copy_from_slice(&flags.to_be_bytes());
+        if let Some((rcv, snd)) = rewrite.latency {
+            data[8..10].copy_from_slice(&rcv.to_be_bytes());
+            data[10..12].copy_from_slice(&snd.to_be_bytes());
+        }
     }
 
     /// Every handshake packet in the connection's output queue, rewritten.
@@ -10205,6 +10481,426 @@ mod tests {
             .expect_err("caller rejects a peer below SRT 1.3.0");
         assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
         assert_eq!(attempt.caller.state(), ConnectionState::Disconnected);
+    }
+
+    /// Negotiated (receive, sender) TSBPD delays of a connected side, read
+    /// from the buffers that actually use them.
+    fn negotiated_delays_micros(conn: &SrtConnection) -> (u64, u64) {
+        let receive = conn.receiver_stats().expect("receiver").tsbpd_delay_micros;
+        let send = conn.sender_stats().expect("sender").tsbpd_delay_micros;
+        (receive, send)
+    }
+
+    /// An asymmetric HSREQ (RCV=20 ms, SND=500 ms) to a 120 ms listener: the
+    /// peer's SND half proposes the listener's receive delay (500 wins), its
+    /// RCV half the caller's (120 wins), and the HSRSP carries the two
+    /// results separately (libsrt `processSrtMsg_HSREQ`,
+    /// `fillSrtHandshake_HSRSP`), at every supported HSv5 SRT version.
+    #[test]
+    fn listener_negotiates_each_latency_direction_from_its_own_hsreq_half() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        for version in [0x0001_0300, 0x0001_0403, 0x0001_0503, 0x0001_0504] {
+            let mut asymmetric = plain;
+            asymmetric.srt_version = Some(version);
+            asymmetric.latency = Some((20, 500));
+            let attempt = handshake_with_rewrites(
+                &asymmetric,
+                &plain,
+                ConnectionOptions {
+                    tsbpd_delay: 120,
+                    ..listener_options()
+                },
+            );
+            attempt.listener_result.expect("listener accepts");
+            attempt.caller_result.expect("caller accepts");
+            assert_eq!(
+                negotiated_delays_micros(&attempt.listener),
+                (500_000, 120_000),
+                "listener at {version:#x}"
+            );
+            // The caller adopts the HSRSP halves: SND=120 for its receive
+            // direction, RCV=500 for the listener's.
+            assert_eq!(
+                negotiated_delays_micros(&attempt.caller),
+                (120_000, 500_000),
+                "caller at {version:#x}"
+            );
+        }
+    }
+
+    /// The inverse, caller-side case: an HSRSP whose RCV=500/SND=120 halves
+    /// describe the listener's receive delay and the caller's. The caller
+    /// must not raise its own 120 ms receive delay to the listener's 500.
+    #[test]
+    fn caller_adopts_each_latency_direction_from_its_own_hsrsp_half() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        let mut response = plain;
+        response.latency = Some((500, 120));
+        let attempt = handshake_with_rewrites(&plain, &response, listener_options());
+        attempt.listener_result.expect("listener accepts");
+        attempt.caller_result.expect("caller accepts");
+        assert_eq!(
+            negotiated_delays_micros(&attempt.caller),
+            (120_000, 500_000)
+        );
+    }
+
+    /// A peer that does not declare TSBPDRCV gets no TSBPDSND (nor an SND
+    /// latency) in the HSRSP: libsrt only answers it when the peer receives
+    /// with TSBPD.
+    #[test]
+    fn hsrsp_answers_tsbpdsnd_only_to_a_peer_declaring_tsbpdrcv() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        let mut no_tsbpd_rcv = plain;
+        no_tsbpd_rcv.hs_flags_clear = srt_flags::TSBPDRCV;
+        let attempt = handshake_with_rewrites(&no_tsbpd_rcv, &plain, listener_options());
+        attempt.listener_result.expect("listener accepts");
+        attempt.caller_result.expect("caller accepts");
+        let response_flags = attempt.caller.peer_srt_flags.expect("HSRSP flags");
+        assert_eq!(response_flags & srt_flags::TSBPDSND, 0);
+        assert_ne!(response_flags & srt_flags::TSBPDRCV, 0);
+        // The withheld SND half is zero: forcing TSBPDSND back on in transit
+        // makes the caller adopt exactly what the listener wrote there.
+        let mut forced_snd = plain;
+        forced_snd.hs_flags_set = srt_flags::TSBPDSND;
+        let attempt = handshake_with_rewrites(&no_tsbpd_rcv, &forced_snd, listener_options());
+        attempt.caller_result.expect("caller accepts");
+        assert_eq!(negotiated_delays_micros(&attempt.caller).0, 0);
+
+        let attempt = handshake_with_rewrites(&plain, &plain, listener_options());
+        let response_flags = attempt.caller.peer_srt_flags.expect("HSRSP flags");
+        assert_ne!(response_flags & srt_flags::TSBPDSND, 0);
+    }
+
+    /// A latency half whose TSBPD flag is clear proposes nothing: a 500 ms
+    /// half without TSBPDSND/TSBPDRCV leaves the listener's 120 ms in place.
+    #[test]
+    fn latency_halves_without_their_tsbpd_flag_are_ignored() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        let mut flagless = plain;
+        flagless.hs_flags_clear = srt_flags::TSBPDSND | srt_flags::TSBPDRCV;
+        flagless.latency = Some((500, 500));
+        let attempt = handshake_with_rewrites(&flagless, &plain, listener_options());
+        attempt.listener_result.expect("listener accepts");
+        assert_eq!(
+            negotiated_delays_micros(&attempt.listener),
+            (120_000, 120_000)
+        );
+    }
+
+    /// Options for one side of a message-API matrix case: live (message
+    /// API) or file (stream API, STREAM set).
+    fn api_options(file: bool, socket_id: u32) -> ConnectionOptions {
+        ConnectionOptions {
+            socket_id,
+            syn_cookie: Some(7),
+            congestion_control: if file { "file" } else { "live" }.to_owned(),
+            ..ConnectionOptions::default()
+        }
+    }
+
+    /// A rewrite that sets or clears the HS extension's STREAM flag and
+    /// advertises `version`.
+    fn stream_rewrite(stream: bool, version: u32) -> HandshakeRewrite {
+        let mut rewrite = HandshakeRewrite::mss(1500, IpFamily::V4);
+        rewrite.srt_version = Some(version);
+        if stream {
+            rewrite.hs_flags_set = srt_flags::STREAM;
+        } else {
+            rewrite.hs_flags_clear = srt_flags::STREAM;
+        }
+        rewrite
+    }
+
+    /// Every local live/file x peer STREAM clear/set combination at SRT
+    /// 1.3.0 and 1.5.4: a listener refuses the other transmission API with
+    /// `SRT_REJ_MESSAGEAPI` (libsrt `processSrtMsg_HSREQ`) before Connected.
+    #[test]
+    fn listener_rejects_a_peer_declaring_the_other_transmission_api() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        for version in [0x0001_0300, 0x0001_0504] {
+            for (local_file, peer_stream) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let case = format!("{version:#x} file={local_file} STREAM={peer_stream}");
+                let mut attempt = handshake_with_options(
+                    &stream_rewrite(peer_stream, version),
+                    &plain,
+                    api_options(local_file, 1),
+                    api_options(local_file, 2),
+                );
+                if local_file == peer_stream {
+                    attempt.listener_result.expect(&case);
+                    assert_eq!(
+                        attempt.listener.state(),
+                        ConnectionState::Connected,
+                        "{case}"
+                    );
+                    continue;
+                }
+                let error = attempt.listener_result.expect_err(&case);
+                assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected, "{case}");
+                assert_ne!(
+                    attempt.listener.state(),
+                    ConnectionState::Connected,
+                    "{case}"
+                );
+                assert_eq!(
+                    rejection_reason(&mut attempt.listener),
+                    Some(SRT_REJ_MESSAGEAPI),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// The same matrix from the caller's side: an HSRSP declaring the other
+    /// transmission API fails the caller before Connected.
+    #[test]
+    fn caller_rejects_a_peer_declaring_the_other_transmission_api() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        for version in [0x0001_0300, 0x0001_0504] {
+            for (local_file, peer_stream) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let case = format!("{version:#x} file={local_file} STREAM={peer_stream}");
+                let attempt = handshake_with_options(
+                    &plain,
+                    &stream_rewrite(peer_stream, version),
+                    api_options(local_file, 1),
+                    api_options(local_file, 2),
+                );
+                attempt.listener_result.expect(&case);
+                if local_file == peer_stream {
+                    attempt.caller_result.expect(&case);
+                    assert_eq!(attempt.caller.state(), ConnectionState::Connected, "{case}");
+                } else {
+                    let error = attempt.caller_result.expect_err(&case);
+                    assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected, "{case}");
+                    assert_ne!(attempt.caller.state(), ConnectionState::Connected, "{case}");
+                }
+            }
+        }
+    }
+
+    /// A caller that sent GROUP refuses a response without one (libsrt
+    /// `SRT_REJ_GROUP`); a direct caller that sent none still connects.
+    #[test]
+    fn caller_requires_a_group_response_only_when_it_sent_group() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        let grouped_caller = ConnectionOptions {
+            socket_id: 1,
+            group_extension: Some(GroupExtensionData {
+                group_id: SRTGROUP_MASK | 0x31,
+                group_type: GroupType::Broadcast,
+                flags: 0,
+                weight: 1,
+            }),
+            ..ConnectionOptions::default()
+        };
+        let attempt = handshake_with_options(&plain, &plain, grouped_caller, listener_options());
+        attempt.listener_result.expect("listener answers");
+        let error = attempt
+            .caller_result
+            .expect_err("no mirror GROUP in the response");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_ne!(attempt.caller.state(), ConnectionState::Connected);
+
+        let direct = handshake_with_rewrites(&plain, &plain, listener_options());
+        direct
+            .caller_result
+            .expect("a direct caller needs no GROUP");
+        assert_eq!(direct.caller.state(), ConnectionState::Connected);
+    }
+
+    /// A peer that omits REXMITFLG would read DATA bit 26 as part of a
+    /// legacy 27-bit message number, while this side always marks
+    /// retransmissions with it. Every SRT 1.3.0+ peer advertises the flag,
+    /// so either role refuses one that does not, the listener with
+    /// `SRT_REJ_ROGUE`.
+    #[test]
+    fn a_peer_without_rexmitflg_is_refused_in_both_roles() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        let mut no_rexmit = plain;
+        no_rexmit.hs_flags_clear = srt_flags::REXMITFLG;
+
+        let mut attempt = handshake_with_rewrites(&no_rexmit, &plain, listener_options());
+        let error = attempt
+            .listener_result
+            .expect_err("listener refuses an HSREQ without REXMITFLG");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_ne!(attempt.listener.state(), ConnectionState::Connected);
+        assert_eq!(rejection_reason(&mut attempt.listener), Some(SRT_REJ_ROGUE));
+
+        let attempt = handshake_with_rewrites(&plain, &no_rexmit, listener_options());
+        attempt.listener_result.expect("listener accepts");
+        let error = attempt
+            .caller_result
+            .expect_err("caller refuses an HSRSP without REXMITFLG");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_ne!(attempt.caller.state(), ConnectionState::Connected);
+    }
+
+    /// Encrypted options for one side of a legacy-GCM boundary case.
+    fn cipher_options(socket_id: u32, cipher_mode: CipherMode) -> ConnectionOptions {
+        ConnectionOptions {
+            socket_id,
+            syn_cookie: Some(7),
+            passphrase: Some("interop-passphrase".to_owned()),
+            cipher_mode,
+            ..ConnectionOptions::default()
+        }
+    }
+
+    /// libsrt uses its legacy GCM layout with a peer at SRT 1.5.3 or older.
+    /// A GCM session whose peer advertises 0x010503 is refused in both
+    /// roles (listener: `SRT_REJ_CRYPTO`); 0x010504 connects and is
+    /// recorded as the peer version; CTR is unaffected.
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "constructs a real CryptoContext, deriving its KEK via 2048               \
+                  PBKDF2-HMAC-SHA1 iterations (per the SRT spec) under Miri; correctness    \
+                  is proven outside Miri, and this property is unrelated to PBKDF2's own    \
+                  iteration count. Run in the miri-extended scheduled job."
+    )]
+    fn gcm_with_a_peer_at_srt_1_5_3_or_older_is_refused_in_both_roles() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        let mut legacy = plain;
+        legacy.srt_version = Some(0x0001_0503);
+        let mut modern = plain;
+        modern.srt_version = Some(0x0001_0504);
+        let gcm = |id| cipher_options(id, CipherMode::Gcm);
+
+        let mut attempt = handshake_with_options(&legacy, &plain, gcm(1), gcm(2));
+        let error = attempt.listener_result.expect_err("legacy GCM caller");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_eq!(
+            rejection_reason(&mut attempt.listener),
+            Some(SRT_REJ_CRYPTO)
+        );
+        assert_ne!(attempt.listener.state(), ConnectionState::Connected);
+
+        let attempt = handshake_with_options(&plain, &legacy, gcm(1), gcm(2));
+        attempt.listener_result.expect("listener accepts");
+        let error = attempt.caller_result.expect_err("legacy GCM listener");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_ne!(attempt.caller.state(), ConnectionState::Connected);
+
+        let attempt = handshake_with_options(&modern, &modern, gcm(1), gcm(2));
+        attempt.listener_result.expect("1.5.4 caller");
+        attempt.caller_result.expect("1.5.4 listener");
+        assert_eq!(attempt.listener.peer_srt_version(), Some(0x0001_0504));
+        assert_eq!(attempt.caller.peer_srt_version(), Some(0x0001_0504));
+
+        let ctr = |id| cipher_options(id, CipherMode::Ctr);
+        let attempt = handshake_with_options(&legacy, &legacy, ctr(1), ctr(2));
+        attempt.listener_result.expect("legacy CTR caller");
+        attempt.caller_result.expect("legacy CTR listener");
+    }
+
+    /// A local `srt_version` of 1.5.3 or older with GCM would make a libsrt
+    /// peer use the legacy layout: a caller refuses it when it starts, a
+    /// listener refuses a GCM caller with `SRT_REJ_CRYPTO`.
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "constructs a real CryptoContext, deriving its KEK via 2048               \
+                  PBKDF2-HMAC-SHA1 iterations (per the SRT spec) under Miri; correctness    \
+                  is proven outside Miri, and this property is unrelated to PBKDF2's own    \
+                  iteration count. Run in the miri-extended scheduled job."
+    )]
+    fn a_local_srt_1_5_3_advertisement_cannot_use_gcm() {
+        for (version, allowed) in [(0x0001_0503, false), (0x0001_0504, true)] {
+            let mut caller = SrtConnection::new_caller(ConnectionOptions {
+                srt_version: version,
+                ..cipher_options(1, CipherMode::Gcm)
+            });
+            let started = caller.connect(Timestamp::default());
+            assert_eq!(started.is_ok(), allowed, "{version:#x}");
+            if let Err(error) = started {
+                assert_eq!(error.kind, crate::ErrorKind::CryptoError);
+            }
+        }
+        let mut ctr = SrtConnection::new_caller(ConnectionOptions {
+            srt_version: 0x0001_0503,
+            ..cipher_options(1, CipherMode::Ctr)
+        });
+        ctr.connect(Timestamp::default())
+            .expect("CTR is unaffected");
+
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        let mut attempt = handshake_with_options(
+            &plain,
+            &plain,
+            cipher_options(1, CipherMode::Gcm),
+            ConnectionOptions {
+                srt_version: 0x0001_0503,
+                ..cipher_options(2, CipherMode::Gcm)
+            },
+        );
+        attempt
+            .listener_result
+            .expect_err("a 1.5.3 listener refuses GCM");
+        assert_eq!(
+            rejection_reason(&mut attempt.listener),
+            Some(SRT_REJ_CRYPTO)
+        );
+    }
+
+    /// A caller configured for AES-128 without a fixed SEK adopts the
+    /// listener's advertised AES-256 for its KMREQ; its CONCLUSION
+    /// encryption field must advertise that same negotiated length, as
+    /// libsrt's `checkUpdateCryptoKeyLen` updates its own advertisement.
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "constructs a real CryptoContext, deriving its KEK via 2048               \
+                  PBKDF2-HMAC-SHA1 iterations (per the SRT spec) under Miri; correctness    \
+                  is proven outside Miri, and this property is unrelated to PBKDF2's own    \
+                  iteration count. Run in the miri-extended scheduled job."
+    )]
+    fn caller_conclusion_advertises_the_key_length_its_kmreq_uses() {
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            key_length: KeyLength::Aes128,
+            ..cipher_options(1, CipherMode::Ctr)
+        });
+        let mut listener = SrtConnection::new_listener(ConnectionOptions {
+            key_length: KeyLength::Aes256,
+            ..cipher_options(2, CipherMode::Ctr)
+        });
+        caller.connect(Timestamp::default()).expect("caller starts");
+        for packet in drain_handshakes(&mut caller) {
+            listener
+                .feed_recv_buf(&packet, Timestamp::from_micros(1_000))
+                .expect("INDUCTION");
+        }
+        for packet in drain_handshakes(&mut listener) {
+            caller
+                .feed_recv_buf(&packet, Timestamp::from_micros(2_000))
+                .expect("INDUCTION response");
+        }
+        let conclusion = drain_handshakes(&mut caller).pop().expect("CONCLUSION");
+        let SrtPacket::Control(control) = SrtPacket::decode(&conclusion).expect("decodes") else {
+            panic!("handshake is a control packet");
+        };
+        let hs = HandshakePacket::decode(&control).expect("handshake decodes");
+        let km = hs
+            .get_km_request()
+            .expect("KMREQ present")
+            .expect("KMREQ decodes");
+        assert_eq!(km.key_length, KeyLength::Aes256);
+        assert_eq!(hs.key_length(), Some(km.key_length));
+    }
+
+    fn drain_handshakes(conn: &mut SrtConnection) -> Vec<Vec<u8>> {
+        drain_outputs(conn)
+            .into_iter()
+            .filter_map(|output| match output {
+                ConnectionOutput::SendPacket(bytes) => Some(bytes),
+                _ => None,
+            })
+            .collect()
     }
 
     /// A peer that negotiates packet-filter behaviour gets a refusal, not a

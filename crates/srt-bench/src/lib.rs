@@ -998,6 +998,15 @@ impl BenchConfig {
         let mut template = session.into_connection_options();
         template.socket_id = socket_id;
         self.encryption.apply_to(&mut template);
+        // A bonded caller refuses a response without the receiving group's
+        // mirror GROUP extension (libsrt `SRT_REJ_GROUP`); this bench
+        // receiver is one logical receiving group for every bonded leg.
+        template.group_extension =
+            self.bond_extension_for(0)
+                .map(|extension| srt_proto::handshake::GroupExtensionData {
+                    group_id: srt_proto::handshake::SRTGROUP_MASK | 0x5256,
+                    ..extension
+                });
         srt_transport::advanced::admission::AdmissionOptions {
             socket_id,
             tsbpd_delay: self.latency_ms,

@@ -165,6 +165,39 @@ implemented: those handshake frame types decode for safe peer handling, but
 the state machine does not initiate or complete a rendezvous exchange. Use a
 reachable listener for every connection.
 
+### Handshake negotiation
+
+HSv5 negotiation follows libsrt 1.5.7:
+
+- Latency is negotiated per direction. `tsbpd_delay` is this side's proposal
+  for both directions; each direction ends at the larger of the two peers'
+  proposals for it, so the two receive delays of a session can differ (a
+  libsrt peer with `SRTO_RCVLATENCY` 20 ms and `SRTO_PEERLATENCY` 500 ms
+  against a 120 ms listener gives the listener a 500 ms receive delay and the
+  caller 120 ms). `receiver_stats().tsbpd_delay_micros` is the local playout
+  delay, `sender_stats().tsbpd_delay_micros` the peer's (the sender's drop
+  horizon). `HandshakePacket::add_hs_extension` and `add_hs_response` take
+  the RCV and SND halves separately.
+- Periodic NAK reports are local receive policy and always on; a peer that
+  clears NAKREPORT (libsrt `SRTO_NAKREPORT=0`) only declares that it will not
+  send them itself.
+- A peer whose STREAM flag declares the other transmission API (stream/file
+  versus message/live) is refused before `Connected`: a listener answers
+  `SRT_REJ_MESSAGEAPI`, a caller fails its attempt.
+- A caller that sent GROUP requires the listener's mirror GROUP extension
+  and fails its attempt without one (libsrt `SRT_REJ_GROUP`); a listener
+  accepting bonded callers must therefore set a receiving group. Direct
+  callers are unaffected.
+- A peer that does not advertise REXMITFLG is refused (`SRT_REJ_ROGUE` from a
+  listener). Every libsrt since 1.2.0 advertises it, and this implementation
+  does not support the legacy 27-bit message-number layout.
+- AES-GCM uses the modern (libsrt 1.5.4+) nonce/AAD layout only. A GCM
+  session whose peer advertises SRT 1.5.3 or older, for which libsrt would
+  use its legacy layout, is refused in both roles (`SRT_REJ_CRYPTO`, libsrt's
+  code for conflicting cryptographic configurations, from a listener), and
+  `connect` refuses a local `srt_version` of 1.5.3 or older with GCM.
+  `SrtConnection::peer_srt_version` reports the peer's advertised version.
+
 ## Testing
 
 ```sh
