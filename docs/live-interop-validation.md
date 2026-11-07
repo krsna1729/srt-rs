@@ -234,17 +234,24 @@ when they have installed a capable library.
    unit, property, and loom tests remain parallel.
 4. **Robotweax 0.3.2 as a second reference**: the same suite runs against
    Robotweax's `srt-live-transmit` build (version-bound to Haivision 1.5.7
-   sources) by putting it first on `PATH`. Every Rust-caller direction
-   passes, including GCM, loss recovery, and key refresh, as do the native
-   Owner caller and Robotweax's plaintext caller. Its encrypted callers do
-   not. Right after connecting, Robotweax was observed to send a fresh KMREQ
-   for the *current* key index with a new salt and SEK. This receiver accepts
-   only the next key generation and fails closed on a same-index rekey, so
-   Robotweax never begins sending data. Haivision does not send this message.
-   The cause is not established: Robotweax may be rejecting this receiver's
-   handshake KMRSP and re-keying. Accepting a same-index rekey would weaken
-   replay protection. This remains an open compatibility difference, not a
-   passing result.
+   sources) by putting it first on `PATH`. Right after connecting, Robotweax
+   announces its transmit key again under the *same* key index with a new
+   salt and SEK (a directional re-key). libsrt 1.5.7 installs such a KMREQ
+   (`haicrypt/hcrypt_ctx_rx.c` replaces the key under its selector and
+   re-derives the KEK for a new salt). srt-rs used to accept only the next
+   key generation and refused it, so Robotweax never began sending DATA:
+   its AES-128, AES-256, GCM, and key-refresh callers failed (14/18 passed).
+   srt-rs now follows libsrt here, keeps separate transmit and receive
+   keys, and installs both-key (KK = 3) refresh announcements; the suite
+   passes 18/18 against both Haivision 1.5.7 and Robotweax 0.3.2. Hardening
+   kept beyond libsrt: a reflected local transmit key, a known key under
+   another selector or salt, one of the last four replaced receive keys,
+   and one SEK under both selectors are refused, and fresh-salt KEK
+   derivations are bounded per connection (two at once, then one per
+   second). The key-refresh test now drives 40 packets through a recording
+   proxy and asserts a KK = 3 KMREQ, an exact-body KMRSP for every KMREQ,
+   and DATA under both selectors; the earlier 4-packet version never
+   reached libsrt's pre-announce threshold, so no refresh occurred.
 
 The automated suite is the reproducible form of the manual results. On a
 developer machine without the optional tools and development library, the

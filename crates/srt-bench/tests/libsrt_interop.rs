@@ -284,6 +284,64 @@ fn receive_from_libsrt_caller(
     )
 }
 
+/// What a forwarding proxy saw of the key exchange and of the caller's DATA
+/// key selectors.
+#[derive(Debug, Default)]
+struct WireObservation {
+    /// Caller KMREQ bodies (UserDefined subtype 3), in arrival order.
+    kmreqs: Vec<Vec<u8>>,
+    /// Listener KMRSP bodies (UserDefined subtype 4), in arrival order.
+    kmrsps: Vec<Vec<u8>>,
+    /// Caller DATA packets per KK selector (index = KK field).
+    data_by_selector: [u64; 4],
+}
+
+impl WireObservation {
+    fn record(&mut self, datagram: &[u8], from_caller: bool) {
+        if datagram.len() < 16 {
+            return;
+        }
+        if datagram[0] & 0x80 == 0 {
+            if from_caller {
+                // KK occupies bits 3-4 of the second word's first byte.
+                self.data_by_selector[usize::from((datagram[4] >> 3) & 0b11)] += 1;
+            }
+            return;
+        }
+        let control_type = u16::from_be_bytes([datagram[0] & 0x7F, datagram[1]]);
+        let subtype = u16::from_be_bytes([datagram[2], datagram[3]]);
+        if control_type != 0x7FFF {
+            return;
+        }
+        let body = datagram[16..].to_vec();
+        match (subtype, from_caller) {
+            (3, true) => self.kmreqs.push(body),
+            (4, false) => self.kmrsps.push(body),
+            _ => {}
+        }
+    }
+}
+
+/// How the libsrt caller reaches the Rust listener.
+enum CallerPath {
+    Direct,
+    /// Through a forwarding proxy that drops every `drop_every`th DATA
+    /// packet, if set, and records what it forwards.
+    Proxy {
+        drop_every: Option<u32>,
+        observation: Arc<Mutex<WireObservation>>,
+    },
+}
+
+impl CallerPath {
+    fn lossy(drop_every: u32) -> Self {
+        Self::Proxy {
+            drop_every: Some(drop_every),
+            observation: Arc::default(),
+        }
+    }
+}
+
 /// Run a live libsrt caller with a loopback UDP source. `srt-live-transmit`
 /// cannot reliably poll `file://con` in this environment, while its UDP
 /// source is a normal production input and gives this test a bounded EOF-free
@@ -291,8 +349,9 @@ fn receive_from_libsrt_caller(
 fn lossy_udp_proxy_thread(
     listen: UdpSocket,
     listener: SocketAddr,
-    drop_every: u32,
+    drop_every: Option<u32>,
     stop: Arc<AtomicBool>,
+    observation: Arc<Mutex<WireObservation>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         listen
@@ -314,6 +373,10 @@ fn lossy_udp_proxy_thread(
                 }
                 Err(error) => panic!("proxy receive failed: {error}"),
             };
+            observation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record(&buf[..n], from != listener);
             if from == listener {
                 if let Some(caller) = caller {
                     listen
@@ -327,7 +390,7 @@ fn lossy_udp_proxy_thread(
             // SRT data packets have a clear high bit; control traffic must not
             // be dropped, or a handshake/NAK test could become a timing test.
             let is_data = buf.first().is_some_and(|first| first & 0x80 == 0);
-            if is_data {
+            if is_data && let Some(drop_every) = drop_every {
                 forwarded_data_packets += 1;
                 if forwarded_data_packets.is_multiple_of(drop_every) {
                     continue;
@@ -344,7 +407,7 @@ fn receive_live_from_udp_source(
     payload: &[u8],
     caller_encryption: Option<(&str, KeyLength)>,
     listener_encryption: Option<(&str, KeyLength)>,
-    drop_every: Option<u32>,
+    path: CallerPath,
     output_options: Option<&str>,
 ) -> (driver::DriverResult, ExitStatus, String) {
     // Keep this listener's OS-assigned port reserved for the entire transfer.
@@ -355,17 +418,22 @@ fn receive_live_from_udp_source(
         .expect("set_read_timeout");
 
     let proxy_stop = Arc::new(AtomicBool::new(false));
-    let proxy = drop_every.map(|drop_every| {
-        let proxy = UdpSocket::bind(("127.0.0.1", 0)).expect("bind lossy UDP proxy");
-        let proxy_addr = proxy.local_addr().expect("read proxy address");
-        let listener = socket.local_addr().expect("read listener address");
-        (
-            proxy_addr,
-            lossy_udp_proxy_thread(proxy, listener, drop_every, Arc::clone(&proxy_stop)),
-        )
-    });
-    let output_port = proxy.as_ref().map_or(port, |(addr, _)| addr.port());
-    let loss_recovery = proxy.is_some();
+    let proxy = match path {
+        CallerPath::Direct => None,
+        CallerPath::Proxy {
+            drop_every,
+            observation,
+        } => {
+            let proxy = UdpSocket::bind(("127.0.0.1", 0)).expect("bind UDP proxy");
+            let proxy_addr = proxy.local_addr().expect("read proxy address");
+            let listener = socket.local_addr().expect("read listener address");
+            let stop = Arc::clone(&proxy_stop);
+            let thread = lossy_udp_proxy_thread(proxy, listener, drop_every, stop, observation);
+            Some((proxy_addr, thread, drop_every.is_some()))
+        }
+    };
+    let output_port = proxy.as_ref().map_or(port, |(addr, _, _)| addr.port());
+    let loss_recovery = proxy.as_ref().is_some_and(|(_, _, lossy)| *lossy);
     let mut output_uri = match caller_encryption {
         Some((passphrase, key_length)) => format!(
             "srt://127.0.0.1:{output_port}?passphrase={passphrase}&pbkeylen={}",
@@ -436,10 +504,10 @@ fn receive_live_from_udp_source(
             Err(e) => panic!("recv_from failed: {e}"),
         }
     };
-    // The proxy is the listener's peer under loss; without it, connect to the
-    // actual libsrt caller directly as the baseline tests do.
+    // The proxy is the listener's peer when present; without it, connect to
+    // the actual libsrt caller directly as the baseline tests do.
     socket
-        .connect(proxy.as_ref().map_or(peer_addr, |(addr, _)| *addr))
+        .connect(proxy.as_ref().map_or(peer_addr, |(addr, _, _)| *addr))
         .expect("connect listener socket to peer");
 
     let mut conn = SrtConnection::new_listener(ConnectionOptions {
@@ -465,7 +533,7 @@ fn receive_live_from_udp_source(
     );
     source_sender.join().expect("UDP source sender panicked");
     proxy_stop.store(true, Ordering::Relaxed);
-    if let Some((_, proxy)) = proxy {
+    if let Some((_, proxy, _)) = proxy {
         proxy.join().expect("lossy UDP proxy panicked");
     }
     let output = wait_for_child(child, "srt-live-transmit");
@@ -714,8 +782,9 @@ fn send_to_libsrt_listener_through_lossy_proxy(payload: &[u8]) -> (driver::Drive
     let proxy_thread = lossy_udp_proxy_thread(
         proxy,
         SocketAddr::from(([127, 0, 0, 1], listener_port)),
-        20,
+        Some(20),
         Arc::clone(&stop),
+        Arc::default(),
     );
 
     let socket = UdpSocket::bind(("127.0.0.1", 0)).expect("bind Rust lossy caller socket");
@@ -822,7 +891,8 @@ fn libsrt_live_transmit_caller_sends_udp_to_rust_listener() {
 
     let payload = test_payload();
 
-    let (result, status, stderr) = receive_live_from_udp_source(&payload, None, None, None, None);
+    let (result, status, stderr) =
+        receive_live_from_udp_source(&payload, None, None, CallerPath::Direct, None);
 
     assert!(
         result.connected,
@@ -859,7 +929,7 @@ fn libsrt_input_bandwidth_caller_sends_stream_to_rust_listener() {
         &payload,
         None,
         None,
-        None,
+        CallerPath::Direct,
         Some("maxbw=0&inputbw=1000000&oheadbw=25"),
     );
     assert!(
@@ -874,9 +944,14 @@ fn libsrt_input_bandwidth_caller_sends_stream_to_rust_listener() {
     );
 }
 
-/// Configure a tiny libsrt refresh cadence to prove its KMREQ and subsequent
-/// encrypted data are accepted by the Rust listener without a 2²⁵-packet CI
-/// transfer.
+/// libsrt refreshes its stream key on a packet schedule: it pre-announces
+/// the next key together with the current one in one both-key KMREQ (KK =
+/// 3, even SEK first; `haicrypt/hcrypt_ctx_tx.c`), switches DATA to the new
+/// selector, and later announces the new key alone. A tiny refresh cadence
+/// puts the caller through several cycles without a 2²⁵-packet transfer.
+/// The forwarding proxy records the key exchange and the DATA selectors, so
+/// the test proves the refresh happened and was answered -- not merely that
+/// the transfer completed.
 #[test]
 fn libsrt_live_caller_refreshes_key_with_rust_listener() {
     let _guard = interop_test_lock();
@@ -887,12 +962,17 @@ fn libsrt_live_caller_refreshes_key_with_rust_listener() {
         return;
     }
 
-    let payload = test_payload_bytes(4_000);
+    // Forty 1000-byte datagrams: several refresh cycles at a cadence of 8.
+    let payload = test_payload_bytes(40_000);
+    let observation = Arc::new(Mutex::new(WireObservation::default()));
     let (result, status, stderr) = receive_live_from_udp_source(
         &payload,
         Some(("interop-passphrase", KeyLength::Aes128)),
         Some(("interop-passphrase", KeyLength::Aes128)),
-        None,
+        CallerPath::Proxy {
+            drop_every: None,
+            observation: Arc::clone(&observation),
+        },
         Some("kmrefreshrate=8&kmpreannounce=3"),
     );
     assert!(
@@ -906,7 +986,28 @@ fn libsrt_live_caller_refreshes_key_with_rust_listener() {
     );
     assert!(
         received_payloads_match(&result.received_payloads, &payload),
-        "Rust listener did not decrypt through the libsrt key refresh"
+        "Rust listener did not decrypt through the libsrt key refresh: {:?}",
+        result.events
+    );
+    let seen = observation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let selectors: Vec<u8> = seen.kmreqs.iter().map(|body| body[3]).collect();
+    assert!(
+        selectors.contains(&0b11),
+        "the caller never announced both keys; KMREQ selectors {selectors:?}"
+    );
+    for request in &seen.kmreqs {
+        assert!(
+            seen.kmrsps.contains(request),
+            "a KMREQ (KK = {}) got no exact-body KMRSP",
+            request[3]
+        );
+    }
+    assert!(
+        seen.data_by_selector[1] > 0 && seen.data_by_selector[2] > 0,
+        "DATA never used both selectors: {:?}",
+        seen.data_by_selector
     );
 }
 
@@ -925,7 +1026,7 @@ fn libsrt_caller_recovers_payload_under_5pct_loss() {
 
     let payload = test_payload_bytes(120_000);
     let (result, status, stderr) =
-        receive_live_from_udp_source(&payload, None, None, Some(20), None);
+        receive_live_from_udp_source(&payload, None, None, CallerPath::lossy(20), None);
     assert!(
         result.connected,
         "Rust listener never reached Connected through the lossy proxy: {:?}",
@@ -957,7 +1058,7 @@ fn libsrt_live_caller_aes128_to_rust_listener() {
         &payload,
         Some(("interop-passphrase", KeyLength::Aes128)),
         Some(("interop-passphrase", KeyLength::Aes128)),
-        None,
+        CallerPath::Direct,
         None,
     );
     assert!(
@@ -988,7 +1089,7 @@ fn libsrt_live_caller_aes256_to_rust_listener() {
         &payload,
         Some(("interop-passphrase", KeyLength::Aes256)),
         Some(("interop-passphrase", KeyLength::Aes256)),
-        None,
+        CallerPath::Direct,
         None,
     );
     assert!(
@@ -1020,7 +1121,7 @@ fn libsrt_live_caller_wrong_passphrase_is_rejected_by_rust_listener() {
         b"must never be delivered",
         Some(("wrong-interop-passphrase", KeyLength::Aes128)),
         Some(("interop-passphrase", KeyLength::Aes128)),
-        None,
+        CallerPath::Direct,
         None,
     );
 
@@ -1826,7 +1927,7 @@ fn libsrt_gcm_caller_sends_to_rust_listener() {
         &payload,
         Some(("interop-passphrase", KeyLength::Aes128)),
         Some(("interop-passphrase", KeyLength::Aes128)),
-        None,
+        CallerPath::Direct,
         Some("cryptomode=2"),
     );
     assert!(
@@ -1906,7 +2007,8 @@ fn libsrt_live_transmit_max_payload_received_by_rust_listener() {
 
     let payload = test_payload_bytes(1_316);
 
-    let (result, status, stderr) = receive_live_from_udp_source(&payload, None, None, None, None);
+    let (result, status, stderr) =
+        receive_live_from_udp_source(&payload, None, None, CallerPath::Direct, None);
     assert!(
         result.connected,
         "Rust listener never reached Connected: {:?}",
