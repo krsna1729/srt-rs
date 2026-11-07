@@ -2259,7 +2259,8 @@ pub struct SenderStats {
     pub packets_in_flight: u32,
     /// Time span between oldest and newest buffered packets.
     pub buffer_span_micros: u64,
-    /// Configured sender TSBPD delay.
+    /// Negotiated sender TSBPD delay: the peer's receive latency, which
+    /// bounds this side's too-late drop.
     pub tsbpd_delay_micros: u64,
     /// Current pacing period between original packet sends.
     pub packet_send_period_micros: u64,

@@ -353,7 +353,7 @@ proptest! {
 
         // ラウンドトリップ: a CONCLUSION carries its HS record, and a set
         // KMREQ flag must be backed by a KMREQ record.
-        packet.add_hs_extension(0x010500, 0, 120);
+        packet.add_hs_extension(0x010500, 0, 120, 120);
         if has_encryption {
             packet.add_km_request(&KmMessage::new(
                 KeyFlag::Even,
@@ -404,10 +404,11 @@ proptest! {
     fn test_hs_extension_roundtrip(
         srt_version in any::<u32>(),
         srt_flags in any::<u32>(),
-        tsbpd_delay in any::<u16>(),
+        recv_delay in any::<u16>(),
+        send_delay in any::<u16>(),
     ) {
         let mut packet = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
-        packet.add_hs_extension(srt_version, srt_flags, tsbpd_delay);
+        packet.add_hs_extension(srt_version, srt_flags, recv_delay, send_delay);
 
         let ctrl = packet.encode(1000, 0);
         let decoded = HandshakePacket::decode(&ctrl).expect("decode should succeed");
@@ -415,8 +416,8 @@ proptest! {
         let ext = decoded.get_hs_extension().expect("should have hs extension");
         prop_assert_eq!(ext.srt_version, srt_version);
         prop_assert_eq!(ext.srt_flags, srt_flags);
-        prop_assert_eq!(ext.recv_tsbpd_delay, tsbpd_delay);
-        prop_assert_eq!(ext.send_tsbpd_delay, tsbpd_delay);
+        prop_assert_eq!(ext.recv_tsbpd_delay, recv_delay);
+        prop_assert_eq!(ext.send_tsbpd_delay, send_delay);
     }
 
     // ===== HS Response Extension roundtrip =====
@@ -424,10 +425,11 @@ proptest! {
     fn test_hs_response_extension_roundtrip(
         srt_version in any::<u32>(),
         srt_flags in any::<u32>(),
-        tsbpd_delay in any::<u16>(),
+        recv_delay in any::<u16>(),
+        send_delay in any::<u16>(),
     ) {
         let mut packet = HandshakePacket::new_conclusion_response(1, 2, 3, 0, false);
-        packet.add_hs_response(srt_version, srt_flags, tsbpd_delay);
+        packet.add_hs_response(srt_version, srt_flags, recv_delay, send_delay);
 
         let ctrl = packet.encode(1000, 0);
         let decoded = HandshakePacket::decode(&ctrl).expect("decode should succeed");
@@ -435,7 +437,8 @@ proptest! {
         let ext = decoded.get_hs_extension().expect("should have hs extension");
         prop_assert_eq!(ext.srt_version, srt_version);
         prop_assert_eq!(ext.srt_flags, srt_flags);
-        prop_assert_eq!(ext.recv_tsbpd_delay, tsbpd_delay);
+        prop_assert_eq!(ext.recv_tsbpd_delay, recv_delay);
+        prop_assert_eq!(ext.send_tsbpd_delay, send_delay);
     }
 
     // ===== KmMessage roundtrip =====
@@ -454,7 +457,7 @@ proptest! {
     #[test]
     fn test_km_request_extension_roundtrip(km in arb_km_message()) {
         let mut packet = HandshakePacket::new_conclusion_request(1, 2, 3, 2, true);
-        packet.add_hs_extension(0x010500, 0, 120);
+        packet.add_hs_extension(0x010500, 0, 120, 120);
         packet.add_km_request(&km);
 
         let ctrl = packet.encode(1000, 0);
@@ -473,7 +476,7 @@ proptest! {
     #[test]
     fn test_km_response_extension_roundtrip(km in arb_km_message()) {
         let mut packet = HandshakePacket::new_conclusion_response(1, 2, 3, 2, true);
-        packet.add_hs_response(0x010500, 0, 120);
+        packet.add_hs_response(0x010500, 0, 120, 120);
         packet.add_km_response(&km);
 
         let ctrl = packet.encode(1000, 0);
@@ -499,7 +502,7 @@ proptest! {
         ])
     ) {
         let mut packet = HandshakePacket::new_conclusion_response(1, 2, 3, 0, true);
-        packet.add_hs_response(0x010500, 0, 120);
+        packet.add_hs_response(0x010500, 0, 120, 120);
         packet.add_km_error(error);
 
         let ctrl = packet.encode(1000, 0);
@@ -536,7 +539,7 @@ proptest! {
     #[test]
     fn test_sid_extension_roundtrip(stream_id in arb_stream_id()) {
         let mut packet = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
-        packet.add_hs_extension(0x010500, 0, 120);
+        packet.add_hs_extension(0x010500, 0, 120, 120);
         packet.add_sid_extension(&stream_id);
 
         let ctrl = packet.encode(1000, 0);
@@ -550,7 +553,7 @@ proptest! {
     #[test]
     fn test_congestion_extension_roundtrip(cc_name in arb_congestion_name()) {
         let mut packet = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
-        packet.add_hs_extension(0x010500, 0, 120);
+        packet.add_hs_extension(0x010500, 0, 120, 120);
         packet.add_congestion_extension(&cc_name);
 
         let ctrl = packet.encode(1000, 0);
@@ -570,7 +573,7 @@ proptest! {
         cc_name in arb_congestion_name(),
     ) {
         let mut packet = HandshakePacket::new_conclusion_request(1, 2, 3, 0, false);
-        packet.add_hs_extension(srt_version, srt_flags, tsbpd_delay);
+        packet.add_hs_extension(srt_version, srt_flags, tsbpd_delay, tsbpd_delay);
         packet.add_sid_extension(&stream_id);
         packet.add_congestion_extension(&cc_name);
 

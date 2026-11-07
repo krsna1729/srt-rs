@@ -846,6 +846,15 @@ pub struct SrtConnection {
     peer_congestion_control: Option<String>,
     /// SRT capability flags advertised by the peer's handshake extension.
     peer_srt_flags: Option<u32>,
+    /// Negotiated TSBPD delay of this side's receive direction, in ms.
+    ///
+    /// HSv5 negotiates each direction separately (libsrt
+    /// `m_iTsbPdDelay_ms`): the peer's SND half proposes it.
+    rcv_tsbpd_delay: u16,
+    /// Negotiated TSBPD delay of the peer's receive direction, in ms: this
+    /// side's sender drop horizon (libsrt `m_iPeerTsbPdDelay_ms`), proposed
+    /// by the peer's RCV half.
+    peer_tsbpd_delay: u16,
     /// The peer's advertised SRT flow window (its receive capacity, in
     /// packets); zero means it advertised nothing usable.
     ///
@@ -1268,6 +1277,8 @@ impl SrtConnection {
             role: ConnectionRole::Caller,
             state: ConnectionState::Disconnected,
             handshake_state: HandshakeState::Initial,
+            rcv_tsbpd_delay: options.tsbpd_delay,
+            peer_tsbpd_delay: options.tsbpd_delay,
             options,
             peer_socket_id: 0,
             syn_cookie: 0,
@@ -1322,6 +1333,8 @@ impl SrtConnection {
             role: ConnectionRole::Listener,
             state: ConnectionState::Listening,
             handshake_state: HandshakeState::Initial,
+            rcv_tsbpd_delay: options.tsbpd_delay,
+            peer_tsbpd_delay: options.tsbpd_delay,
             options,
             peer_socket_id: 0,
             syn_cookie: 0,
@@ -1672,11 +1685,8 @@ impl SrtConnection {
     /// data via `set_pacing_demand`.
     fn init_buffers(&mut self, now: Timestamp, peer_initial_seq: u32, tsbpd_time_base: u64) {
         let negotiated_window = self.negotiated_flow_window();
-        let mut sender = SenderBuffer::new(
-            self.initial_seq,
-            negotiated_window,
-            self.options.tsbpd_delay,
-        );
+        let mut sender =
+            SenderBuffer::new(self.initial_seq, negotiated_window, self.peer_tsbpd_delay);
         if let Some(max_bw) = self.options.max_bandwidth_bytes_per_sec {
             sender.set_max_bandwidth(max_bw);
         } else if let Some(input_bw) = self.options.input_bandwidth_bytes_per_sec {
@@ -1686,7 +1696,7 @@ impl SrtConnection {
         self.sender = Some(sender);
         let mut receiver = ReceiverBuffer::with_buffer_size(
             peer_initial_seq,
-            self.options.tsbpd_delay,
+            self.rcv_tsbpd_delay,
             now,
             tsbpd_time_base,
             self.options
@@ -4583,12 +4593,57 @@ impl SrtConnection {
         flags
     }
 
+    /// Record the peer's HSREQ/HSRSP capabilities and negotiate each
+    /// latency direction the way libsrt does
+    /// (`processSrtMsg_HSREQ`/`processSrtMsg_HSRSP`): the peer's SND half
+    /// concerns this side's receive delay, its RCV half the reverse
+    /// direction, each only when the matching TSBPD flag is set. An HSREQ's
+    /// halves are proposals the larger of which wins; an HSRSP's halves are
+    /// the responder's already-negotiated results.
     fn apply_peer_handshake_extension(&mut self, hs: &HandshakePacket) {
+        let configured = self.options.tsbpd_delay;
+        self.rcv_tsbpd_delay = configured;
+        self.peer_tsbpd_delay = configured;
         let Some(extension) = hs.get_hs_extension() else {
             return;
         };
-        self.options.tsbpd_delay = self.options.tsbpd_delay.max(extension.recv_tsbpd_delay);
+        let peer_sends = extension.srt_flags & srt_flags::TSBPDSND != 0;
+        let peer_receives = extension.srt_flags & srt_flags::TSBPDRCV != 0;
+        let (rcv, peer) = match self.role {
+            ConnectionRole::Listener => (
+                configured.max(extension.send_tsbpd_delay),
+                configured.max(extension.recv_tsbpd_delay),
+            ),
+            ConnectionRole::Caller => (extension.send_tsbpd_delay, extension.recv_tsbpd_delay),
+        };
+        if peer_sends {
+            self.rcv_tsbpd_delay = rcv;
+        }
+        if peer_receives {
+            self.peer_tsbpd_delay = peer;
+        }
         self.peer_srt_flags = Some(extension.srt_flags);
+    }
+
+    /// Flags and (RCV, SND) latency halves of this listener's HSRSP.
+    ///
+    /// TSBPDSND, and the SND half carrying the peer's negotiated receive
+    /// delay, are only answered when the peer declared TSBPDRCV (libsrt
+    /// `fillSrtHandshake_HSRSP`).
+    fn hs_response_fields(&self) -> (u32, u16, u16) {
+        let mut flags = self.negotiated_srt_flags();
+        if self
+            .peer_srt_flags
+            .is_none_or(|peer| peer & srt_flags::TSBPDRCV == 0)
+        {
+            flags &= !srt_flags::TSBPDSND;
+        }
+        let snd = if flags & srt_flags::TSBPDSND != 0 {
+            self.peer_tsbpd_delay
+        } else {
+            0
+        };
+        (flags, self.rcv_tsbpd_delay, snd)
     }
 
     fn negotiated_feature(&self, local_flag: u32, peer_flag: u32) -> bool {
@@ -4662,7 +4717,12 @@ impl SrtConnection {
 
         let flags = self.negotiated_srt_flags();
 
-        hs.add_hs_extension(self.options.srt_version, flags, self.options.tsbpd_delay);
+        hs.add_hs_extension(
+            self.options.srt_version,
+            flags,
+            self.options.tsbpd_delay,
+            self.options.tsbpd_delay,
+        );
 
         // Declare our congestion control mode. A real libsrt peer that
         // declares its own mode refuses to transmit if we declare none at
@@ -4735,9 +4795,8 @@ impl SrtConnection {
         );
         hs.flow_window = self.flight_capacity_packets();
 
-        let flags = self.negotiated_srt_flags();
-
-        hs.add_hs_response(self.options.srt_version, flags, self.options.tsbpd_delay);
+        let (flags, rcv_delay, snd_delay) = self.hs_response_fields();
+        hs.add_hs_response(self.options.srt_version, flags, rcv_delay, snd_delay);
 
         // Declare our congestion control mode (see send_conclusion_request).
         hs.add_congestion_extension(&self.options.congestion_control);
@@ -4773,8 +4832,8 @@ impl SrtConnection {
             true,
         );
         hs.flow_window = self.flight_capacity_packets();
-        let flags = self.negotiated_srt_flags();
-        hs.add_hs_response(self.options.srt_version, flags, self.options.tsbpd_delay);
+        let (flags, rcv_delay, snd_delay) = self.hs_response_fields();
+        hs.add_hs_response(self.options.srt_version, flags, rcv_delay, snd_delay);
         hs.add_km_error(error);
         // A GROUP extension in the RESPONSE names the RECEIVING group and is
         // only meaningful (and, for libsrt callers, only legal) when the caller
@@ -6816,8 +6875,8 @@ mod tests {
 
         assert_eq!(caller.state(), ConnectionState::Connected);
         assert_eq!(listener.state(), ConnectionState::Connected);
-        assert_eq!(caller.options.tsbpd_delay, 500);
-        assert_eq!(listener.options.tsbpd_delay, 500);
+        assert_eq!(negotiated_delays_micros(&caller), (500_000, 500_000));
+        assert_eq!(negotiated_delays_micros(&listener), (500_000, 500_000));
         assert!(
             caller
                 .receiver
@@ -6838,7 +6897,7 @@ mod tests {
     fn peer_capabilities_disable_optional_live_behaviour() {
         let mut conn = SrtConnection::new_listener(ConnectionOptions::default());
         let mut peer = HandshakePacket::new_conclusion_request(1, 0, 0, 0, false);
-        peer.add_hs_extension(0x010500, srt_flags::CRYPT | srt_flags::REXMITFLG, 120);
+        peer.add_hs_extension(0x010500, srt_flags::CRYPT | srt_flags::REXMITFLG, 120, 120);
         conn.apply_peer_handshake_extension(&peer);
         conn.init_buffers(Timestamp::from_micros(0), 0, 0);
 
@@ -9492,6 +9551,11 @@ mod tests {
         flow_window: Option<u32>,
         handshake_version: Option<u32>,
         srt_version: Option<u32>,
+        /// HS extension flags to clear, then to set.
+        hs_flags_clear: u32,
+        hs_flags_set: u32,
+        /// HS extension (RCV, SND) latency halves.
+        latency: Option<(u16, u16)>,
     }
 
     impl HandshakeRewrite {
@@ -9504,6 +9568,9 @@ mod tests {
                 flow_window: None,
                 handshake_version: None,
                 srt_version: None,
+                hs_flags_clear: 0,
+                hs_flags_set: 0,
+                latency: None,
             }
         }
     }
@@ -9534,6 +9601,7 @@ mod tests {
                 extension.srt_version,
                 extension.srt_flags | srt_flags::PACKET_FILTER,
                 extension.recv_tsbpd_delay,
+                extension.send_tsbpd_delay,
             );
         }
         if rewrite.filter_extension {
@@ -9543,21 +9611,34 @@ mod tests {
             });
             handshake.extension_field |= extension_flags::CONFIG;
         }
-        if let Some(version) = rewrite.srt_version {
-            for extension in &mut handshake.extensions {
-                if matches!(
-                    extension.ext_type,
-                    ExtensionType::HsReq | ExtensionType::HsRsp
-                ) && extension.data.len() >= 4
-                {
-                    extension.data[..4].copy_from_slice(&version.to_be_bytes());
-                }
+        for extension in &mut handshake.extensions {
+            if matches!(
+                extension.ext_type,
+                ExtensionType::HsReq | ExtensionType::HsRsp
+            ) && extension.data.len() == 12
+            {
+                rewrite_hs_block(&mut extension.data, rewrite);
             }
         }
         let rewritten = handshake.encode(control.timestamp, control.dest_socket_id);
         let mut bytes = Vec::new();
         rewritten.encode(&mut bytes).expect("re-encodes");
         bytes
+    }
+
+    /// Apply a rewrite's version, flag and latency overrides to one raw
+    /// 12-byte HSREQ/HSRSP block.
+    fn rewrite_hs_block(data: &mut [u8], rewrite: &HandshakeRewrite) {
+        if let Some(version) = rewrite.srt_version {
+            data[..4].copy_from_slice(&version.to_be_bytes());
+        }
+        let flags = u32::from_be_bytes(data[4..8].try_into().expect("four bytes"));
+        let flags = (flags & !rewrite.hs_flags_clear) | rewrite.hs_flags_set;
+        data[4..8].copy_from_slice(&flags.to_be_bytes());
+        if let Some((rcv, snd)) = rewrite.latency {
+            data[8..10].copy_from_slice(&rcv.to_be_bytes());
+            data[10..12].copy_from_slice(&snd.to_be_bytes());
+        }
     }
 
     /// Every handshake packet in the connection's output queue, rewritten.
@@ -10205,6 +10286,111 @@ mod tests {
             .expect_err("caller rejects a peer below SRT 1.3.0");
         assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
         assert_eq!(attempt.caller.state(), ConnectionState::Disconnected);
+    }
+
+    /// Negotiated (receive, sender) TSBPD delays of a connected side, read
+    /// from the buffers that actually use them.
+    fn negotiated_delays_micros(conn: &SrtConnection) -> (u64, u64) {
+        let receive = conn.receiver_stats().expect("receiver").tsbpd_delay_micros;
+        let send = conn.sender_stats().expect("sender").tsbpd_delay_micros;
+        (receive, send)
+    }
+
+    /// An asymmetric HSREQ (RCV=20 ms, SND=500 ms) to a 120 ms listener: the
+    /// peer's SND half proposes the listener's receive delay (500 wins), its
+    /// RCV half the caller's (120 wins), and the HSRSP carries the two
+    /// results separately (libsrt `processSrtMsg_HSREQ`,
+    /// `fillSrtHandshake_HSRSP`), at every supported HSv5 SRT version.
+    #[test]
+    fn listener_negotiates_each_latency_direction_from_its_own_hsreq_half() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        for version in [0x0001_0300, 0x0001_0403, 0x0001_0503, 0x0001_0504] {
+            let mut asymmetric = plain;
+            asymmetric.srt_version = Some(version);
+            asymmetric.latency = Some((20, 500));
+            let attempt = handshake_with_rewrites(
+                &asymmetric,
+                &plain,
+                ConnectionOptions {
+                    tsbpd_delay: 120,
+                    ..listener_options()
+                },
+            );
+            attempt.listener_result.expect("listener accepts");
+            attempt.caller_result.expect("caller accepts");
+            assert_eq!(
+                negotiated_delays_micros(&attempt.listener),
+                (500_000, 120_000),
+                "listener at {version:#x}"
+            );
+            // The caller adopts the HSRSP halves: SND=120 for its receive
+            // direction, RCV=500 for the listener's.
+            assert_eq!(
+                negotiated_delays_micros(&attempt.caller),
+                (120_000, 500_000),
+                "caller at {version:#x}"
+            );
+        }
+    }
+
+    /// The inverse, caller-side case: an HSRSP whose RCV=500/SND=120 halves
+    /// describe the listener's receive delay and the caller's. The caller
+    /// must not raise its own 120 ms receive delay to the listener's 500.
+    #[test]
+    fn caller_adopts_each_latency_direction_from_its_own_hsrsp_half() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        let mut response = plain;
+        response.latency = Some((500, 120));
+        let attempt = handshake_with_rewrites(&plain, &response, listener_options());
+        attempt.listener_result.expect("listener accepts");
+        attempt.caller_result.expect("caller accepts");
+        assert_eq!(
+            negotiated_delays_micros(&attempt.caller),
+            (120_000, 500_000)
+        );
+    }
+
+    /// A peer that does not declare TSBPDRCV gets no TSBPDSND (nor an SND
+    /// latency) in the HSRSP: libsrt only answers it when the peer receives
+    /// with TSBPD.
+    #[test]
+    fn hsrsp_answers_tsbpdsnd_only_to_a_peer_declaring_tsbpdrcv() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        let mut no_tsbpd_rcv = plain;
+        no_tsbpd_rcv.hs_flags_clear = srt_flags::TSBPDRCV;
+        let attempt = handshake_with_rewrites(&no_tsbpd_rcv, &plain, listener_options());
+        attempt.listener_result.expect("listener accepts");
+        attempt.caller_result.expect("caller accepts");
+        let response_flags = attempt.caller.peer_srt_flags.expect("HSRSP flags");
+        assert_eq!(response_flags & srt_flags::TSBPDSND, 0);
+        assert_ne!(response_flags & srt_flags::TSBPDRCV, 0);
+        // The withheld SND half is zero: forcing TSBPDSND back on in transit
+        // makes the caller adopt exactly what the listener wrote there.
+        let mut forced_snd = plain;
+        forced_snd.hs_flags_set = srt_flags::TSBPDSND;
+        let attempt = handshake_with_rewrites(&no_tsbpd_rcv, &forced_snd, listener_options());
+        attempt.caller_result.expect("caller accepts");
+        assert_eq!(negotiated_delays_micros(&attempt.caller).0, 0);
+
+        let attempt = handshake_with_rewrites(&plain, &plain, listener_options());
+        let response_flags = attempt.caller.peer_srt_flags.expect("HSRSP flags");
+        assert_ne!(response_flags & srt_flags::TSBPDSND, 0);
+    }
+
+    /// A latency half whose TSBPD flag is clear proposes nothing: a 500 ms
+    /// half without TSBPDSND/TSBPDRCV leaves the listener's 120 ms in place.
+    #[test]
+    fn latency_halves_without_their_tsbpd_flag_are_ignored() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        let mut flagless = plain;
+        flagless.hs_flags_clear = srt_flags::TSBPDSND | srt_flags::TSBPDRCV;
+        flagless.latency = Some((500, 500));
+        let attempt = handshake_with_rewrites(&flagless, &plain, listener_options());
+        attempt.listener_result.expect("listener accepts");
+        assert_eq!(
+            negotiated_delays_micros(&attempt.listener),
+            (120_000, 120_000)
+        );
     }
 
     /// A peer that negotiates packet-filter behaviour gets a refusal, not a

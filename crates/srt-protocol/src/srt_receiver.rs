@@ -2360,7 +2360,7 @@ pub struct ReceiverStats {
     pub link_capacity_packets_per_second: u32,
     /// Link-capacity estimate converted using measured wire bytes per packet.
     pub link_capacity_bytes_per_second: Option<u64>,
-    /// Configured receiver TSBPD delay.
+    /// Negotiated receiver TSBPD delay (this side's playout latency).
     pub tsbpd_delay_micros: u64,
 }
 
