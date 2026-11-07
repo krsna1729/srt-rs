@@ -1,7 +1,9 @@
 //! Property-based tests for SRT crypto
 
 use proptest::prelude::*;
-use srt_proto::crypto::{CipherMode, CryptoContext, KeyFlag, KeyLength, KmRefreshState};
+use srt_proto::crypto::{
+    CipherMode, CryptoContext, KeyFlag, KeyLength, KmKeySelection, KmRefreshState, RxKeyUpdate,
+};
 
 fn generate_sek(key_length: KeyLength) -> Vec<u8> {
     vec![0x42u8; key_length.len()]
@@ -279,7 +281,7 @@ proptest! {
     }
 
     #[test]
-    fn test_update_sek_changes_decryption(
+    fn test_install_rx_keys_changes_decryption(
         passphrase in "[a-zA-Z0-9]{10,32}",
         key_length in prop::sample::select(vec![KeyLength::Aes128, KeyLength::Aes192, KeyLength::Aes256]),
         salt in prop::collection::vec(any::<u8>(), 16..=16),
@@ -303,11 +305,15 @@ proptest! {
             CipherMode::Ctr,
         ).expect("receiver creation should succeed");
 
-        let new_sek = generate_sek(key_length);
+        let new_sek = vec![0x43u8; key_length.len()];
         let (new_key_flag, new_wrapped_sek) = sender.start_pre_announce(&new_sek).expect("start_pre_announce should succeed");
 
-        receiver.update_sek(&new_wrapped_sek, new_key_flag).expect("update_sek should succeed");
-        prop_assert_eq!(receiver.current_key(), new_key_flag);
+        let update = receiver
+            .install_rx_keys(KmKeySelection::from(new_key_flag), *sender.salt(), &new_wrapped_sek)
+            .expect("install_rx_keys should succeed");
+        prop_assert_eq!(update, RxKeyUpdate::Installed);
+        // The announcement configures the receive direction only.
+        prop_assert_eq!(receiver.current_key(), key_flag);
 
         sender.switch_key();
         let mut encrypted2 = payload_data.clone();

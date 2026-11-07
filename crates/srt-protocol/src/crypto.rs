@@ -41,7 +41,7 @@ use cipher::{InnerIvInit, StreamCipher};
 use ctr::{Ctr128BE, CtrCore};
 use pbkdf2::pbkdf2_hmac;
 use sha1::Sha1;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 // Compile-time pin: cached expanded schedules must securely erase on drop.
 // Requires `aes/zeroize` + `aes-gcm/zeroize` (which enables AES+GHASH wipe).
@@ -174,6 +174,81 @@ impl KeyFlag {
             Self::Odd => Self::Even,
         }
     }
+}
+
+/// The stream keys a key-material (KM) message carries.
+///
+/// DATA selects exactly one key ([`KeyFlag`]). A KM message may also carry
+/// both (KK = 3): libsrt's refresh announces the current and the next SEK
+/// together, wrapped as one blob with the even SEK first
+/// (`haicrypt/hcrypt_ctx_tx.c`, `hcryptCtx_Tx_AsmKM`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KmKeySelection {
+    /// The even key alone.
+    Even = 0b01,
+    /// The odd key alone.
+    Odd = 0b10,
+    /// Both keys, even first.
+    Both = 0b11,
+}
+
+impl KmKeySelection {
+    /// Get the selection from a KM message's KK field (its two low bits).
+    pub fn from_kk_field(value: u8) -> Option<Self> {
+        match value & 0b11 {
+            0b01 => Some(Self::Even),
+            0b10 => Some(Self::Odd),
+            0b11 => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    /// Convert to a KK field value.
+    pub fn to_kk_field(self) -> u8 {
+        self as u8
+    }
+
+    /// The selected keys in wire order (even first).
+    pub fn flags(self) -> &'static [KeyFlag] {
+        match self {
+            Self::Even => &[KeyFlag::Even],
+            Self::Odd => &[KeyFlag::Odd],
+            Self::Both => &[KeyFlag::Even, KeyFlag::Odd],
+        }
+    }
+
+    /// How many SEKs the message wraps.
+    pub fn key_count(self) -> usize {
+        self.flags().len()
+    }
+
+    /// The single selected key, or `None` for [`Self::Both`].
+    pub fn single(self) -> Option<KeyFlag> {
+        match self {
+            Self::Even => Some(KeyFlag::Even),
+            Self::Odd => Some(KeyFlag::Odd),
+            Self::Both => None,
+        }
+    }
+}
+
+impl From<KeyFlag> for KmKeySelection {
+    fn from(flag: KeyFlag) -> Self {
+        match flag {
+            KeyFlag::Even => Self::Even,
+            KeyFlag::Odd => Self::Odd,
+        }
+    }
+}
+
+/// What a peer's receive-key announcement did to the receive direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RxKeyUpdate {
+    /// At least one selected slot now holds the announced key.
+    Installed,
+    /// Every selected slot already held the announced key under the same
+    /// salt: a retransmission, answered without reinstalling anything.
+    Unchanged,
 }
 
 /// Immutable per-datagram cryptographic reservation.
@@ -353,7 +428,155 @@ fn cache_gcm(sek: &[u8], key_length: KeyLength) -> Result<Option<CachedGcm>, Err
     Ok(Some(CachedGcm::from_sek(sek, key_length)?))
 }
 
-/// Encryption context.
+/// How many replaced receive keys are remembered to refuse their
+/// reinstallation.
+const RX_RETIRED_CAPACITY: usize = 4;
+
+/// One receive-direction stream key: the SEK, the salt it was announced
+/// under (the IV/nonce input for DATA under this selector), and its cached
+/// schedule for the session's cipher mode.
+struct RxKey {
+    sek: Zeroizing<Vec<u8>>,
+    salt: [u8; 16],
+    ctr: Option<Box<CachedCtr>>,
+    gcm: Option<Box<CachedGcm>>,
+}
+
+impl RxKey {
+    fn new(
+        sek: &[u8],
+        salt: [u8; 16],
+        key_length: KeyLength,
+        cipher_mode: CipherMode,
+    ) -> Result<Self, Error> {
+        if sek.len() != key_length.len() {
+            return Err(Error::crypto_error("invalid SEK length"));
+        }
+        if sek.iter().all(|byte| *byte == 0) {
+            return Err(Error::crypto_error("unwrapped SEK must not be all zero"));
+        }
+        let (ctr, gcm) = match cipher_mode {
+            CipherMode::Ctr => (cache_ctr(sek, key_length)?.map(Box::new), None),
+            CipherMode::Gcm => (None, cache_gcm(sek, key_length)?.map(Box::new)),
+        };
+        Ok(Self {
+            sek: Zeroizing::new(sek.to_vec()),
+            salt,
+            ctr,
+            gcm,
+        })
+    }
+
+    fn ctr(&self) -> Result<&CachedCtr, Error> {
+        self.ctr
+            .as_deref()
+            .ok_or_else(|| Error::crypto_error("CTR key schedule missing for key flag"))
+    }
+
+    fn gcm(&self) -> Result<&CachedGcm, Error> {
+        self.gcm
+            .as_deref()
+            .ok_or_else(|| Error::crypto_error("GCM key schedule missing for key flag"))
+    }
+
+    fn is(&self, sek: &[u8], salt: &[u8; 16]) -> bool {
+        self.sek.as_slice() == sek && self.salt == *salt
+    }
+}
+
+/// The KEK for a receive salt that differs from the transmit salt.
+struct RxKek {
+    salt: [u8; 16],
+    kek: Zeroizing<Vec<u8>>,
+}
+
+/// Receive-direction key state, owned separately from the transmit keys.
+///
+/// A peer's KMREQ changes only this state; the local transmit selector,
+/// keys and counters change only through local rotation. libsrt keeps the
+/// same split (separate RX/TX HaiCrypt contexts, `srtcore/crypto.cpp`).
+#[derive(Default)]
+struct RxKeys {
+    even: Option<RxKey>,
+    odd: Option<RxKey>,
+    /// The KEK derived for the latest announced salt other than the
+    /// transmit salt, so a retransmission or a later refresh under the
+    /// same salt costs no further PBKDF2 derivation.
+    kek: Option<RxKek>,
+    /// SEKs replaced in a receive slot, newest last in ring order.
+    retired: [Option<Zeroizing<Vec<u8>>>; RX_RETIRED_CAPACITY],
+    retired_next: usize,
+}
+
+impl RxKeys {
+    fn slot(&self, flag: KeyFlag) -> Option<&RxKey> {
+        match flag {
+            KeyFlag::Even => self.even.as_ref(),
+            KeyFlag::Odd => self.odd.as_ref(),
+        }
+    }
+
+    fn slot_mut(&mut self, flag: KeyFlag) -> &mut Option<RxKey> {
+        match flag {
+            KeyFlag::Even => &mut self.even,
+            KeyFlag::Odd => &mut self.odd,
+        }
+    }
+
+    /// Whether `flag`'s slot already holds exactly this key and salt.
+    fn holds(&self, flag: KeyFlag, sek: &[u8], salt: &[u8; 16]) -> bool {
+        self.slot(flag).is_some_and(|key| key.is(sek, salt))
+    }
+
+    /// Whether a current slot holds `sek`. Called for a key that is not
+    /// already in its announced slot under its announced salt, so a match
+    /// means the announcement moves a known key to another selector or
+    /// salt. The wrapped key authenticates neither.
+    fn holds_elsewhere(&self, sek: &[u8]) -> bool {
+        [&self.even, &self.odd]
+            .into_iter()
+            .flatten()
+            .any(|key| key.sek.as_slice() == sek)
+    }
+
+    /// Whether `sek` was recently replaced in a receive slot.
+    fn retired(&self, sek: &[u8]) -> bool {
+        self.retired
+            .iter()
+            .flatten()
+            .any(|retired| retired.as_slice() == sek)
+    }
+
+    /// Replace `flag`'s slot, remembering the key it held.
+    fn replace(&mut self, flag: KeyFlag, key: RxKey) {
+        if let Some(old) = self.slot_mut(flag).replace(key) {
+            self.retired[self.retired_next] = Some(old.sek.clone());
+            self.retired_next = (self.retired_next + 1) % RX_RETIRED_CAPACITY;
+        }
+    }
+}
+
+/// A comparable copy of every key-state field (test builds only).
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeyStateForTest {
+    pub tx_even: Vec<u8>,
+    pub tx_odd: Vec<u8>,
+    pub tx_salt: [u8; 16],
+    pub tx_current: KeyFlag,
+    pub tx_next: Option<KeyFlag>,
+    pub tx_refresh: KmRefreshState,
+    pub tx_count: u64,
+    pub rx_even: Option<(Vec<u8>, [u8; 16])>,
+    pub rx_odd: Option<(Vec<u8>, [u8; 16])>,
+    pub rx_kek_salt: Option<[u8; 16]>,
+    pub rx_retired: Vec<Option<Vec<u8>>>,
+}
+
+/// Encryption context: the transmit keys (`kek` .. `gcm_odd`), which only
+/// local rotation changes, and the receive keys (`rx`), which only the
+/// peer's key material changes. The handshake's initial key seeds both
+/// directions as independent copies.
 pub struct CryptoContext {
     /// Key Encrypting Key (derived via PBKDF2).
     kek: Vec<u8>,
@@ -384,6 +607,11 @@ pub struct CryptoContext {
     ctr_odd: Option<Box<CachedCtr>>,
     gcm_even: Option<Box<CachedGcm>>,
     gcm_odd: Option<Box<CachedGcm>>,
+    /// The passphrase, kept to derive the KEK for a salt the peer announces
+    /// after the handshake (libsrt keeps its secret for the same purpose).
+    passphrase: Zeroizing<Vec<u8>>,
+    /// Receive-direction keys.
+    rx: RxKeys,
 }
 
 // local patch (crates/srt-protocol/VENDOR.md, upstream issues
@@ -402,6 +630,9 @@ impl fmt::Debug for CryptoContext {
             .field("encrypted_packet_count", &self.encrypted_packet_count)
             .field("km_refresh_state", &self.km_refresh_state)
             .field("next_key", &self.next_key)
+            .field("passphrase", &"[REDACTED]")
+            .field("rx_even", &self.rx.even.as_ref().map(|_| "[REDACTED]"))
+            .field("rx_odd", &self.rx.odd.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
 }
@@ -441,6 +672,9 @@ impl CryptoContext {
     /// Build an encryption context from a passphrase (sender side).
     ///
     /// `salt` and `sek` must be generated externally from a random source.
+    /// The key is installed as the even transmit key and, as an independent
+    /// copy, as the even receive key: HSv5's initial key material is
+    /// bidirectional.
     pub fn new_sender(
         passphrase: &str,
         key_length: KeyLength,
@@ -454,43 +688,24 @@ impl CryptoContext {
         if sek.iter().all(|byte| *byte == 0) {
             return Err(Error::crypto_error("SEK must not be all zero"));
         }
-        if cipher_mode == CipherMode::Gcm && key_length == KeyLength::Aes192 {
-            return Err(Error::crypto_error(
-                "AES-192 is not supported with GCM mode",
-            ));
-        }
-
-        let kek = derive_kek(passphrase, &salt, key_length);
-
-        let sek_even = sek.to_vec();
-        // Reserved slot for the future odd key (KM refresh provides it).
-        // All-zero by construction: rejected as a key by validation above
-        // and skipped by cache_ctr/cache_gcm, so it can never schedule.
-        let sek_odd = vec![u8::MIN; key_length.len()];
-
-        let mut ctx = Self {
+        reject_unsupported_suite(key_length, cipher_mode)?;
+        let kek = derive_kek(passphrase.as_bytes(), &salt, key_length);
+        Self::seeded(
+            passphrase,
             kek,
-            sek_even,
-            sek_odd,
             salt,
-            current_key: KeyFlag::Even,
+            sek,
+            KeyFlag::Even,
             key_length,
             cipher_mode,
-            encrypted_packet_count: 0,
-            km_refresh_state: KmRefreshState::Idle,
-            next_key: None,
-            ctr_even: None,
-            ctr_odd: None,
-            gcm_even: None,
-            gcm_odd: None,
-        };
-        ctx.rebuild_cipher_cache()?;
-        Ok(ctx)
+        )
     }
 
     /// Build an encryption context from a passphrase and key material (receiver side).
     ///
-    /// Unwraps the SEK with the KEK.
+    /// Unwraps the SEK with the KEK and installs it under `key_flag` as the
+    /// receive key and, as an independent copy, as the transmit key (libsrt
+    /// clones the responder's TX context from its RX context in HSv5).
     pub fn new_receiver(
         passphrase: &str,
         salt: [u8; 16],
@@ -499,24 +714,42 @@ impl CryptoContext {
         key_length: KeyLength,
         cipher_mode: CipherMode,
     ) -> Result<Self, Error> {
-        if cipher_mode == CipherMode::Gcm && key_length == KeyLength::Aes192 {
-            return Err(Error::crypto_error(
-                "AES-192 is not supported with GCM mode",
-            ));
-        }
-
-        let kek = derive_kek(passphrase, &salt, key_length);
-
-        let sek = unwrap_sek(&kek, wrapped_sek, key_length)?;
+        reject_unsupported_suite(key_length, cipher_mode)?;
+        let kek = derive_kek(passphrase.as_bytes(), &salt, key_length);
+        let sek = Zeroizing::new(unwrap_sek(&kek, wrapped_sek, key_length)?);
         if sek.iter().all(|byte| *byte == 0) {
             return Err(Error::crypto_error("unwrapped SEK must not be all zero"));
         }
+        Self::seeded(
+            passphrase,
+            kek,
+            salt,
+            &sek,
+            key_flag,
+            key_length,
+            cipher_mode,
+        )
+    }
 
+    /// The initial context: `sek` under `key_flag` in both directions.
+    fn seeded(
+        passphrase: &str,
+        kek: Vec<u8>,
+        salt: [u8; 16],
+        sek: &[u8],
+        key_flag: KeyFlag,
+        key_length: KeyLength,
+        cipher_mode: CipherMode,
+    ) -> Result<Self, Error> {
+        let rx_key = RxKey::new(sek, salt, key_length, cipher_mode)?;
+        // The other transmit slot is reserved for the next key (KM refresh
+        // provides it). All-zero by construction: rejected as a key by
+        // validation and skipped by cache_ctr/cache_gcm, so it can never
+        // schedule.
         let (sek_even, sek_odd) = match key_flag {
-            KeyFlag::Even => (sek, vec![u8::MIN; key_length.len()]),
-            KeyFlag::Odd => (vec![u8::MIN; key_length.len()], sek),
+            KeyFlag::Even => (sek.to_vec(), vec![u8::MIN; key_length.len()]),
+            KeyFlag::Odd => (vec![u8::MIN; key_length.len()], sek.to_vec()),
         };
-
         let mut ctx = Self {
             kek,
             sek_even,
@@ -532,7 +765,10 @@ impl CryptoContext {
             ctr_odd: None,
             gcm_even: None,
             gcm_odd: None,
+            passphrase: Zeroizing::new(passphrase.as_bytes().to_vec()),
+            rx: RxKeys::default(),
         };
+        *ctx.rx.slot_mut(key_flag) = Some(rx_key);
         ctx.rebuild_cipher_cache()?;
         Ok(ctx)
     }
@@ -735,15 +971,23 @@ impl CryptoContext {
         Ok(tag)
     }
 
-    /// Decrypt data in place (CTR mode).
+    /// The receive key DATA under `key_flag` decrypts with.
+    fn rx_key(&self, key_flag: KeyFlag) -> Result<&RxKey, Error> {
+        self.rx
+            .slot(key_flag)
+            .ok_or_else(|| Error::crypto_error("no receive key for key flag"))
+    }
+
+    /// Decrypt data in place (CTR mode) with the receive key `key_flag`.
     pub fn decrypt(
         &self,
         packet_index: u32,
         key_flag: KeyFlag,
         payload: &mut [u8],
     ) -> Result<(), Error> {
-        let iv = build_ctr_iv(&self.salt, packet_index);
-        self.cached_ctr(key_flag)?.apply_keystream(&iv, payload);
+        let key = self.rx_key(key_flag)?;
+        let iv = build_ctr_iv(&key.salt, packet_index);
+        key.ctr()?.apply_keystream(&iv, payload);
         Ok(())
     }
 
@@ -761,11 +1005,11 @@ impl CryptoContext {
         if payload.len() < GCM_TAG_LEN {
             return Err(Error::crypto_error("GCM payload too short for auth tag"));
         }
-        let iv = build_gcm_iv(&self.salt, packet_index);
+        let key = self.rx_key(key_flag)?;
+        let iv = build_gcm_iv(&key.salt, packet_index);
         let nonce = Nonce::try_from(iv.as_slice())
             .map_err(|e| Error::crypto_error(format!("invalid GCM nonce: {e}")))?;
-        self.cached_gcm(key_flag)?
-            .decrypt_in_place(&nonce, header, &mut payload)?;
+        key.gcm()?.decrypt_in_place(&nonce, header, &mut payload)?;
         Ok(payload)
     }
 
@@ -783,21 +1027,17 @@ impl CryptoContext {
         if payload.len() < GCM_TAG_LEN {
             return Err(Error::crypto_error("GCM payload too short for auth tag"));
         }
-
+        let key = self.rx_key(key_flag)?;
+        let gcm = key.gcm()?;
         let tag_bytes = payload.split_off(payload.len() - GCM_TAG_LEN);
         let tag: [u8; GCM_TAG_LEN] = tag_bytes
             .as_ref()
             .try_into()
             .expect("GCM tag length was checked");
-        let iv = build_gcm_iv(&self.salt, packet_index);
+        let iv = build_gcm_iv(&key.salt, packet_index);
         let nonce = Nonce::try_from(iv.as_slice())
             .map_err(|error| Error::crypto_error(format!("invalid GCM nonce: {error}")))?;
-        self.cached_gcm(key_flag)?.decrypt_inout_detached(
-            &nonce,
-            header,
-            payload.as_mut(),
-            &tag,
-        )?;
+        gcm.decrypt_inout_detached(&nonce, header, payload.as_mut(), &tag)?;
         Ok(())
     }
 
@@ -817,10 +1057,10 @@ impl CryptoContext {
         self.encrypted_packet_count = count;
     }
 
-    /// Force `current_key`'s cipher schedule out, without going through the
-    /// KM wire path that is the only real way to reach this state (a peer's
-    /// KM refresh unwrapping to a key of the wrong length -- see
-    /// `update_sek`). Exists to let `srt_connection`'s own tests exercise
+    /// Force `current_key`'s cipher schedule out. No production path
+    /// reaches this state -- transmit schedules are built only from
+    /// validated local keys, and a peer's KM touches only the receive keys.
+    /// Exists to let `srt_connection`'s own tests exercise
     /// `can_encrypt_current_key()` returning false deterministically.
     #[cfg(test)]
     pub(crate) fn drop_current_key_schedule_for_test(&mut self) {
@@ -833,6 +1073,31 @@ impl CryptoContext {
                 self.ctr_odd = None;
                 self.gcm_odd = None;
             }
+        }
+    }
+
+    /// Every key-state field, for tests that require a rejected KM message
+    /// to change nothing.
+    #[cfg(test)]
+    pub(crate) fn key_state_for_test(&self) -> KeyStateForTest {
+        let rx = |key: &Option<RxKey>| key.as_ref().map(|key| (key.sek.to_vec(), key.salt));
+        KeyStateForTest {
+            tx_even: self.sek_even.clone(),
+            tx_odd: self.sek_odd.clone(),
+            tx_salt: self.salt,
+            tx_current: self.current_key,
+            tx_next: self.next_key,
+            tx_refresh: self.km_refresh_state,
+            tx_count: self.encrypted_packet_count,
+            rx_even: rx(&self.rx.even),
+            rx_odd: rx(&self.rx.odd),
+            rx_kek_salt: self.rx.kek.as_ref().map(|rx_kek| rx_kek.salt),
+            rx_retired: self
+                .rx
+                .retired
+                .iter()
+                .map(|key| key.as_ref().map(|key| key.to_vec()))
+                .collect(),
         }
     }
 
@@ -941,51 +1206,140 @@ impl CryptoContext {
         self.km_refresh_state = KmRefreshState::Idle;
     }
 
-    /// Update the SEK from a received KM message.
-    pub fn update_sek(&mut self, wrapped_sek: &[u8], key_flag: KeyFlag) -> Result<(), Error> {
-        let sek = unwrap_sek(&self.kek, wrapped_sek, self.key_length)?;
-        // `unwrap_sek`'s output length tracks the wire-supplied wrapped
-        // blob's length, not `self.key_length` -- AES-KW only requires a
-        // multiple of 8 bytes, so a peer's wrapped key of the wrong length
-        // unwraps without error. Reject it here, before it ever reaches the
-        // slot below: `rebuild_cipher_cache` catching the same mismatch
-        // later is too late, since by then the slot is already overwritten
-        // with the bad bytes and stays that way even though this call
-        // returns `Err` (S02 -- the same "commit before the fallible check"
-        // pattern the send paths had).
-        if sek.len() != self.key_length.len() {
+    /// Whether installing keys announced under `salt` needs a fresh KEK
+    /// derivation (one 2048-iteration PBKDF2-HMAC-SHA1 run): `salt` is
+    /// neither the transmit salt nor the latest receive salt already
+    /// derived. Callers bound how often a peer may cause one.
+    pub fn needs_kek_derivation(&self, salt: &[u8; 16]) -> bool {
+        self.cached_kek(salt).is_none()
+    }
+
+    fn cached_kek(&self, salt: &[u8; 16]) -> Option<&[u8]> {
+        if *salt == self.salt {
+            return Some(&self.kek);
+        }
+        self.rx
+            .kek
+            .as_ref()
+            .filter(|rx_kek| rx_kek.salt == *salt)
+            .map(|rx_kek| rx_kek.kek.as_slice())
+    }
+
+    /// Install the receive keys a peer's KMREQ announces under `salt`.
+    ///
+    /// As in libsrt (`haicrypt/hcrypt_ctx_rx.c`), a key may replace the one
+    /// already held under its selector, with a new SEK and/or a new salt;
+    /// a both-key message is one AES-KW blob of `2 * key_length` bytes, even
+    /// SEK first. Only the receive slots change: the transmit selector,
+    /// keys and counters belong to local rotation.
+    ///
+    /// Transactional: the KEK is derived and the whole blob unwrapped and
+    /// validated before any slot changes, so a failure leaves every key and
+    /// the cached KEK as they were. A slot that already holds the announced
+    /// key under the same salt is left untouched; if that is every selected
+    /// slot the result is [`RxKeyUpdate::Unchanged`] (a retransmission).
+    ///
+    /// Hardening beyond libsrt, which installs any well-wrapped key (the
+    /// wrap authenticates neither selector nor salt): an announced key not
+    /// already in its slot is refused if it is one of this side's transmit
+    /// keys (reflected), is held under another selector or salt, or was
+    /// one of the last four keys replaced in a receive slot.
+    pub fn install_rx_keys(
+        &mut self,
+        keys: KmKeySelection,
+        salt: [u8; 16],
+        wrapped: &[u8],
+    ) -> Result<RxKeyUpdate, Error> {
+        let derived = self
+            .needs_kek_derivation(&salt)
+            .then(|| Zeroizing::new(derive_kek(&self.passphrase, &salt, self.key_length)));
+        let kek = match &derived {
+            Some(kek) => kek.as_slice(),
+            None => self
+                .cached_kek(&salt)
+                .ok_or_else(|| Error::crypto_error("no KEK for the announced salt"))?,
+        };
+        // AES-KW accepts any multiple of eight bytes, so the unwrapped
+        // length is the wire's claim until checked here.
+        let plain = Zeroizing::new(unwrap_sek(kek, wrapped, self.key_length)?);
+        let len = self.key_length.len();
+        if plain.len() != keys.key_count() * len {
             return Err(Error::crypto_error("invalid SEK length"));
         }
-        if sek.iter().all(|byte| *byte == 0) {
-            return Err(Error::crypto_error("unwrapped SEK must not be all zero"));
+        if keys == KmKeySelection::Both && plain[..len] == plain[len..] {
+            return Err(Error::crypto_error(
+                "KMREQ announces one SEK under both selectors",
+            ));
         }
+        let mut fresh: [Option<(KeyFlag, RxKey)>; 2] = [None, None];
+        for (slot, (&flag, sek)) in fresh
+            .iter_mut()
+            .zip(keys.flags().iter().zip(plain.chunks_exact(len)))
+        {
+            if self.rx.holds(flag, sek, &salt) {
+                continue;
+            }
+            self.check_announced_rx_key(sek)?;
+            *slot = Some((
+                flag,
+                RxKey::new(sek, salt, self.key_length, self.cipher_mode)?,
+            ));
+        }
+        if fresh.iter().all(Option::is_none) {
+            return Ok(RxKeyUpdate::Unchanged);
+        }
+        for (flag, key) in fresh.into_iter().flatten() {
+            self.rx.replace(flag, key);
+        }
+        if let Some(kek) = derived {
+            self.rx.kek = Some(RxKek { salt, kek });
+        }
+        Ok(RxKeyUpdate::Installed)
+    }
 
-        let target = match key_flag {
-            KeyFlag::Even => &mut self.sek_even,
-            KeyFlag::Odd => &mut self.sek_odd,
-        };
-        target.zeroize();
-        *target = sek;
-
-        // Rebuild before committing `current_key`: `rebuild_cipher_cache`
-        // does not read `current_key` (it rebuilds both flags from the
-        // SEKs unconditionally), so this reordering changes nothing on the
-        // success path. On failure (e.g. an unwrapped SEK whose cipher
-        // mode/length combination this build doesn't support), it leaves
-        // `current_key` on the previously-working flag instead of
-        // advancing to one with no cached schedule at all (S02).
-        self.rebuild_cipher_cache()?;
-        self.current_key = key_flag;
+    /// The hardening checks for an announced key that is not already in
+    /// its slot under its salt (see [`Self::install_rx_keys`]).
+    fn check_announced_rx_key(&self, sek: &[u8]) -> Result<(), Error> {
+        if self.is_transmit_key(sek) {
+            return Err(Error::crypto_error("KMREQ reflects a local transmit key"));
+        }
+        if self.rx.holds_elsewhere(sek) {
+            return Err(Error::crypto_error(
+                "KMREQ moves a known key to another selector or salt",
+            ));
+        }
+        if self.rx.retired(sek) {
+            return Err(Error::crypto_error(
+                "KMREQ reinstalls a retired receive key",
+            ));
+        }
         Ok(())
+    }
+
+    /// Whether `sek` is in a transmit slot: the active key or the one being
+    /// announced. A decommissioned transmit key is zeroed, not remembered.
+    fn is_transmit_key(&self, sek: &[u8]) -> bool {
+        [&self.sek_even, &self.sek_odd]
+            .into_iter()
+            .any(|key| key.as_slice() == sek)
     }
 }
 
+fn reject_unsupported_suite(key_length: KeyLength, cipher_mode: CipherMode) -> Result<(), Error> {
+    if cipher_mode == CipherMode::Gcm && key_length == KeyLength::Aes192 {
+        return Err(Error::crypto_error(
+            "AES-192 is not supported with GCM mode",
+        ));
+    }
+    Ok(())
+}
+
 /// Derive the KEK via PBKDF2.
-fn derive_kek(passphrase: &str, salt: &[u8; 16], key_length: KeyLength) -> Vec<u8> {
+fn derive_kek(passphrase: &[u8], salt: &[u8; 16], key_length: KeyLength) -> Vec<u8> {
     let mut kek = vec![0u8; key_length.len()];
     // Use the salt's low 64 bits (8 bytes).
     let salt_lsb = &salt[8..16];
-    pbkdf2_hmac::<Sha1>(passphrase.as_bytes(), salt_lsb, PBKDF2_ITERATIONS, &mut kek);
+    pbkdf2_hmac::<Sha1>(passphrase, salt_lsb, PBKDF2_ITERATIONS, &mut kek);
     kek
 }
 
@@ -1218,7 +1572,7 @@ mod tests {
     fn test_derive_kek() {
         let passphrase = "test_passphrase";
         let salt = [0u8; 16];
-        let kek = derive_kek(passphrase, &salt, KeyLength::Aes128);
+        let kek = derive_kek(passphrase.as_bytes(), &salt, KeyLength::Aes128);
         assert_eq!(kek.len(), 16);
     }
 
@@ -1539,49 +1893,85 @@ mod tests {
     }
 
     /// S02: a peer's KM refresh carrying a wrapped key of the wrong length
-    /// unwraps fine (AES-KW only requires a multiple of 8 bytes) but then
-    /// fails to build a cipher schedule for it. `update_sek` must not have
-    /// already committed `current_key` to that broken flag by the time it
-    /// discovers that -- the working key stays current and encryptable.
+    /// unwraps fine (AES-KW only requires a multiple of 8 bytes) but is
+    /// the wrong size for the selected keys. `install_rx_keys` rejects it
+    /// before touching any slot: every key, transmit and receive, stays as
+    /// it was.
     #[test]
-    fn update_sek_rejects_wrong_length_key_without_advancing_current_key() {
+    fn install_rx_keys_rejects_wrong_length_key_without_touching_keys() {
         let passphrase = "passphrase";
         let salt = [0x42; 16];
-        let good_sek = [0x24; 16];
         let mut crypto = CryptoContext::new_sender(
             passphrase,
             KeyLength::Aes128,
             salt,
-            &good_sek,
+            &[0x24; 16],
             CipherMode::Ctr,
         )
         .expect("valid sender context");
-        let starting_key = crypto.current_key();
-        assert!(crypto.can_encrypt_current_key());
+        let before = crypto.key_state_for_test();
 
-        let kek = derive_kek(passphrase, &salt, KeyLength::Aes128);
+        let kek = derive_kek(passphrase.as_bytes(), &salt, KeyLength::Aes128);
         // A 24-byte plaintext wraps to a 32-byte blob -- valid AES-KW, but
-        // the wrong length for this context's Aes128 (16-byte) schedule.
+        // the wrong length for one AES-128 key (and for two).
         let wrong_length_wrapped =
             wrap_sek(&kek, &[0x11; 24], KeyLength::Aes128).expect("valid AES-KW wrap");
+        for keys in [KmKeySelection::Odd, KmKeySelection::Both] {
+            let error = crypto
+                .install_rx_keys(keys, salt, &wrong_length_wrapped)
+                .expect_err("wrong-length key must be rejected");
+            assert!(error.reason.contains("invalid SEK"), "{}", error.reason);
+            assert_eq!(crypto.key_state_for_test(), before);
+        }
+        assert!(crypto.can_encrypt_current_key());
+    }
 
-        let error = crypto
-            .update_sek(&wrong_length_wrapped, starting_key.other())
-            .expect_err("wrong-length key must be rejected");
-        assert!(error.reason.contains("invalid SEK"), "{}", error.reason);
+    /// A both-key KM is one AES-KW blob of the even then the odd SEK; it
+    /// installs both receive slots and leaves the transmit keys alone.
+    #[test]
+    fn install_rx_keys_installs_both_receive_slots_only() {
+        let passphrase = "passphrase";
+        let salt = [0x42; 16];
+        let mut crypto = CryptoContext::new_sender(
+            passphrase,
+            KeyLength::Aes128,
+            salt,
+            &[0x24; 16],
+            CipherMode::Ctr,
+        )
+        .expect("valid sender context");
+        let before = crypto.key_state_for_test();
+        let kek = derive_kek(passphrase.as_bytes(), &salt, KeyLength::Aes128);
+        let both = [[0x31; 16], [0x32; 16]].concat();
+        let wrapped = wrap_sek(&kek, &both, KeyLength::Aes128).expect("valid AES-KW wrap");
+
+        let update = crypto
+            .install_rx_keys(KmKeySelection::Both, salt, &wrapped)
+            .expect("valid both-key announcement");
+        assert_eq!(update, RxKeyUpdate::Installed);
+        let after = crypto.key_state_for_test();
+        assert_eq!(after.rx_even, Some((vec![0x31; 16], salt)));
+        assert_eq!(after.rx_odd, Some((vec![0x32; 16], salt)));
         assert_eq!(
-            crypto.current_key(),
-            starting_key,
-            "a rejected update must not advance current_key onto an uncached flag"
+            (
+                &after.tx_even,
+                &after.tx_odd,
+                after.tx_current,
+                after.tx_count
+            ),
+            (
+                &before.tx_even,
+                &before.tx_odd,
+                before.tx_current,
+                before.tx_count
+            ),
+            "a receive announcement never touches the transmit keys"
         );
-        assert!(
-            crypto.can_encrypt_current_key(),
-            "the original working key must remain usable"
-        );
-        assert!(
-            crypto.sek_odd.iter().all(|b| *b == 0),
-            "the untouched slot must not have been poisoned with the wrong-length bytes"
-        );
+        let repeat = crypto
+            .install_rx_keys(KmKeySelection::Both, salt, &wrapped)
+            .expect("a retransmission is accepted");
+        assert_eq!(repeat, RxKeyUpdate::Unchanged);
+        assert_eq!(crypto.key_state_for_test(), after);
     }
 
     /// S02: `start_pre_announce` must not commit the rotation as
@@ -1590,8 +1980,8 @@ mod tests {
     /// already validates its length/non-zero up front); the failure comes
     /// from `rebuild_cipher_cache` rebuilding *both* flags unconditionally,
     /// so a corrupted currently-active SEK (simulated directly -- no
-    /// production path leaves this state now that `update_sek` validates
-    /// length before writing) still fails the call, and that failure must
+    /// production path leaves this state: a peer's KM installs only receive
+    /// keys) still fails the call, and that failure must
     /// not leave rotation looking like it started.
     #[test]
     fn start_pre_announce_does_not_commit_rotation_state_on_cache_rebuild_failure() {

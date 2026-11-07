@@ -11,7 +11,9 @@ use bytes::{Bytes, BytesMut};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::buf::{read_u32, write_u32};
-use crate::crypto_impl::{CipherMode, CryptoContext, GCM_TAG_LEN, KeyFlag, KeyLength};
+use crate::crypto_impl::{
+    CipherMode, CryptoContext, GCM_TAG_LEN, KeyFlag, KeyLength, KmKeySelection,
+};
 use crate::error::Error;
 use crate::message_assembler::MessageAssembler;
 use crate::sender_rto::RtoArm;
@@ -588,17 +590,14 @@ impl Default for ConnectionOptions {
 
 const KM_HISTORY_CAPACITY: usize = 4;
 
-/// Bounded replay history for key-material controls.
+/// Bounded history of this side's acknowledged key-material requests.
 ///
 /// SRT's KM wire format carries only an even/odd selector, not a monotonic
-/// generation number. Retaining the last few complete messages lets the
-/// connection distinguish a *recent* delayed replay from the next legitimate
-/// use of the same selector without growing memory over a connection's
-/// lifetime. This is bounded recent-replay rejection, not durable replay
-/// protection: after `KM_HISTORY_CAPACITY` further rotations an old complete
-/// message has left the ring. A replayed KMREQ must still carry key
-/// material wrapped under this session's KEK, so it can reinstall only a key
-/// this session already used, never an attacker-chosen one.
+/// generation number. Retaining the last few acknowledged messages lets the
+/// connection recognise a delayed or replayed KMRSP for an earlier rotation
+/// without growing memory over a connection's lifetime. This is bounded
+/// recent-replay rejection, not durable replay protection: after
+/// `KM_HISTORY_CAPACITY` further rotations an old message has left the ring.
 struct KmHistory {
     entries: [Option<KmMessage>; KM_HISTORY_CAPACITY],
     next: usize,
@@ -631,9 +630,67 @@ impl KmHistory {
 /// and silently continuing with mismatched encryption state.
 const KM_REQUEST_MAX_RETRIES: u8 = 4;
 
-/// Retry cadence for an unacknowledged key-material request. libsrt's own
-/// KMREQ cadence is one second.
+/// Retry cadence for an unacknowledged key-material request.
+///
+/// An srt-rs sender policy, not libsrt's: libsrt resends after 1.5 x SRTT,
+/// up to ten times, and switches keys on its packet schedule whether or
+/// not the peer answered (`srtcore/crypto.cpp`, `haicrypt/hcrypt_ctx_tx.c`).
+/// srt-rs switches only after the matching KMRSP and closes after
+/// `KM_REQUEST_MAX_RETRIES` unanswered retries at this fixed cadence.
 const KM_REQUEST_RETRY_INTERVAL_MICROS: u64 = 1_000_000;
+
+/// Fresh-salt KEK derivations a connection allows at once (see
+/// [`KekDerivationBudget`]).
+const KM_KEK_DERIVATION_BURST: u8 = 2;
+
+/// One fresh-salt KEK derivation is restored per this interval.
+const KM_KEK_DERIVATION_REFILL_MICROS: u64 = 1_000_000;
+
+/// Bound on PBKDF2 work a peer's KMREQs can cause.
+///
+/// A KMREQ under a salt with no cached KEK costs one 2048-iteration
+/// PBKDF2-HMAC-SHA1 derivation before its wrap can even be checked. A token
+/// bucket admits `KM_KEK_DERIVATION_BURST` such derivations at once and
+/// restores one per `KM_KEK_DERIVATION_REFILL_MICROS`. Legitimate peers need
+/// few: libsrt keeps its salt for the whole session, and Robotweax announces
+/// one new salt per direction after connecting. A KMREQ refused here gets
+/// no KMRSP and changes nothing, so the peer's own retry installs it once a
+/// derivation is available again.
+struct KekDerivationBudget {
+    tokens: u8,
+    /// When `tokens` was last brought up to date.
+    updated_at: Option<Timestamp>,
+}
+
+impl Default for KekDerivationBudget {
+    fn default() -> Self {
+        Self {
+            tokens: KM_KEK_DERIVATION_BURST,
+            updated_at: None,
+        }
+    }
+}
+
+impl KekDerivationBudget {
+    /// Take one derivation if available at `now`.
+    fn try_take(&mut self, now: Timestamp) -> bool {
+        let updated_at = *self.updated_at.get_or_insert(now);
+        let restored = now.saturating_sub(updated_at) / KM_KEK_DERIVATION_REFILL_MICROS;
+        if restored > 0 {
+            let tokens = u64::from(self.tokens).saturating_add(restored);
+            self.tokens = u8::try_from(tokens)
+                .unwrap_or(u8::MAX)
+                .min(KM_KEK_DERIVATION_BURST);
+            self.updated_at =
+                Some(updated_at.add_micros(restored * KM_KEK_DERIVATION_REFILL_MICROS));
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
+}
 
 /// An outgoing key-material request awaiting its response.
 struct PendingKmRequest {
@@ -656,7 +713,7 @@ enum KmRetryAction {
     /// Retransmit this exact request.
     Resend(KmMessage),
     /// Close when the peer's installed key is uncertain.
-    Close(KeyFlag),
+    Close(KmKeySelection),
 }
 
 /// Post-handshake KM request/response transaction state.
@@ -664,19 +721,15 @@ enum KmRetryAction {
 struct KmControlState {
     /// Outgoing rotation awaiting acknowledgement (sender side).
     pending: Option<PendingKmRequest>,
-    /// The most recently accepted inbound KMREQ, whose exact duplicate is
-    /// answered again without installing anything (receiver side). SRT's KM
-    /// wire format carries only an even/odd selector, so this is what
-    /// distinguishes a legitimate retransmission of the current rotation from
-    /// a replay of an older one.
-    last_received: Option<KmMessage>,
-    received: KmHistory,
     acknowledged: KmHistory,
+    /// Bound on the PBKDF2 work inbound KMREQs cause (receiver side).
+    kek_derivations: KekDerivationBudget,
 }
 
-fn km_matches_context(message: &KmMessage, crypto: &CryptoContext) -> bool {
+/// Whether a KM message uses the session's key length and cipher. libsrt
+/// likewise rejects a runtime key-length change and a cipher mismatch.
+fn km_matches_suite(message: &KmMessage, crypto: &CryptoContext) -> bool {
     message.key_length == crypto.key_length()
-        && message.salt == *crypto.salt()
         && CipherMode::from_km(message) == Some(crypto.cipher_mode())
 }
 
@@ -3672,18 +3725,21 @@ impl SrtConnection {
                 ));
             };
             let km = km_result?;
-            let Some(cipher_mode) = CipherMode::from_km(&km) else {
+            // The handshake's initial KM announces one key; a both-key
+            // message only appears in a runtime refresh.
+            let (Some(cipher_mode), Some(key_flag)) = (CipherMode::from_km(&km), km.keys.single())
+            else {
                 return Err(self.fail_listener_km(
                     now,
                     KmError::BadSecret,
-                    "inconsistent cipher/auth fields in KMREQ",
+                    "inconsistent cipher/auth fields or key selection in KMREQ",
                 ));
             };
             let crypto = match CryptoContext::new_receiver(
                 &passphrase,
                 km.salt,
                 &km.wrapped_key,
-                km.key_flag,
+                key_flag,
                 km.key_length,
                 cipher_mode,
             ) {
@@ -3696,18 +3752,8 @@ impl SrtConnection {
                     ));
                 }
             };
-            // The handshake KMREQ is the session's first received key
-            // message, so it seeds the replay history here -- where both the
-            // context and its transaction state are constructed -- rather
-            // than at completion, which has no fallible step left to guard.
-            let mut km_control = KmControlState::default();
-            km_control.received.remember(km.clone());
-            // A retransmitted handshake KMREQ (a repeated CONCLUSION, or a
-            // runtime retry of the same material) is answered again without
-            // installing anything.
-            km_control.last_received = Some(km.clone());
             self.crypto = Some(Box::new(crypto));
-            self.km_control = Some(Box::new(km_control));
+            self.km_control = Some(Box::new(KmControlState::default()));
             self.received_km = Some(Box::new(km));
         } else if hs.get_km_request().is_some() {
             return Err(self.fail_listener_km(
@@ -4096,53 +4142,44 @@ impl SrtConnection {
 
     /// A peer's key-material request (receiver side).
     ///
-    /// Three outcomes, and the distinction matters: a *new* valid request is
-    /// installed once and answered; an exact duplicate of the current request
-    /// is answered again **without** installing anything (the peer is
-    /// retrying because its response was lost, not attacking); and an older
-    /// generation fails closed with no state or liveness change.
+    /// The announced keys configure this side's *receive* direction only
+    /// (`CryptoContext::install_rx_keys`); the local transmit selector,
+    /// keys and counters belong to local rotation. As in libsrt, a valid
+    /// request may replace the key under an already-held selector with a
+    /// new SEK and/or salt, may carry both keys at once, and is answered
+    /// with a KMRSP echoing its exact body -- also when it repeats keys
+    /// already installed (the peer retrying after a lost response), in
+    /// which case nothing is reinstalled. A request for another key length
+    /// or cipher, one refused by the receive-key hardening checks, or one
+    /// whose fresh salt exceeds the KEK derivation budget fails closed: no
+    /// KMRSP and no state or liveness change.
     fn handle_km_request(&mut self, control_info: &[u8], now: Timestamp) -> Result<(), Error> {
         let km = KmMessage::decode(control_info)?;
-
-        if self.crypto.is_none() {
+        let Some(crypto) = self.crypto.as_deref_mut() else {
             // A refresh KMREQ on an unencrypted connection cannot succeed.
             // Reply immediately rather than leaving the peer to wait for its
             // own timeout (spec §3.2.1.2).
             self.send_km_error_response(KmError::NoSecret, now);
             return Ok(());
-        }
-
-        let is_current_retry = self
-            .km_control
-            .as_ref()
-            .and_then(|state| state.last_received.as_ref())
-            .is_some_and(|last| last == &km);
-        if is_current_retry {
-            self.send_km_response(&km, now);
-            return Ok(());
-        }
-
-        if self
-            .km_control
-            .as_ref()
-            .is_some_and(|state| state.received.contains(&km))
-        {
-            return Err(Error::invalid_data("stale or replayed KMREQ"));
-        }
-
-        let Some(crypto) = self.crypto.as_deref_mut().filter(|crypto| {
-            km_matches_context(&km, crypto) && km.key_flag == crypto.current_key().other()
-        }) else {
-            return Err(Error::invalid_data(
-                "KMREQ does not match the secured session's next generation",
-            ));
         };
-        crypto.update_sek(&km.wrapped_key, km.key_flag)?;
-        self.send_km_response(&km, now);
-        if let Some(state) = self.km_control.as_mut() {
-            state.received.remember(km.clone());
-            state.last_received = Some(km);
+        if !km_matches_suite(&km, crypto) {
+            return Err(Error::invalid_data(
+                "KMREQ does not match the secured session's key length or cipher",
+            ));
         }
+        if crypto.needs_kek_derivation(&km.salt)
+            && !self
+                .km_control
+                .get_or_insert_with(Box::default)
+                .kek_derivations
+                .try_take(now)
+        {
+            return Err(Error::invalid_data(
+                "KMREQ salt exceeds the KEK derivation budget",
+            ));
+        }
+        crypto.install_rx_keys(km.keys, km.salt, &km.wrapped_key)?;
+        self.send_km_response(control_info, now);
         Ok(())
     }
 
@@ -4204,7 +4241,7 @@ impl SrtConnection {
                 // CONCLUSION, which carries this same KMREQ.
                 None => return,
                 // A lost response is indistinguishable from a lost request.
-                Some(0) => KmRetryAction::Close(pending.request.key_flag),
+                Some(0) => KmRetryAction::Close(pending.request.keys),
                 Some(left) => {
                     pending.retries_left = Some(left - 1);
                     pending.next_retry = now.add_micros(KM_REQUEST_RETRY_INTERVAL_MICROS);
@@ -4215,7 +4252,7 @@ impl SrtConnection {
 
         match action {
             KmRetryAction::Resend(request) => self.send_km_request(&request, now),
-            KmRetryAction::Close(key_flag) => {
+            KmRetryAction::Close(keys) => {
                 if let Some(state) = self.km_control.as_mut() {
                     state.pending = None;
                 }
@@ -4223,7 +4260,8 @@ impl SrtConnection {
                 self.finish_local_close(DisconnectReason::ProtocolError(
                     "key rotation was not acknowledged".to_owned(),
                 ));
-                if let Some(crypto) = self.crypto.as_mut() {
+                // This side only ever announces one key per rotation.
+                if let (Some(crypto), Some(key_flag)) = (self.crypto.as_mut(), keys.single()) {
                     crypto.abandon_pre_announce(key_flag);
                 }
             }
@@ -4300,15 +4338,16 @@ impl SrtConnection {
         self.queue_control_packet(pkt, now);
     }
 
-    /// Send a KMRSP packet (KM Refresh).
-    fn send_km_response(&mut self, km_message: &KmMessage, now: Timestamp) {
+    /// Send a KMRSP packet (KM Refresh) echoing the accepted KMREQ's exact
+    /// body, as libsrt does.
+    fn send_km_response(&mut self, request_body: &[u8], now: Timestamp) {
         let pkt = ControlPacket {
             control_type: ControlType::UserDefined,
             subtype: SRT_CMD_KMRSP,
             type_specific_info: 0,
             timestamp: self.relative_timestamp(now),
             dest_socket_id: self.peer_socket_id,
-            control_info: km_message.encode(),
+            control_info: request_body.to_vec(),
         };
 
         self.queue_control_packet(pkt, now);
@@ -5337,7 +5376,10 @@ mod tests {
         let mut handshake = HandshakePacket::new_conclusion_request(1, 2, 3, 2, true);
         handshake.add_km_error(KmError::NoSecret);
         assert_eq!(
-            handshake.extensions.last().map(|extension| extension.data.as_slice()),
+            handshake
+                .extensions
+                .last()
+                .map(|extension| extension.data.as_slice()),
             Some(response.control_info.as_slice()),
             "runtime and handshake KMRSP share one KM-state encoding"
         );
@@ -6546,9 +6588,9 @@ mod tests {
     /// touching sender state if it cannot actually be encrypted, rather
     /// than advancing the sequence and retaining a fragment for
     /// retransmission and only then discovering `encrypt_to_wire` fails.
-    /// `drop_current_key_schedule_for_test` reproduces the one realistic
-    /// way this happens in production (see `update_sek`'s doc comment)
-    /// without driving a full KM wire exchange to a malformed wrapped key.
+    /// `drop_current_key_schedule_for_test` forces that state directly; no
+    /// production path reaches it now that a peer's KM installs only
+    /// receive keys, but the pre-admission check must still hold.
     #[test]
     #[cfg_attr(
         all(miri, not(feature = "miri-extended")),
@@ -9259,20 +9301,34 @@ mod tests {
             b"after duplicate response",
         );
 
-        // The initial even generation now has the selector expected after the
-        // accepted odd generation. Full-message replay history, rather than
-        // selector parity alone, is what prevents this rollback.
+        // The handshake's even key is still the listener's current even
+        // receive key, so repeating its KM changes nothing and is answered
+        // (libsrt answers a cached duplicate too).
+        tick += 10;
+        let before_repeat = km_security_snapshot(&listener);
+        feed_kmreq_expect_echo(
+            &mut listener,
+            &old_material.encode(),
+            Timestamp::from_micros(tick),
+        );
+        assert_eq!(km_security_snapshot(&listener), before_repeat);
+
+        // Once the peer replaces that even key, replaying the old KM would
+        // roll the receive slot back: refused, with nothing changed.
+        tick += 10;
+        let replacement = libsrt_km_body(0b01, test_km_salt(), &[&[0x7E; 16]], CipherMode::Ctr);
+        feed_kmreq_expect_echo(&mut listener, &replacement, Timestamp::from_micros(tick));
         tick += 10;
         assert_km_control_rejected(
             &mut listener,
             SRT_CMD_KMREQ,
             old_material.encode(),
             Timestamp::from_micros(tick),
-            "KMREQ replay of stale generation",
+            "KMREQ replay of a replaced generation",
         );
         assert_encrypted_roundtrip(
-            &mut caller,
             &mut listener,
+            &mut caller,
             Timestamp::from_micros(tick + 1),
             b"after stale request",
         );
@@ -10236,11 +10292,10 @@ mod tests {
             .feed_recv_buf(&first_request, now)
             .expect("the listener installs the announced key");
         let listener_after_install = km_security_snapshot(&listener);
-        let announced = listener
-            .crypto
-            .as_ref()
-            .expect("secured listener")
-            .current_key();
+        let announced = key_message_from_datagram(&first_request)
+            .keys
+            .single()
+            .expect("a local rotation announces one key");
 
         // The response is lost. The retry cadence elapses, and the sender
         // retransmits the *identical* request.
@@ -10275,14 +10330,9 @@ mod tests {
             km_security_snapshot(&caller).pending_response.is_none(),
             "a matching KMRSP closes the transaction"
         );
-        assert_eq!(
-            listener
-                .crypto
-                .as_ref()
-                .expect("secured listener")
-                .current_key(),
-            announced,
-            "the receiver is on the announced generation"
+        assert!(
+            receives_under(&listener, announced, test_km_salt(), &[0x6B; 16]),
+            "the receiver holds the announced key"
         );
         assert_encrypted_roundtrip(
             &mut caller,
@@ -10403,14 +10453,9 @@ mod tests {
             .expect("secured caller")
             .current_key();
         assert_ne!(switched, original_key, "the acknowledged rotation switches");
-        assert_eq!(
-            switched,
-            listener
-                .crypto
-                .as_ref()
-                .expect("secured listener")
-                .current_key(),
-            "sender and receiver agree on the generation"
+        assert!(
+            receives_under(&listener, switched, test_km_salt(), &[0x7C; 16]),
+            "the receiver holds the sender's new key under the switched selector"
         );
         assert_encrypted_roundtrip(
             &mut caller,
@@ -10462,14 +10507,452 @@ mod tests {
         }));
     }
 
+    /// The passphrase every encrypted test pair shares.
+    const KM_FIXTURE_PASSPHRASE: &str = "shared-secret";
+
+    /// A KM body assembled the way libsrt's `hcryptCtx_Tx_AsmKM`
+    /// (`haicrypt/hcrypt_ctx_tx.c`) assembles it, independently of
+    /// `KmMessage::encode`: the fixed header, the salt, then one AES key
+    /// wrap of the selected SEKs -- the even SEK first when both are
+    /// announced. The KEK is PBKDF2-HMAC-SHA1 over the salt's last eight
+    /// bytes with 2048 iterations (`haicrypt/hcrypt_sa.c`).
+    fn libsrt_km_body(kk: u8, salt: [u8; 16], seks: &[&[u8]], cipher_mode: CipherMode) -> Vec<u8> {
+        use aes_gcm::KeyInit;
+        let key_len = seks[0].len();
+        let mut kek = vec![0u8; key_len];
+        pbkdf2::pbkdf2_hmac::<sha1::Sha1>(
+            KM_FIXTURE_PASSPHRASE.as_bytes(),
+            &salt[8..],
+            2048,
+            &mut kek,
+        );
+        let plain = seks.concat();
+        let mut wrapped = vec![0u8; plain.len() + 8];
+        let wrapped_ok = match key_len {
+            16 => aes_kw::KwAes128::new_from_slice(&kek)
+                .expect("AES-128 KEK")
+                .wrap_key(&plain, &mut wrapped)
+                .is_ok(),
+            32 => aes_kw::KwAes256::new_from_slice(&kek)
+                .expect("AES-256 KEK")
+                .wrap_key(&plain, &mut wrapped)
+                .is_ok(),
+            _ => false,
+        };
+        assert!(wrapped_ok, "the fixture wraps its SEKs");
+        let (cipher, auth) = match cipher_mode {
+            CipherMode::Ctr => (2, 0),
+            CipherMode::Gcm => (4, 1),
+        };
+        let key_words = u8::try_from(key_len / 4).expect("AES key length in words");
+        let mut body = vec![
+            0x12, 0x20, 0x29, kk, 0, 0, 0, 0, cipher, auth, 2, 0, 0, 0, 4, key_words,
+        ];
+        body.extend_from_slice(&salt);
+        body.extend_from_slice(&wrapped);
+        body
+    }
+
+    /// Whether `connection` decrypts what a sender keyed with `salt`/`sek`
+    /// encrypted, when the DATA carries `flag` -- the same decrypt calls
+    /// the DATA receive path makes.
+    fn receives_under(
+        connection: &SrtConnection,
+        flag: KeyFlag,
+        salt: [u8; 16],
+        sek: &[u8],
+    ) -> bool {
+        let crypto = connection.crypto.as_ref().expect("secured connection");
+        let mode = crypto.cipher_mode();
+        let key_length = KeyLength::from_len(sek.len()).expect("AES key");
+        let mut oracle =
+            CryptoContext::new_sender(KM_FIXTURE_PASSPHRASE, key_length, salt, sek, mode)
+                .expect("oracle sender");
+        let plaintext = b"key-material oracle payload".to_vec();
+        let header = [0x42; 16];
+        match mode {
+            CipherMode::Ctr => {
+                let mut buffer = plaintext.clone();
+                oracle.encrypt(7, &mut buffer).expect("oracle encrypts");
+                crypto.decrypt(7, flag, &mut buffer).is_ok() && buffer == plaintext
+            }
+            CipherMode::Gcm => {
+                let (_, sealed) = oracle
+                    .encrypt_gcm(7, &header, plaintext.clone())
+                    .expect("oracle seals");
+                crypto
+                    .decrypt_gcm(7, flag, &header, sealed)
+                    .is_ok_and(|opened| opened == plaintext)
+            }
+        }
+    }
+
+    /// Feed a runtime KMREQ and require the exact-body KMRSP echo.
+    fn feed_kmreq_expect_echo(target: &mut SrtConnection, body: &[u8], now: Timestamp) {
+        let _ = drain_outputs(target);
+        let datagram = control_datagram(
+            target.socket_id(),
+            ControlType::UserDefined,
+            SRT_CMD_KMREQ,
+            0,
+            body.to_vec(),
+        );
+        target
+            .feed_recv_buf(&datagram, now)
+            .expect("a valid KMREQ is accepted");
+        let response = take_user_defined_datagram(target, SRT_CMD_KMRSP);
+        assert_eq!(
+            user_defined_control_info(&response),
+            body,
+            "the KMRSP echoes the exact KMREQ body"
+        );
+    }
+
+    /// Both peers drained of the handshake's events and output.
+    fn quiet_encrypted_pair(
+        cipher_mode: CipherMode,
+        key_length: KeyLength,
+    ) -> (SrtConnection, SrtConnection) {
+        let (mut caller, mut listener) = encrypted_pair_with(cipher_mode, key_length);
+        for connection in [&mut caller, &mut listener] {
+            while connection.poll_event().is_some() {}
+            let _ = drain_outputs(connection);
+        }
+        (caller, listener)
+    }
+
+    /// KM-3: libsrt's ordinary refresh announces the current and the next
+    /// SEK in one KM message (KK = 3, even SEK first) under the unchanged
+    /// salt, then the switched-to key alone once the old one is retired.
+    #[test]
+    fn libsrt_both_key_announcement_installs_both_receive_slots() {
+        for (cipher_mode, key_length) in [
+            (CipherMode::Ctr, KeyLength::Aes128),
+            (CipherMode::Ctr, KeyLength::Aes256),
+            (CipherMode::Gcm, KeyLength::Aes128),
+            (CipherMode::Gcm, KeyLength::Aes256),
+        ] {
+            let (_caller, mut listener) = quiet_encrypted_pair(cipher_mode, key_length);
+            let len = key_length.len();
+            let (current, next, after) = (vec![0x5A; len], vec![0x6C; len], vec![0x7E; len]);
+            let salt = test_km_salt();
+            let now = Timestamp::from_micros(10_000_000);
+
+            let even_to_odd = libsrt_km_body(0b11, salt, &[&current, &next], cipher_mode);
+            assert_eq!(even_to_odd.len(), 16 + 16 + 2 * len + 8);
+            feed_kmreq_expect_echo(&mut listener, &even_to_odd, now);
+            assert!(receives_under(&listener, KeyFlag::Even, salt, &current));
+            assert!(receives_under(&listener, KeyFlag::Odd, salt, &next));
+
+            // After the switch: the odd key alone, then odd -> even.
+            let odd_only = libsrt_km_body(0b10, salt, &[&next], cipher_mode);
+            feed_kmreq_expect_echo(&mut listener, &odd_only, now.add_micros(1));
+            let odd_to_even = libsrt_km_body(0b11, salt, &[&after, &next], cipher_mode);
+            feed_kmreq_expect_echo(&mut listener, &odd_to_even, now.add_micros(2));
+            assert!(receives_under(&listener, KeyFlag::Even, salt, &after));
+            assert!(receives_under(&listener, KeyFlag::Odd, salt, &next));
+        }
+    }
+
+    /// KM-2: a peer's key announcement configures this side's receive
+    /// direction only. Its own transmit selector and in-flight rotation
+    /// stay as they were, even when both sides rotate at once.
+    #[test]
+    fn peer_key_announcement_leaves_the_local_transmit_key_unchanged() {
+        let (mut caller, mut listener) = quiet_encrypted_pair(CipherMode::Ctr, KeyLength::Aes128);
+        let now = Timestamp::from_micros(10_000_000);
+        listener
+            .provide_new_sek(&[0x71; 16], now)
+            .expect("the listener starts its own rotation");
+        let listener_request = take_user_defined_datagram(&mut listener, SRT_CMD_KMREQ);
+        caller
+            .provide_new_sek(&[0x6B; 16], now)
+            .expect("the caller starts its rotation");
+        let caller_request = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
+
+        listener
+            .feed_recv_buf(&caller_request, now.add_micros(1))
+            .expect("the listener installs the caller's announced key");
+        assert!(receives_under(
+            &listener,
+            KeyFlag::Odd,
+            test_km_salt(),
+            &[0x6B; 16]
+        ));
+        let listener_crypto = listener.crypto.as_ref().expect("secured listener");
+        assert_eq!(listener_crypto.current_key(), KeyFlag::Even);
+        assert_eq!(
+            listener_crypto.km_refresh_state(),
+            crate::crypto_impl::KmRefreshState::PreAnnounce
+        );
+        assert_eq!(
+            listener
+                .km_control
+                .as_ref()
+                .and_then(|state| state.pending.as_ref())
+                .map(|pending| pending.request.encode()),
+            Some(user_defined_control_info(&listener_request)),
+            "the listener's own rotation is still the one awaiting a response"
+        );
+
+        let reverse = capture_data_datagram(&mut listener, b"reverse", now.add_micros(2));
+        let Ok(SrtPacket::Data(packet)) = SrtPacket::decode(&reverse) else {
+            panic!("encrypted send must produce DATA");
+        };
+        assert_eq!(packet.encryption_flag, KeyFlag::Even.to_kk_field());
+        caller
+            .feed_recv_buf(&reverse, now.add_micros(3))
+            .expect("the caller still decrypts the listener's unchanged key");
+
+        feed_kmreq_expect_echo(
+            &mut caller,
+            &user_defined_control_info(&listener_request),
+            now.add_micros(4),
+        );
+        assert!(receives_under(
+            &caller,
+            KeyFlag::Odd,
+            test_km_salt(),
+            &[0x71; 16]
+        ));
+        assert_eq!(
+            caller
+                .crypto
+                .as_ref()
+                .expect("secured caller")
+                .current_key(),
+            KeyFlag::Even
+        );
+    }
+
+    /// KM-1: Robotweax replaces the handshake's even key right after
+    /// establishment with independently generated material -- a new salt and
+    /// SEK under the same selector (`prepare_bidirectional_sender`). libsrt
+    /// installs a changed same-selector KM, salt included
+    /// (`hcrypt_ctx_rx.c`); so does an SEK-only change.
+    #[test]
+    fn same_selector_replacement_after_connect_is_installed() {
+        for cipher_mode in [CipherMode::Ctr, CipherMode::Gcm] {
+            for (salt, sek) in [([0xC3; 16], [0x7D; 16]), (test_km_salt(), [0x7E; 16])] {
+                for caller_is_target in [true, false] {
+                    let (mut caller, mut listener) =
+                        quiet_encrypted_pair(cipher_mode, KeyLength::Aes128);
+                    let (target, peer) = if caller_is_target {
+                        (&mut caller, &mut listener)
+                    } else {
+                        (&mut listener, &mut caller)
+                    };
+                    assert_same_selector_replacement(target, peer, cipher_mode, salt, &sek);
+                }
+            }
+        }
+    }
+
+    fn assert_same_selector_replacement(
+        target: &mut SrtConnection,
+        peer: &mut SrtConnection,
+        cipher_mode: CipherMode,
+        salt: [u8; 16],
+        sek: &[u8],
+    ) {
+        let now = Timestamp::from_micros(10_000_000);
+        let body = libsrt_km_body(0b01, salt, &[sek], cipher_mode);
+        feed_kmreq_expect_echo(target, &body, now);
+        assert!(receives_under(target, KeyFlag::Even, salt, sek));
+        // The target's own transmit direction still uses the handshake key.
+        let reverse = capture_data_datagram(target, b"reverse", now.add_micros(1));
+        peer.feed_recv_buf(&reverse, now.add_micros(2))
+            .expect("the peer still decrypts the target's handshake key");
+    }
+
+    /// A salt the handshake did not use.
+    const FRESH_SALT: [u8; 16] = [0xC3; 16];
+
+    /// A CTR KM body for `keys` under [`FRESH_SALT`].
+    fn fresh_salt_km(kk: u8, seks: &[&[u8]]) -> Vec<u8> {
+        libsrt_km_body(kk, FRESH_SALT, seks, CipherMode::Ctr)
+    }
+
+    /// A listener whose even receive key a Robotweax-style peer replaced
+    /// twice under [`FRESH_SALT`]: `[0x91; 16]`, then `[0x92; 16]`. The
+    /// first is now a retired receive key that was never a transmit key.
+    fn listener_with_replaced_even_key() -> (SrtConnection, Timestamp) {
+        let (_caller, mut listener) = quiet_encrypted_pair(CipherMode::Ctr, KeyLength::Aes128);
+        let now = Timestamp::from_micros(10_000_000);
+        feed_kmreq_expect_echo(&mut listener, &fresh_salt_km(0b01, &[&[0x91; 16]]), now);
+        feed_kmreq_expect_echo(
+            &mut listener,
+            &fresh_salt_km(0b01, &[&[0x92; 16]]),
+            now.add_micros(1),
+        );
+        (listener, now.add_micros(2))
+    }
+
+    /// Hardening: this side's own transmit key, reflected back as a KMREQ,
+    /// is never installed as a receive key -- verbatim or re-wrapped under
+    /// another salt.
+    #[test]
+    fn a_reflected_transmit_key_is_not_installed_as_a_receive_key() {
+        let (mut caller, _listener) = quiet_encrypted_pair(CipherMode::Ctr, KeyLength::Aes128);
+        let now = Timestamp::from_micros(10_000_000);
+        caller
+            .provide_new_sek(&[0x6B; 16], now)
+            .expect("the caller starts a rotation");
+        let own_request = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
+        assert_km_control_rejected(
+            &mut caller,
+            SRT_CMD_KMREQ,
+            user_defined_control_info(&own_request),
+            now.add_micros(1),
+            "own KMREQ reflected",
+        );
+        assert_km_control_rejected(
+            &mut caller,
+            SRT_CMD_KMREQ,
+            fresh_salt_km(0b10, &[&[0x6B; 16]]),
+            now.add_micros(2),
+            "own key re-wrapped under a fresh salt",
+        );
+    }
+
+    /// Hardening: the wrap authenticates neither selector nor salt, so a
+    /// key already held must keep both.
+    #[test]
+    fn a_known_receive_key_cannot_change_selector_or_salt() {
+        let (mut listener, now) = listener_with_replaced_even_key();
+        assert_km_control_rejected(
+            &mut listener,
+            SRT_CMD_KMREQ,
+            fresh_salt_km(0b10, &[&[0x92; 16]]),
+            now,
+            "current even key announced as odd",
+        );
+        assert_km_control_rejected(
+            &mut listener,
+            SRT_CMD_KMREQ,
+            libsrt_km_body(0b01, test_km_salt(), &[&[0x92; 16]], CipherMode::Ctr),
+            now.add_micros(1),
+            "current even key under another salt",
+        );
+    }
+
+    /// Hardening: a recently replaced receive key is not reinstalled,
+    /// under either selector.
+    #[test]
+    fn a_retired_receive_key_cannot_be_reinstalled() {
+        let (mut listener, now) = listener_with_replaced_even_key();
+        assert_km_control_rejected(
+            &mut listener,
+            SRT_CMD_KMREQ,
+            fresh_salt_km(0b01, &[&[0x91; 16]]),
+            now,
+            "retired key in its old slot",
+        );
+        assert_km_control_rejected(
+            &mut listener,
+            SRT_CMD_KMREQ,
+            fresh_salt_km(0b10, &[&[0x91; 16]]),
+            now.add_micros(1),
+            "retired key in the other slot",
+        );
+    }
+
+    /// Hardening: a both-key announcement cannot install one SEK as both.
+    #[test]
+    fn a_both_key_announcement_of_one_key_twice_is_refused() {
+        let (mut listener, now) = listener_with_replaced_even_key();
+        assert_km_control_rejected(
+            &mut listener,
+            SRT_CMD_KMREQ,
+            fresh_salt_km(0b11, &[&[0x93; 16], &[0x93; 16]]),
+            now,
+            "one SEK under both selectors",
+        );
+    }
+
+    /// An identical repeat of the current KM is answered with the same
+    /// KMRSP and reinstalls nothing.
+    #[test]
+    fn an_identical_current_kmreq_is_answered_without_reinstalling() {
+        let (mut listener, now) = listener_with_replaced_even_key();
+        let before = km_security_snapshot(&listener);
+        feed_kmreq_expect_echo(&mut listener, &fresh_salt_km(0b01, &[&[0x92; 16]]), now);
+        assert_eq!(km_security_snapshot(&listener), before);
+    }
+
+    /// A KMREQ whose wrap fails under a freshly derived KEK leaves every key
+    /// and the cached KEK as they were; the intact request then installs.
+    #[test]
+    fn a_failed_unwrap_under_a_fresh_salt_leaves_every_key_untouched() {
+        let (_caller, mut listener) = quiet_encrypted_pair(CipherMode::Ctr, KeyLength::Aes128);
+        let now = Timestamp::from_micros(10_000_000);
+        let intact = fresh_salt_km(0b01, &[&[0x91; 16]]);
+        let mut corrupted = intact.clone();
+        *corrupted.last_mut().expect("wrapped key") ^= 0x01;
+        assert_km_control_rejected(
+            &mut listener,
+            SRT_CMD_KMREQ,
+            corrupted,
+            now,
+            "corrupted wrap under a fresh salt",
+        );
+        feed_kmreq_expect_echo(&mut listener, &intact, now.add_micros(1));
+        assert!(receives_under(
+            &listener,
+            KeyFlag::Even,
+            FRESH_SALT,
+            &[0x91; 16]
+        ));
+    }
+
+    /// Each fresh salt costs a 2048-iteration PBKDF2 derivation, so a
+    /// connection admits `KM_KEK_DERIVATION_BURST` at once and one more per
+    /// `KM_KEK_DERIVATION_REFILL_MICROS`. A refused KMREQ is unanswered and
+    /// changes nothing; salts with a cached KEK cost nothing; the peer's
+    /// retry after the interval installs.
+    #[test]
+    fn fresh_salt_kek_derivations_are_bounded_per_connection() {
+        let (_caller, mut listener) = quiet_encrypted_pair(CipherMode::Ctr, KeyLength::Aes128);
+        let now = Timestamp::from_micros(10_000_000);
+        let ctr = CipherMode::Ctr;
+        let first = libsrt_km_body(0b01, [0xA1; 16], &[&[0x91; 16]], ctr);
+        let second = libsrt_km_body(0b01, [0xA2; 16], &[&[0x92; 16]], ctr);
+        let third = libsrt_km_body(0b01, [0xA3; 16], &[&[0x93; 16]], ctr);
+        feed_kmreq_expect_echo(&mut listener, &first, now);
+        feed_kmreq_expect_echo(&mut listener, &second, now.add_micros(1));
+        assert_km_control_rejected(
+            &mut listener,
+            SRT_CMD_KMREQ,
+            third.clone(),
+            now.add_micros(2),
+            "fresh salt beyond the derivation burst",
+        );
+        feed_kmreq_expect_echo(&mut listener, &second, now.add_micros(3));
+        let odd_under_session_salt = libsrt_km_body(0b10, test_km_salt(), &[&[0x94; 16]], ctr);
+        feed_kmreq_expect_echo(&mut listener, &odd_under_session_salt, now.add_micros(4));
+        feed_kmreq_expect_echo(
+            &mut listener,
+            &third,
+            now.add_micros(KM_KEK_DERIVATION_REFILL_MICROS + 2),
+        );
+    }
+
     /// A connected encrypted pair sharing one passphrase.
     fn encrypted_pair(cipher_mode: CipherMode) -> (SrtConnection, SrtConnection) {
-        let sek = vec![0x5Au8; 16];
+        encrypted_pair_with(cipher_mode, KeyLength::Aes128)
+    }
+
+    fn encrypted_pair_with(
+        cipher_mode: CipherMode,
+        key_length: KeyLength,
+    ) -> (SrtConnection, SrtConnection) {
+        let sek = vec![0x5Au8; key_length.len()];
         let options = |socket_id: u32| ConnectionOptions {
             socket_id,
-            passphrase: Some("shared-secret".to_owned()),
+            passphrase: Some(KM_FIXTURE_PASSPHRASE.to_owned()),
             crypto_salt: Some(test_km_salt()),
             crypto_sek: Some(sek.clone()),
+            key_length,
             cipher_mode,
             ..ConnectionOptions::default()
         };
@@ -10485,10 +10968,8 @@ mod tests {
     #[derive(Debug, PartialEq, Eq)]
     struct KmSecuritySnapshot {
         state: ConnectionState,
-        current_key: KeyFlag,
+        keys: crate::crypto_impl::KeyStateForTest,
         pending_response: Option<Vec<u8>>,
-        received: Vec<Option<Vec<u8>>>,
-        received_next: usize,
         acknowledged: Vec<Option<Vec<u8>>>,
         acknowledged_next: usize,
     }
@@ -10499,23 +10980,19 @@ mod tests {
             .km_control
             .as_ref()
             .expect("secured KM control state");
-        let encode_entries = |history: &KmHistory| {
-            history
-                .entries
-                .iter()
-                .map(|entry| entry.as_ref().map(KmMessage::encode))
-                .collect()
-        };
         KmSecuritySnapshot {
             state: connection.state(),
-            current_key: crypto.current_key(),
+            keys: crypto.key_state_for_test(),
             pending_response: state
                 .pending
                 .as_ref()
                 .map(|pending| pending.request.encode()),
-            received: encode_entries(&state.received),
-            received_next: state.received.next,
-            acknowledged: encode_entries(&state.acknowledged),
+            acknowledged: state
+                .acknowledged
+                .entries
+                .iter()
+                .map(|entry| entry.as_ref().map(KmMessage::encode))
+                .collect(),
             acknowledged_next: state.acknowledged.next,
         }
     }

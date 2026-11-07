@@ -53,7 +53,8 @@ pub mod handshake {
 /// Supported key-management and encryption protocol component APIs.
 pub mod crypto {
     pub use super::crypto_impl::{
-        CipherMode, CryptoContext, GCM_TAG_LEN, KeyFlag, KeyLength, KmRefreshState, TxCryptoStamp,
+        CipherMode, CryptoContext, GCM_TAG_LEN, KeyFlag, KeyLength, KmKeySelection, KmRefreshState,
+        RxKeyUpdate, TxCryptoStamp,
     };
 }
 
