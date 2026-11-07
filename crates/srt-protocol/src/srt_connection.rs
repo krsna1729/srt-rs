@@ -4671,8 +4671,11 @@ impl SrtConnection {
         self.receiver.as_ref()?.gives_up_at(source_time)
     }
 
+    /// Periodic NAK reports are this side's own receive policy, independent
+    /// of the peer's NAKREPORT, which only says whether the peer will send
+    /// them to us (libsrt `fillSrtHandshake_HSRSP`, `checkNAKTimer`).
     fn periodic_nak_enabled(&self) -> bool {
-        self.negotiated_feature(srt_flags::PERIODICNAK, srt_flags::PERIODICNAK)
+        self.negotiated_srt_flags() & srt_flags::PERIODICNAK != 0
     }
 
     fn send_induction_response(&mut self, now: Timestamp) {
@@ -6893,6 +6896,9 @@ mod tests {
         );
     }
 
+    /// A peer without TSBPDSND/TLPKTDROP disables those negotiated live
+    /// features, but its missing NAKREPORT does not stop this side's own
+    /// periodic loss reports: that flag describes the peer's reporting.
     #[test]
     fn peer_capabilities_disable_optional_live_behaviour() {
         let mut conn = SrtConnection::new_listener(ConnectionOptions::default());
@@ -6903,8 +6909,52 @@ mod tests {
 
         assert!(!conn.tsbpd_enabled());
         assert!(!conn.tlpktdrop_enabled());
-        assert!(!conn.periodic_nak_enabled());
+        assert!(conn.periodic_nak_enabled());
         assert!(!conn.receiver.as_ref().expect("receiver").tsbpd_enabled());
+    }
+
+    /// A libsrt peer with `SRTO_NAKREPORT=0` clears NAKREPORT in its HSREQ.
+    /// libsrt keeps reporting its own losses periodically regardless
+    /// (`m_config.bRcvNakReport` alone gates `checkNAKTimer`), so this side
+    /// must too: after the first NAK is lost, the timer repeats the report.
+    #[test]
+    fn local_periodic_nak_repeats_losses_when_the_peer_clears_nakreport() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        let mut no_nakreport = plain;
+        no_nakreport.hs_flags_clear = srt_flags::PERIODICNAK;
+        let mut attempt = handshake_with_rewrites(&no_nakreport, &plain, listener_options());
+        attempt.listener_result.expect("listener accepts");
+        let listener = &mut attempt.listener;
+        let first = listener.initial_seq;
+        let gap_end = (first + 2) & SEQUENCE_MASK;
+        listener.receiver.as_mut().expect("receiver").receive(
+            DataPacket::new(gap_end, 1, 1, 0, Vec::new().into()),
+            Timestamp::from_micros(10_000),
+        );
+        drain_outputs(listener);
+
+        listener
+            .handle_timer(TimerId::Nak, Timestamp::from_micros(1_000_000))
+            .expect("NAK timer");
+        let outputs = drain_outputs(listener);
+        let naks = outputs
+            .iter()
+            .filter(|output| {
+                matches!(output, ConnectionOutput::SendPacket(bytes)
+                    if matches!(SrtPacket::decode(bytes), Ok(SrtPacket::Control(ControlPacket { control_type: ControlType::Nak, .. }))))
+            })
+            .count();
+        assert!(naks > 0, "the outstanding loss is reported again");
+        assert!(
+            outputs.iter().any(|output| matches!(
+                output,
+                ConnectionOutput::SetTimer {
+                    id: TimerId::Nak,
+                    ..
+                }
+            )),
+            "the periodic NAK timer stays armed"
+        );
     }
 
     #[test]

@@ -178,6 +178,9 @@ HSv5 negotiation follows libsrt 1.5.7:
   delay, `sender_stats().tsbpd_delay_micros` the peer's (the sender's drop
   horizon). `HandshakePacket::add_hs_extension` and `add_hs_response` take
   the RCV and SND halves separately.
+- Periodic NAK reports are local receive policy and always on; a peer that
+  clears NAKREPORT (libsrt `SRTO_NAKREPORT=0`) only declares that it will not
+  send them itself.
 
 ## Testing
 
