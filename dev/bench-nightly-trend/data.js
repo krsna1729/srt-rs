@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793961948799,
+  "lastUpdate": 1794048314317,
   "repoUrl": "https://github.com/krsna1729/srt-rs",
   "entries": {
     "Benchmark": [
@@ -147,6 +147,43 @@ window.BENCHMARK_DATA = {
           {
             "name": "tokio",
             "value": 47548.3,
+            "unit": "pkt/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Saikrishna Edupuganti",
+            "username": "krsna1729",
+            "email": "6157640+krsna1729@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "Saikrishna Edupuganti",
+            "username": "krsna1729",
+            "email": "6157640+krsna1729@users.noreply.github.com"
+          },
+          "id": "91eeef82a2c0dd0e3f1263ab0a8e062af572d8d2",
+          "message": "Record Robotweax rekey cause as unestablished\n\nThe interop record stated why Robotweax's encrypted callers fail as fact.\nThe trace shows only a post-connect same-index KMREQ with a new salt and\nSEK; whether Robotweax is reacting to this receiver's handshake KMRSP is\nnot established. Reword the risk item to the observation.\n\nEvidence: documentation only.",
+          "timestamp": "2026-11-06T14:09:36Z",
+          "url": "https://github.com/krsna1729/srt-rs/commit/91eeef82a2c0dd0e3f1263ab0a8e062af572d8d2"
+        },
+        "date": 1794048313938,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "compio",
+            "value": 25574.9,
+            "unit": "pkt/s"
+          },
+          {
+            "name": "mio",
+            "value": 58762.6,
+            "unit": "pkt/s"
+          },
+          {
+            "name": "tokio",
+            "value": 39703.1,
             "unit": "pkt/s"
           }
         ]
