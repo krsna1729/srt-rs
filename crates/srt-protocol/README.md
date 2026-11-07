@@ -211,6 +211,11 @@ Packets carry what libsrt 1.5.7 emits:
 - A listener's INDUCTION response echoes the caller's ISN. A caller refuses
   a CONCLUSION response that carries another ISN (libsrt `MN_SECURITY`);
   the INDUCTION response's ISN is not checked, as in libsrt.
+- An empty `stream_id` is not sent. `congestion_control` must be 1 to 16
+  bytes, the names libsrt accepts: `connect` refuses another, and a listener
+  configured with one refuses callers with `SRT_REJ_CONGESTION`. Received
+  handshakes with an empty SID, or an empty or over-16-byte congestion
+  block, fail to decode, as libsrt refuses them.
 
 ## Testing
 

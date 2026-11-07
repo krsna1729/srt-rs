@@ -1144,10 +1144,12 @@ proptest! {
     /// この宣言が抜けていると、congctl を宣言する real libsrt ピアは
     /// 相手が何も宣言しないのを見て自らのモードとの不一致を疑い、
     /// 送信を一切行わずに切断していた)
+    /// Names stay within libsrt's 1-16 byte bounds (`MAX_CONG_LENGTH`);
+    /// others are refused before emission.
     #[test]
     fn prop_peer_congestion_control_round_trips_through_handshake(
-        caller_cc in "[a-zA-Z0-9_-]{0,32}",
-        listener_cc in "[a-zA-Z0-9_-]{0,32}",
+        caller_cc in "[a-zA-Z0-9_-]{1,16}",
+        listener_cc in "[a-zA-Z0-9_-]{1,16}",
     ) {
         let mut now = Timestamp::from_micros(0);
         let mut caller = SrtConnection::new_caller(ConnectionOptions {

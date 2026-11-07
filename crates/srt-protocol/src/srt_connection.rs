@@ -19,8 +19,9 @@ use crate::message_assembler::MessageAssembler;
 use crate::sender_rto::RtoArm;
 use crate::srt_handshake::{
     DEFAULT_FLOW_WINDOW, DEFAULT_MTU, GroupExtensionData, HS_VERSION_5, HandshakePacket,
-    HandshakeState, HandshakeType, IpFamily, KmError, KmMessage, MAX_FLOW_WINDOW, SRT_MAGIC_CODE,
-    SRT_REJ_CRYPTO, SRT_REJ_FILTER, SRT_REJ_MESSAGEAPI, SRT_REJ_ROGUE, SRT_REJ_VERSION, srt_flags,
+    HandshakeState, HandshakeType, IpFamily, KmError, KmMessage, MAX_CONGESTION_NAME_BYTES,
+    MAX_FLOW_WINDOW, SRT_MAGIC_CODE, SRT_REJ_CONGESTION, SRT_REJ_CRYPTO, SRT_REJ_FILTER,
+    SRT_REJ_MESSAGEAPI, SRT_REJ_ROGUE, SRT_REJ_VERSION, srt_flags,
 };
 use crate::srt_packet::{
     ControlPacket, ControlType, DataHeader, DataPacket, DatagramClass, PendingData,
@@ -448,10 +449,13 @@ pub struct ConnectionOptions {
     /// SRT version.
     pub srt_version: u32,
     /// Stream ID (the identifier the Caller sends to the Listener, capped at
-    /// 512 bytes at construction).
+    /// 512 bytes at construction). An empty Stream ID is not sent: libsrt
+    /// refuses an empty SID block.
     pub stream_id: Option<String>,
     /// Congestion control mode name declared in the handshake extension
-    /// (e.g. "live", "file"), capped at 512 bytes at construction. A real
+    /// (e.g. "live", "file"). It must be 1 to 16 bytes, the names a libsrt
+    /// peer accepts (`CSrtConfig::MAX_CONG_LENGTH`): `connect` refuses
+    /// another, and a listener refuses callers with `SRT_REJ_CONGESTION`. A real
     /// libsrt peer that declares a mode itself refuses to transmit if the
     /// other side declares nothing at all, assuming a live/file mismatch
     /// (confirmed by interop testing against `srt-file-transmit`, which logs
@@ -925,7 +929,8 @@ fn normalize_buffer_options(mut options: ConnectionOptions) -> ConnectionOptions
     if let Some(stream_id) = options.stream_id.as_mut() {
         truncate_utf8(stream_id, MAX_HANDSHAKE_OPTION_BYTES);
     }
-    truncate_utf8(&mut options.congestion_control, MAX_HANDSHAKE_OPTION_BYTES);
+    // The congestion name is validated, not truncated: a shortened name
+    // would declare a different mode.
     options.ack_interval_micros =
         crate::receiver::clamp_ack_interval_micros(options.ack_interval_micros);
     options.light_ack_interval_packets =
@@ -1651,6 +1656,11 @@ impl SrtConnection {
             return Err(Error::crypto_error(
                 "AES-GCM needs an srt_version of 1.5.4 or newer: libsrt peers use the \
                  unsupported legacy GCM layout with 1.5.3 and older",
+            ));
+        }
+        if !self.congestion_name_is_emittable() {
+            return Err(Error::invalid_data(
+                "congestion_control must be 1 to 16 bytes, the names libsrt accepts",
             ));
         }
 
@@ -3580,6 +3590,27 @@ impl SrtConnection {
         ))
     }
 
+    /// Whether the configured congestion name is one a libsrt peer accepts:
+    /// 1 to 16 bytes (`CSrtConfig::MAX_CONG_LENGTH`; `interpretSrtHandshake`
+    /// refuses any other, core.cpp:3001-3007).
+    fn congestion_name_is_emittable(&self) -> bool {
+        (1..=MAX_CONGESTION_NAME_BYTES).contains(&self.options.congestion_control.len())
+    }
+
+    /// A listener whose own congestion name libsrt would refuse does not
+    /// answer with it: it refuses the caller with `SRT_REJ_CONGESTION`. (A
+    /// caller refuses such a name in `connect`, before sending anything.)
+    fn reject_unemittable_congestion(&mut self, now: Timestamp) -> Result<(), Error> {
+        if self.congestion_name_is_emittable() {
+            return Ok(());
+        }
+        Err(self.refuse_peer(
+            SRT_REJ_CONGESTION,
+            "configured congestion_control is not 1 to 16 bytes, the names libsrt accepts",
+            now,
+        ))
+    }
+
     /// Reject a handshake in which the peer negotiates packet-filter
     /// behaviour this implementation does not provide.
     ///
@@ -3869,6 +3900,7 @@ impl SrtConnection {
         self.reject_message_api_mismatch(&hs, now)?;
         self.reject_peer_without_rexmit_flag(&hs, now)?;
         self.reject_legacy_gcm_peer(&hs, now)?;
+        self.reject_unemittable_congestion(now)?;
         self.apply_peer_mss(&hs);
         self.note_peer_flow_window(hs.flow_window);
 
@@ -4937,8 +4969,13 @@ impl SrtConnection {
             });
         }
 
-        // Add a SID extension if a Stream ID is set.
-        if let Some(ref stream_id) = self.options.stream_id {
+        // Add a SID extension if a non-empty Stream ID is set.
+        if let Some(stream_id) = self
+            .options
+            .stream_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+        {
             hs.add_sid_extension(stream_id);
         }
 
@@ -5488,13 +5525,91 @@ mod tests {
     fn handshake_option_strings_are_bounded_at_construction() {
         let conn = SrtConnection::new_caller(ConnectionOptions {
             stream_id: Some("あ".repeat(200)),
-            congestion_control: "live-".to_owned() + &"x".repeat(600),
             ..ConnectionOptions::default()
         });
 
         let stream_id = conn.options.stream_id.as_deref().expect("stream id");
         assert_eq!(stream_id.len(), 510);
-        assert!(conn.options.congestion_control.len() <= MAX_HANDSHAKE_OPTION_BYTES);
+    }
+
+    /// An empty Stream ID is not sent: libsrt refuses an empty SID block
+    /// (core.cpp:2950-2960).
+    #[test]
+    fn an_empty_stream_id_is_not_emitted() {
+        for (stream_id, emitted) in [("", None), ("id", Some("id"))] {
+            let mut caller = SrtConnection::new_caller(ConnectionOptions {
+                socket_id: 1,
+                stream_id: Some(stream_id.to_owned()),
+                ..ConnectionOptions::default()
+            });
+            let mut listener = SrtConnection::new_listener(listener_options());
+            caller.connect(Timestamp::default()).unwrap();
+            listener
+                .feed_recv_buf(&next_wire(&mut caller), Timestamp::from_micros(1))
+                .unwrap();
+            caller
+                .feed_recv_buf(&next_wire(&mut listener), Timestamp::from_micros(2))
+                .unwrap();
+            let (conclusion, _) = decode_handshake(&next_wire(&mut caller));
+            assert_eq!(conclusion.get_sid_extension().as_deref(), emitted);
+        }
+    }
+
+    /// Congestion names a libsrt peer refuses (empty, or over 16 bytes:
+    /// `CSrtConfig::MAX_CONG_LENGTH`, core.cpp:3001-3007), paired with
+    /// whether this side may emit them.
+    fn congestion_name_cases() -> [(String, bool); 4] {
+        [
+            (String::new(), false),
+            ("live".to_owned(), true),
+            ("c".repeat(16), true),
+            ("c".repeat(17), false),
+        ]
+    }
+
+    /// `connect` refuses a congestion name libsrt refuses, before sending.
+    #[test]
+    fn caller_refuses_a_congestion_name_outside_libsrt_bounds() {
+        for (name, emittable) in congestion_name_cases() {
+            let mut caller = SrtConnection::new_caller(ConnectionOptions {
+                congestion_control: name.clone(),
+                ..ConnectionOptions::default()
+            });
+            let started = caller.connect(Timestamp::default());
+            assert_eq!(started.is_ok(), emittable, "{name:?}: {started:?}");
+            let sent = drain_outputs(&mut caller)
+                .iter()
+                .any(|output| matches!(output, ConnectionOutput::SendPacket(_)));
+            assert_eq!(sent, emittable, "{name:?}");
+        }
+    }
+
+    /// A listener whose congestion name libsrt refuses answers callers with
+    /// `SRT_REJ_CONGESTION` instead of a CONCLUSION response carrying it.
+    #[test]
+    fn listener_refuses_callers_with_a_congestion_name_outside_libsrt_bounds() {
+        for (name, emittable) in congestion_name_cases() {
+            let mut caller = SrtConnection::new_caller(ConnectionOptions {
+                socket_id: 1,
+                ..ConnectionOptions::default()
+            });
+            let mut listener = SrtConnection::new_listener(ConnectionOptions {
+                congestion_control: name.clone(),
+                ..listener_options()
+            });
+            caller.connect(Timestamp::default()).unwrap();
+            listener
+                .feed_recv_buf(&next_wire(&mut caller), Timestamp::from_micros(1))
+                .unwrap();
+            caller
+                .feed_recv_buf(&next_wire(&mut listener), Timestamp::from_micros(2))
+                .unwrap();
+            let answered =
+                listener.feed_recv_buf(&next_wire(&mut caller), Timestamp::from_micros(3));
+            assert_eq!(answered.is_ok(), emittable, "{name:?}: {answered:?}");
+            let expected = (!emittable).then_some(SRT_REJ_CONGESTION);
+            assert_eq!(rejection_reason(&mut listener), expected, "{name:?}");
+        }
     }
 
     #[test]

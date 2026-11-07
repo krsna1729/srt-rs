@@ -146,6 +146,15 @@ pub const SRT_REJ_FILTER: i32 = 14;
 /// (STREAM flag), which libsrt refuses in `processSrtMsg_HSREQ`.
 pub const SRT_REJ_MESSAGEAPI: i32 = 12;
 
+/// `SRT_REJ_CONGESTION`: incompatible congestion-controller type. Used when
+/// a listener's own congestion name cannot be emitted (see
+/// [`MAX_CONGESTION_NAME_BYTES`]).
+pub const SRT_REJ_CONGESTION: i32 = 13;
+
+/// Longest congestion-control name libsrt accepts, in bytes
+/// (`CSrtConfig::MAX_CONG_LENGTH`); it refuses empty names too.
+pub const MAX_CONGESTION_NAME_BYTES: usize = 16;
+
 /// `SRT_REJ_CRYPTO`: conflicting cryptographic configurations (libsrt
 /// builds with the AEAD API). Used when an AES-GCM session would need
 /// libsrt's legacy (SRT 1.5.3 and older) GCM layout.
@@ -1046,6 +1055,15 @@ fn validate_extension_data(ext_type: ExtensionType, data: &[u8]) -> Result<(), E
         ExtensionType::Group if data.len() < 8 => Err(Error::invalid_data(
             "GROUP extension must be at least 8 bytes",
         )),
+        // libsrt refuses an empty SID and an empty or over-16-byte
+        // congestion block (`interpretSrtHandshake`, core.cpp:2950-2960 and
+        // 3001-3007), so neither is a shape a libsrt peer emits.
+        ExtensionType::Sid | ExtensionType::Congestion if data.is_empty() => {
+            Err(Error::invalid_data("empty SID or congestion extension"))
+        }
+        ExtensionType::Congestion if data.len() > MAX_CONGESTION_NAME_BYTES => {
+            Err(Error::invalid_data("congestion extension exceeds 16 bytes"))
+        }
         ExtensionType::Sid | ExtensionType::Congestion | ExtensionType::Filter
             if data.len() > 512 =>
         {
@@ -2063,17 +2081,34 @@ mod tests {
     }
 
     #[test]
-    fn test_sid_extension_empty() {
+    fn empty_config_strings_are_refused_like_libsrt() {
         let mut hs = conclusion_with_hs();
         hs.add_sid_extension("");
+        assert!(
+            HandshakePacket::decode(&hs.encode(1000, 0)).is_err(),
+            "an empty SID is refused"
+        );
 
-        let packet = hs.encode(1000, 0);
-        let decoded = HandshakePacket::decode(&packet)
-            .expect("decoding an encoded handshake packet should succeed");
+        let mut hs = conclusion_with_hs();
+        hs.add_congestion_extension("");
+        assert!(
+            HandshakePacket::decode(&hs.encode(1000, 0)).is_err(),
+            "an empty congestion name is refused"
+        );
+    }
 
-        // An empty string decodes to `Some("")` (all zero padding).
-        let sid = decoded.get_sid_extension();
-        assert_eq!(sid, Some("".to_string()));
+    /// libsrt's congestion block holds at most 16 bytes
+    /// (`CSrtConfig::MAX_CONG_LENGTH`): 16 decodes, 17 (20 padded) does not.
+    #[test]
+    fn congestion_names_above_16_bytes_are_refused_like_libsrt() {
+        let mut hs = conclusion_with_hs();
+        hs.add_congestion_extension(&"c".repeat(16));
+        let decoded = HandshakePacket::decode(&hs.encode(1000, 0)).expect("16 bytes decode");
+        assert_eq!(decoded.get_congestion_extension(), Some("c".repeat(16)));
+
+        let mut hs = conclusion_with_hs();
+        hs.add_congestion_extension(&"c".repeat(17));
+        assert!(HandshakePacket::decode(&hs.encode(1000, 0)).is_err());
     }
 
     #[test]
@@ -2221,7 +2256,7 @@ mod tests {
                 crate::crypto_impl::CipherMode::Ctr,
             )
             .encode(),
-            ExtensionType::Sid | ExtensionType::Congestion => Vec::new(),
+            ExtensionType::Sid | ExtensionType::Congestion => b"live".to_vec(),
             ExtensionType::Filter => b"fec\0".to_vec(),
             ExtensionType::Group => vec![0; 8],
         }
