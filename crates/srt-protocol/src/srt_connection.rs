@@ -20,7 +20,7 @@ use crate::sender_rto::RtoArm;
 use crate::srt_handshake::{
     DEFAULT_FLOW_WINDOW, DEFAULT_MTU, GroupExtensionData, HS_VERSION_5, HandshakePacket,
     HandshakeState, HandshakeType, IpFamily, KmError, KmMessage, MAX_FLOW_WINDOW, SRT_MAGIC_CODE,
-    SRT_REJ_FILTER, SRT_REJ_ROGUE, SRT_REJ_VERSION, srt_flags,
+    SRT_REJ_FILTER, SRT_REJ_MESSAGEAPI, SRT_REJ_ROGUE, SRT_REJ_VERSION, srt_flags,
 };
 use crate::srt_packet::{
     ControlPacket, ControlType, DataHeader, DataPacket, DatagramClass, PendingData,
@@ -3550,6 +3550,44 @@ impl SrtConnection {
         }
     }
 
+    /// Refuse the handshake in progress: a caller fails its attempt, a
+    /// listener answers with an HSv5 rejection carrying `reason_code`.
+    fn refuse_peer(&mut self, reason_code: i32, reason: &str, now: Timestamp) -> Error {
+        match self.role {
+            ConnectionRole::Caller => self.fail_caller_handshake(reason),
+            ConnectionRole::Listener => match self.reject(reason_code, now) {
+                Ok(()) => Error::handshake_rejected(reason),
+                Err(error) => error,
+            },
+        }
+    }
+
+    /// Reject a peer whose HS extension declares the other transmission
+    /// API: STREAM set means the stream (file) API, clear the message
+    /// (live) API. libsrt refuses the mismatch with `SRT_REJ_MESSAGEAPI`
+    /// (`processSrtMsg_HSREQ`) instead of running a session in which the
+    /// two peers disagree about message boundaries.
+    fn reject_message_api_mismatch(
+        &mut self,
+        hs: &HandshakePacket,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        let Some(extension) = hs.get_hs_extension() else {
+            return Ok(());
+        };
+        let peer_stream = extension.srt_flags & srt_flags::STREAM != 0;
+        let local_stream = self.negotiated_srt_flags() & srt_flags::STREAM != 0;
+        if peer_stream == local_stream {
+            return Ok(());
+        }
+        let reason = if local_stream {
+            "peer declares the message API but this side uses the stream (file) API"
+        } else {
+            "peer declares the stream API but this side uses the message (live) API"
+        };
+        Err(self.refuse_peer(SRT_REJ_MESSAGEAPI, reason, now))
+    }
+
     fn handle_caller_conclusion(
         &mut self,
         hs: HandshakePacket,
@@ -3568,6 +3606,7 @@ impl SrtConnection {
         self.reject_unusable_peer_flow_window(&hs, now)?;
         self.reject_peer_mss(&hs, now)?;
         self.reject_unsupported_packet_filter(&hs, now)?;
+        self.reject_message_api_mismatch(&hs, now)?;
         self.apply_peer_mss(&hs);
 
         self.peer_socket_id = hs.socket_id;
@@ -3706,6 +3745,7 @@ impl SrtConnection {
 
         self.reject_peer_mss(&hs, now)?;
         self.reject_unsupported_packet_filter(&hs, now)?;
+        self.reject_message_api_mismatch(&hs, now)?;
         self.apply_peer_mss(&hs);
         self.note_peer_flow_window(hs.flow_window);
 
@@ -10441,6 +10481,101 @@ mod tests {
             negotiated_delays_micros(&attempt.listener),
             (120_000, 120_000)
         );
+    }
+
+    /// Options for one side of a message-API matrix case: live (message
+    /// API) or file (stream API, STREAM set).
+    fn api_options(file: bool, socket_id: u32) -> ConnectionOptions {
+        ConnectionOptions {
+            socket_id,
+            syn_cookie: Some(7),
+            congestion_control: if file { "file" } else { "live" }.to_owned(),
+            ..ConnectionOptions::default()
+        }
+    }
+
+    /// A rewrite that sets or clears the HS extension's STREAM flag and
+    /// advertises `version`.
+    fn stream_rewrite(stream: bool, version: u32) -> HandshakeRewrite {
+        let mut rewrite = HandshakeRewrite::mss(1500, IpFamily::V4);
+        rewrite.srt_version = Some(version);
+        if stream {
+            rewrite.hs_flags_set = srt_flags::STREAM;
+        } else {
+            rewrite.hs_flags_clear = srt_flags::STREAM;
+        }
+        rewrite
+    }
+
+    /// Every local live/file x peer STREAM clear/set combination at SRT
+    /// 1.3.0 and 1.5.4: a listener refuses the other transmission API with
+    /// `SRT_REJ_MESSAGEAPI` (libsrt `processSrtMsg_HSREQ`) before Connected.
+    #[test]
+    fn listener_rejects_a_peer_declaring_the_other_transmission_api() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        for version in [0x0001_0300, 0x0001_0504] {
+            for (local_file, peer_stream) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let case = format!("{version:#x} file={local_file} STREAM={peer_stream}");
+                let mut attempt = handshake_with_options(
+                    &stream_rewrite(peer_stream, version),
+                    &plain,
+                    api_options(local_file, 1),
+                    api_options(local_file, 2),
+                );
+                if local_file == peer_stream {
+                    attempt.listener_result.expect(&case);
+                    assert_eq!(
+                        attempt.listener.state(),
+                        ConnectionState::Connected,
+                        "{case}"
+                    );
+                    continue;
+                }
+                let error = attempt.listener_result.expect_err(&case);
+                assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected, "{case}");
+                assert_ne!(
+                    attempt.listener.state(),
+                    ConnectionState::Connected,
+                    "{case}"
+                );
+                assert_eq!(
+                    rejection_reason(&mut attempt.listener),
+                    Some(SRT_REJ_MESSAGEAPI),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// The same matrix from the caller's side: an HSRSP declaring the other
+    /// transmission API fails the caller before Connected.
+    #[test]
+    fn caller_rejects_a_peer_declaring_the_other_transmission_api() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        for version in [0x0001_0300, 0x0001_0504] {
+            for (local_file, peer_stream) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let case = format!("{version:#x} file={local_file} STREAM={peer_stream}");
+                let attempt = handshake_with_options(
+                    &plain,
+                    &stream_rewrite(peer_stream, version),
+                    api_options(local_file, 1),
+                    api_options(local_file, 2),
+                );
+                attempt.listener_result.expect(&case);
+                if local_file == peer_stream {
+                    attempt.caller_result.expect(&case);
+                    assert_eq!(attempt.caller.state(), ConnectionState::Connected, "{case}");
+                } else {
+                    let error = attempt.caller_result.expect_err(&case);
+                    assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected, "{case}");
+                    assert_ne!(attempt.caller.state(), ConnectionState::Connected, "{case}");
+                }
+            }
+        }
     }
 
     /// A peer that negotiates packet-filter behaviour gets a refusal, not a

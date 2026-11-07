@@ -181,6 +181,9 @@ HSv5 negotiation follows libsrt 1.5.7:
 - Periodic NAK reports are local receive policy and always on; a peer that
   clears NAKREPORT (libsrt `SRTO_NAKREPORT=0`) only declares that it will not
   send them itself.
+- A peer whose STREAM flag declares the other transmission API (stream/file
+  versus message/live) is refused before `Connected`: a listener answers
+  `SRT_REJ_MESSAGEAPI`, a caller fails its attempt.
 
 ## Testing
 

@@ -142,6 +142,10 @@ pub const SRT_REJ_VERSION: i32 = 8;
 /// peers disagree about whether recovery filtering exists.
 pub const SRT_REJ_FILTER: i32 = 14;
 
+/// `SRT_REJ_MESSAGEAPI`: the peers declare different transmission APIs
+/// (STREAM flag), which libsrt refuses in `processSrtMsg_HSREQ`.
+pub const SRT_REJ_MESSAGEAPI: i32 = 12;
+
 /// Default flow window size.
 pub const DEFAULT_FLOW_WINDOW: u32 = 8192;
 
