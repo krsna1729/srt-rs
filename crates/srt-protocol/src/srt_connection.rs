@@ -3588,6 +3588,34 @@ impl SrtConnection {
         Err(self.refuse_peer(SRT_REJ_MESSAGEAPI, reason, now))
     }
 
+    /// Refuse a peer that does not advertise REXMITFLG.
+    ///
+    /// Without it, DATA bit 26 is part of a legacy 27-bit message number
+    /// instead of the retransmission flag this implementation always sets
+    /// and decodes. libsrt has advertised it unconditionally in every HSREQ
+    /// since 1.2.0 and echoes it in its HSRSP to a requester that sent it
+    /// (`fillSrtHandshake_HSREQ`, `fillSrtHandshake_HSRSP`), so every
+    /// peer at the 1.3.0 HSv5 floor carries it; one that omits it is
+    /// inconsistent with its own version, refused with `SRT_REJ_ROGUE` as
+    /// an HSv5 peer claiming a pre-1.3.0 version is.
+    fn reject_peer_without_rexmit_flag(
+        &mut self,
+        hs: &HandshakePacket,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        if hs
+            .get_hs_extension()
+            .is_none_or(|extension| extension.srt_flags & srt_flags::REXMITFLG != 0)
+        {
+            return Ok(());
+        }
+        Err(self.refuse_peer(
+            SRT_REJ_ROGUE,
+            "peer does not advertise REXMITFLG, which every SRT 1.3.0+ peer does",
+            now,
+        ))
+    }
+
     /// A caller that asked for group membership requires the listener's
     /// mirror GROUP extension: one that omits it did not understand the
     /// group, and libsrt's bonded initiator refuses it with `SRT_REJ_GROUP`
@@ -3621,6 +3649,7 @@ impl SrtConnection {
         self.reject_peer_mss(&hs, now)?;
         self.reject_unsupported_packet_filter(&hs, now)?;
         self.reject_message_api_mismatch(&hs, now)?;
+        self.reject_peer_without_rexmit_flag(&hs, now)?;
         self.reject_missing_group_response(&hs)?;
         self.apply_peer_mss(&hs);
 
@@ -3761,6 +3790,7 @@ impl SrtConnection {
         self.reject_peer_mss(&hs, now)?;
         self.reject_unsupported_packet_filter(&hs, now)?;
         self.reject_message_api_mismatch(&hs, now)?;
+        self.reject_peer_without_rexmit_flag(&hs, now)?;
         self.apply_peer_mss(&hs);
         self.note_peer_flow_window(hs.flow_window);
 
@@ -10621,6 +10651,34 @@ mod tests {
             .caller_result
             .expect("a direct caller needs no GROUP");
         assert_eq!(direct.caller.state(), ConnectionState::Connected);
+    }
+
+    /// A peer that omits REXMITFLG would read DATA bit 26 as part of a
+    /// legacy 27-bit message number, while this side always marks
+    /// retransmissions with it. Every SRT 1.3.0+ peer advertises the flag,
+    /// so either role refuses one that does not, the listener with
+    /// `SRT_REJ_ROGUE`.
+    #[test]
+    fn a_peer_without_rexmitflg_is_refused_in_both_roles() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        let mut no_rexmit = plain;
+        no_rexmit.hs_flags_clear = srt_flags::REXMITFLG;
+
+        let mut attempt = handshake_with_rewrites(&no_rexmit, &plain, listener_options());
+        let error = attempt
+            .listener_result
+            .expect_err("listener refuses an HSREQ without REXMITFLG");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_ne!(attempt.listener.state(), ConnectionState::Connected);
+        assert_eq!(rejection_reason(&mut attempt.listener), Some(SRT_REJ_ROGUE));
+
+        let attempt = handshake_with_rewrites(&plain, &no_rexmit, listener_options());
+        attempt.listener_result.expect("listener accepts");
+        let error = attempt
+            .caller_result
+            .expect_err("caller refuses an HSRSP without REXMITFLG");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_ne!(attempt.caller.state(), ConnectionState::Connected);
     }
 
     /// A peer that negotiates packet-filter behaviour gets a refusal, not a

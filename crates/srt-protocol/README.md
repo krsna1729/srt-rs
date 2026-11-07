@@ -188,6 +188,9 @@ HSv5 negotiation follows libsrt 1.5.7:
   and fails its attempt without one (libsrt `SRT_REJ_GROUP`); a listener
   accepting bonded callers must therefore set a receiving group. Direct
   callers are unaffected.
+- A peer that does not advertise REXMITFLG is refused (`SRT_REJ_ROGUE` from a
+  listener). Every libsrt since 1.2.0 advertises it, and this implementation
+  does not support the legacy 27-bit message-number layout.
 
 ## Testing
 
