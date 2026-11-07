@@ -4838,11 +4838,14 @@ impl SrtConnection {
     }
 
     fn send_conclusion_request(&mut self, now: Timestamp) -> Result<(), Error> {
-        let encryption_field = if self.options.passphrase.is_some() {
-            self.options.key_length.to_encryption_field()
-        } else {
-            0
-        };
+        // Advertise the key length the KMREQ actually uses: the crypto
+        // context may have adopted the listener's advertised length, as
+        // libsrt's `checkUpdateCryptoKeyLen` updates its own advertisement.
+        // A caller with a passphrase built its context at INDUCTION.
+        let encryption_field = self
+            .crypto
+            .as_deref()
+            .map_or(0, |crypto| crypto.key_length().to_encryption_field());
 
         let has_encryption = self.options.passphrase.is_some();
         tracing::debug!(
@@ -10843,6 +10846,61 @@ mod tests {
             rejection_reason(&mut attempt.listener),
             Some(SRT_REJ_CRYPTO)
         );
+    }
+
+    /// A caller configured for AES-128 without a fixed SEK adopts the
+    /// listener's advertised AES-256 for its KMREQ; its CONCLUSION
+    /// encryption field must advertise that same negotiated length, as
+    /// libsrt's `checkUpdateCryptoKeyLen` updates its own advertisement.
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "constructs a real CryptoContext, deriving its KEK via 2048               \
+                  PBKDF2-HMAC-SHA1 iterations (per the SRT spec) under Miri; correctness    \
+                  is proven outside Miri, and this property is unrelated to PBKDF2's own    \
+                  iteration count. Run in the miri-extended scheduled job."
+    )]
+    fn caller_conclusion_advertises_the_key_length_its_kmreq_uses() {
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            key_length: KeyLength::Aes128,
+            ..cipher_options(1, CipherMode::Ctr)
+        });
+        let mut listener = SrtConnection::new_listener(ConnectionOptions {
+            key_length: KeyLength::Aes256,
+            ..cipher_options(2, CipherMode::Ctr)
+        });
+        caller.connect(Timestamp::default()).expect("caller starts");
+        for packet in drain_handshakes(&mut caller) {
+            listener
+                .feed_recv_buf(&packet, Timestamp::from_micros(1_000))
+                .expect("INDUCTION");
+        }
+        for packet in drain_handshakes(&mut listener) {
+            caller
+                .feed_recv_buf(&packet, Timestamp::from_micros(2_000))
+                .expect("INDUCTION response");
+        }
+        let conclusion = drain_handshakes(&mut caller).pop().expect("CONCLUSION");
+        let SrtPacket::Control(control) = SrtPacket::decode(&conclusion).expect("decodes") else {
+            panic!("handshake is a control packet");
+        };
+        let hs = HandshakePacket::decode(&control).expect("handshake decodes");
+        let km = hs
+            .get_km_request()
+            .expect("KMREQ present")
+            .expect("KMREQ decodes");
+        assert_eq!(km.key_length, KeyLength::Aes256);
+        assert_eq!(hs.key_length(), Some(km.key_length));
+    }
+
+    fn drain_handshakes(conn: &mut SrtConnection) -> Vec<Vec<u8>> {
+        drain_outputs(conn)
+            .into_iter()
+            .filter_map(|output| match output {
+                ConnectionOutput::SendPacket(bytes) => Some(bytes),
+                _ => None,
+            })
+            .collect()
     }
 
     /// A peer that negotiates packet-filter behaviour gets a refusal, not a
