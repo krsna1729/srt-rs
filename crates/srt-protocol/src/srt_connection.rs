@@ -5215,6 +5215,17 @@ mod tests {
         std::array::from_fn(|index| index as u8)
     }
 
+    /// Deterministic, non-secret key or salt bytes for KM fixtures:
+    /// distinct per `tag`, and never zero for a `tag` of at least 0x40.
+    fn fixture_key(tag: u8) -> [u8; 16] {
+        std::array::from_fn(|index| tag ^ index as u8)
+    }
+
+    /// [`fixture_key`] for any key length.
+    fn fixture_key_vec(tag: u8, len: usize) -> Vec<u8> {
+        (0..len).map(|index| tag ^ index as u8).collect()
+    }
+
     /// Deterministic, non-secret salt for wire-shape fixtures in this module
     /// (same derivation as `test_km_salt`; named for the hostile-control
     /// cases that need a *body*, not a key).
@@ -9316,7 +9327,8 @@ mod tests {
         // Once the peer replaces that even key, replaying the old KM would
         // roll the receive slot back: refused, with nothing changed.
         tick += 10;
-        let replacement = libsrt_km_body(0b01, test_km_salt(), &[&[0x7E; 16]], CipherMode::Ctr);
+        let replacement =
+            libsrt_km_body(0b01, test_km_salt(), &[&fixture_key(0x7E)], CipherMode::Ctr);
         feed_kmreq_expect_echo(&mut listener, &replacement, Timestamp::from_micros(tick));
         tick += 10;
         assert_km_control_rejected(
@@ -10285,7 +10297,7 @@ mod tests {
 
         // The rotation is announced and installed by the listener.
         caller
-            .provide_new_sek(&[0x6B; 16], now)
+            .provide_new_sek(&fixture_key(0x6B), now)
             .expect("start key refresh");
         let first_request = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
         listener
@@ -10331,7 +10343,7 @@ mod tests {
             "a matching KMRSP closes the transaction"
         );
         assert!(
-            receives_under(&listener, announced, test_km_salt(), &[0x6B; 16]),
+            receives_under(&listener, announced, test_km_salt(), &fixture_key(0x6B)),
             "the receiver holds the announced key"
         );
         assert_encrypted_roundtrip(
@@ -10351,7 +10363,7 @@ mod tests {
         }
         let mut now = Timestamp::from_micros(10_000_000);
         caller
-            .provide_new_sek(&[0x6B; 16], now)
+            .provide_new_sek(&fixture_key(0x6B), now)
             .expect("caller starts a rotation");
         let first = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
         listener
@@ -10407,7 +10419,7 @@ mod tests {
         // The rotation is announced past the switch threshold, and its first
         // request never reaches the peer.
         caller
-            .provide_new_sek(&[0x7C; 16], now)
+            .provide_new_sek(&fixture_key(0x7C), now)
             .expect("start key refresh");
         let dropped = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
         caller
@@ -10454,7 +10466,7 @@ mod tests {
             .current_key();
         assert_ne!(switched, original_key, "the acknowledged rotation switches");
         assert!(
-            receives_under(&listener, switched, test_km_salt(), &[0x7C; 16]),
+            receives_under(&listener, switched, test_km_salt(), &fixture_key(0x7C)),
             "the receiver holds the sender's new key under the switched selector"
         );
         assert_encrypted_roundtrip(
@@ -10569,7 +10581,7 @@ mod tests {
             CryptoContext::new_sender(KM_FIXTURE_PASSPHRASE, key_length, salt, sek, mode)
                 .expect("oracle sender");
         let plaintext = b"key-material oracle payload".to_vec();
-        let header = [0x42; 16];
+        let header = fixture_key(0x42);
         match mode {
             CipherMode::Ctr => {
                 let mut buffer = plaintext.clone();
@@ -10634,7 +10646,11 @@ mod tests {
         ] {
             let (_caller, mut listener) = quiet_encrypted_pair(cipher_mode, key_length);
             let len = key_length.len();
-            let (current, next, after) = (vec![0x5A; len], vec![0x6C; len], vec![0x7E; len]);
+            let (current, next, after) = (
+                fixture_key_vec(0x5A, len),
+                fixture_key_vec(0x6C, len),
+                fixture_key_vec(0x7E, len),
+            );
             let salt = test_km_salt();
             let now = Timestamp::from_micros(10_000_000);
 
@@ -10662,11 +10678,11 @@ mod tests {
         let (mut caller, mut listener) = quiet_encrypted_pair(CipherMode::Ctr, KeyLength::Aes128);
         let now = Timestamp::from_micros(10_000_000);
         listener
-            .provide_new_sek(&[0x71; 16], now)
+            .provide_new_sek(&fixture_key(0x71), now)
             .expect("the listener starts its own rotation");
         let listener_request = take_user_defined_datagram(&mut listener, SRT_CMD_KMREQ);
         caller
-            .provide_new_sek(&[0x6B; 16], now)
+            .provide_new_sek(&fixture_key(0x6B), now)
             .expect("the caller starts its rotation");
         let caller_request = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
 
@@ -10677,7 +10693,7 @@ mod tests {
             &listener,
             KeyFlag::Odd,
             test_km_salt(),
-            &[0x6B; 16]
+            &fixture_key(0x6B)
         ));
         let listener_crypto = listener.crypto.as_ref().expect("secured listener");
         assert_eq!(listener_crypto.current_key(), KeyFlag::Even);
@@ -10713,7 +10729,7 @@ mod tests {
             &caller,
             KeyFlag::Odd,
             test_km_salt(),
-            &[0x71; 16]
+            &fixture_key(0x71)
         ));
         assert_eq!(
             caller
@@ -10733,7 +10749,10 @@ mod tests {
     #[test]
     fn same_selector_replacement_after_connect_is_installed() {
         for cipher_mode in [CipherMode::Ctr, CipherMode::Gcm] {
-            for (salt, sek) in [([0xC3; 16], [0x7D; 16]), (test_km_salt(), [0x7E; 16])] {
+            for (salt, sek) in [
+                (fresh_salt(), fixture_key(0x7D)),
+                (test_km_salt(), fixture_key(0x7E)),
+            ] {
                 for caller_is_target in [true, false] {
                     let (mut caller, mut listener) =
                         quiet_encrypted_pair(cipher_mode, KeyLength::Aes128);
@@ -10766,23 +10785,30 @@ mod tests {
     }
 
     /// A salt the handshake did not use.
-    const FRESH_SALT: [u8; 16] = [0xC3; 16];
+    fn fresh_salt() -> [u8; 16] {
+        fixture_key(0xC3)
+    }
 
-    /// A CTR KM body for `keys` under [`FRESH_SALT`].
+    /// A CTR KM body for `keys` under [`fresh_salt`].
     fn fresh_salt_km(kk: u8, seks: &[&[u8]]) -> Vec<u8> {
-        libsrt_km_body(kk, FRESH_SALT, seks, CipherMode::Ctr)
+        libsrt_km_body(kk, fresh_salt(), seks, CipherMode::Ctr)
     }
 
     /// A listener whose even receive key a Robotweax-style peer replaced
-    /// twice under [`FRESH_SALT`]: `[0x91; 16]`, then `[0x92; 16]`. The
-    /// first is now a retired receive key that was never a transmit key.
+    /// twice under [`fresh_salt`]: `fixture_key(0x91)`, then
+    /// `fixture_key(0x92)`. The first is now a retired receive key that was
+    /// never a transmit key.
     fn listener_with_replaced_even_key() -> (SrtConnection, Timestamp) {
         let (_caller, mut listener) = quiet_encrypted_pair(CipherMode::Ctr, KeyLength::Aes128);
         let now = Timestamp::from_micros(10_000_000);
-        feed_kmreq_expect_echo(&mut listener, &fresh_salt_km(0b01, &[&[0x91; 16]]), now);
         feed_kmreq_expect_echo(
             &mut listener,
-            &fresh_salt_km(0b01, &[&[0x92; 16]]),
+            &fresh_salt_km(0b01, &[&fixture_key(0x91)]),
+            now,
+        );
+        feed_kmreq_expect_echo(
+            &mut listener,
+            &fresh_salt_km(0b01, &[&fixture_key(0x92)]),
             now.add_micros(1),
         );
         (listener, now.add_micros(2))
@@ -10796,7 +10822,7 @@ mod tests {
         let (mut caller, _listener) = quiet_encrypted_pair(CipherMode::Ctr, KeyLength::Aes128);
         let now = Timestamp::from_micros(10_000_000);
         caller
-            .provide_new_sek(&[0x6B; 16], now)
+            .provide_new_sek(&fixture_key(0x6B), now)
             .expect("the caller starts a rotation");
         let own_request = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
         assert_km_control_rejected(
@@ -10809,7 +10835,7 @@ mod tests {
         assert_km_control_rejected(
             &mut caller,
             SRT_CMD_KMREQ,
-            fresh_salt_km(0b10, &[&[0x6B; 16]]),
+            fresh_salt_km(0b10, &[&fixture_key(0x6B)]),
             now.add_micros(2),
             "own key re-wrapped under a fresh salt",
         );
@@ -10823,14 +10849,14 @@ mod tests {
         assert_km_control_rejected(
             &mut listener,
             SRT_CMD_KMREQ,
-            fresh_salt_km(0b10, &[&[0x92; 16]]),
+            fresh_salt_km(0b10, &[&fixture_key(0x92)]),
             now,
             "current even key announced as odd",
         );
         assert_km_control_rejected(
             &mut listener,
             SRT_CMD_KMREQ,
-            libsrt_km_body(0b01, test_km_salt(), &[&[0x92; 16]], CipherMode::Ctr),
+            libsrt_km_body(0b01, test_km_salt(), &[&fixture_key(0x92)], CipherMode::Ctr),
             now.add_micros(1),
             "current even key under another salt",
         );
@@ -10844,14 +10870,14 @@ mod tests {
         assert_km_control_rejected(
             &mut listener,
             SRT_CMD_KMREQ,
-            fresh_salt_km(0b01, &[&[0x91; 16]]),
+            fresh_salt_km(0b01, &[&fixture_key(0x91)]),
             now,
             "retired key in its old slot",
         );
         assert_km_control_rejected(
             &mut listener,
             SRT_CMD_KMREQ,
-            fresh_salt_km(0b10, &[&[0x91; 16]]),
+            fresh_salt_km(0b10, &[&fixture_key(0x91)]),
             now.add_micros(1),
             "retired key in the other slot",
         );
@@ -10864,7 +10890,7 @@ mod tests {
         assert_km_control_rejected(
             &mut listener,
             SRT_CMD_KMREQ,
-            fresh_salt_km(0b11, &[&[0x93; 16], &[0x93; 16]]),
+            fresh_salt_km(0b11, &[&fixture_key(0x93), &fixture_key(0x93)]),
             now,
             "one SEK under both selectors",
         );
@@ -10876,7 +10902,11 @@ mod tests {
     fn an_identical_current_kmreq_is_answered_without_reinstalling() {
         let (mut listener, now) = listener_with_replaced_even_key();
         let before = km_security_snapshot(&listener);
-        feed_kmreq_expect_echo(&mut listener, &fresh_salt_km(0b01, &[&[0x92; 16]]), now);
+        feed_kmreq_expect_echo(
+            &mut listener,
+            &fresh_salt_km(0b01, &[&fixture_key(0x92)]),
+            now,
+        );
         assert_eq!(km_security_snapshot(&listener), before);
     }
 
@@ -10886,7 +10916,7 @@ mod tests {
     fn a_failed_unwrap_under_a_fresh_salt_leaves_every_key_untouched() {
         let (_caller, mut listener) = quiet_encrypted_pair(CipherMode::Ctr, KeyLength::Aes128);
         let now = Timestamp::from_micros(10_000_000);
-        let intact = fresh_salt_km(0b01, &[&[0x91; 16]]);
+        let intact = fresh_salt_km(0b01, &[&fixture_key(0x91)]);
         let mut corrupted = intact.clone();
         *corrupted.last_mut().expect("wrapped key") ^= 0x01;
         assert_km_control_rejected(
@@ -10900,8 +10930,8 @@ mod tests {
         assert!(receives_under(
             &listener,
             KeyFlag::Even,
-            FRESH_SALT,
-            &[0x91; 16]
+            fresh_salt(),
+            &fixture_key(0x91)
         ));
     }
 
@@ -10915,9 +10945,9 @@ mod tests {
         let (_caller, mut listener) = quiet_encrypted_pair(CipherMode::Ctr, KeyLength::Aes128);
         let now = Timestamp::from_micros(10_000_000);
         let ctr = CipherMode::Ctr;
-        let first = libsrt_km_body(0b01, [0xA1; 16], &[&[0x91; 16]], ctr);
-        let second = libsrt_km_body(0b01, [0xA2; 16], &[&[0x92; 16]], ctr);
-        let third = libsrt_km_body(0b01, [0xA3; 16], &[&[0x93; 16]], ctr);
+        let first = libsrt_km_body(0b01, fixture_key(0xA1), &[&fixture_key(0x91)], ctr);
+        let second = libsrt_km_body(0b01, fixture_key(0xA2), &[&fixture_key(0x92)], ctr);
+        let third = libsrt_km_body(0b01, fixture_key(0xA3), &[&fixture_key(0x93)], ctr);
         feed_kmreq_expect_echo(&mut listener, &first, now);
         feed_kmreq_expect_echo(&mut listener, &second, now.add_micros(1));
         assert_km_control_rejected(
@@ -10928,7 +10958,8 @@ mod tests {
             "fresh salt beyond the derivation burst",
         );
         feed_kmreq_expect_echo(&mut listener, &second, now.add_micros(3));
-        let odd_under_session_salt = libsrt_km_body(0b10, test_km_salt(), &[&[0x94; 16]], ctr);
+        let odd_under_session_salt =
+            libsrt_km_body(0b10, test_km_salt(), &[&fixture_key(0x94)], ctr);
         feed_kmreq_expect_echo(&mut listener, &odd_under_session_salt, now.add_micros(4));
         feed_kmreq_expect_echo(
             &mut listener,
@@ -10946,7 +10977,7 @@ mod tests {
         cipher_mode: CipherMode,
         key_length: KeyLength,
     ) -> (SrtConnection, SrtConnection) {
-        let sek = vec![0x5Au8; key_length.len()];
+        let sek = fixture_key_vec(0x5A, key_length.len());
         let options = |socket_id: u32| ConnectionOptions {
             socket_id,
             passphrase: Some(KM_FIXTURE_PASSPHRASE.to_owned()),

@@ -1736,7 +1736,8 @@ mod tests {
             KmKeySelection::Both,
             KeyLength::Aes128,
             salt,
-            vec![0x5A; 2 * 16 + 8],
+            // Non-secret placeholder bytes: the codec only checks the length.
+            (0..2 * 16 + 8).map(|index| 0x5A ^ index as u8).collect(),
             crate::crypto_impl::CipherMode::Ctr,
         );
         let encoded = both.encode();

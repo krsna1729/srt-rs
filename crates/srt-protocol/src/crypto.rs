@@ -1892,6 +1892,16 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Deterministic, non-secret key or salt bytes for test fixtures:
+    /// distinct per `tag`, and never zero for a `tag` of at least 0x40.
+    fn fixture_key(tag: u8, len: usize) -> Vec<u8> {
+        (0..len).map(|index| tag ^ index as u8).collect()
+    }
+
+    fn fixture_salt(tag: u8) -> [u8; 16] {
+        std::array::from_fn(|index| tag ^ index as u8)
+    }
+
     /// S02: a peer's KM refresh carrying a wrapped key of the wrong length
     /// unwraps fine (AES-KW only requires a multiple of 8 bytes) but is
     /// the wrong size for the selected keys. `install_rx_keys` rejects it
@@ -1900,12 +1910,12 @@ mod tests {
     #[test]
     fn install_rx_keys_rejects_wrong_length_key_without_touching_keys() {
         let passphrase = "passphrase";
-        let salt = [0x42; 16];
+        let salt = fixture_salt(0x42);
         let mut crypto = CryptoContext::new_sender(
             passphrase,
             KeyLength::Aes128,
             salt,
-            &[0x24; 16],
+            &fixture_key(0x64, 16),
             CipherMode::Ctr,
         )
         .expect("valid sender context");
@@ -1915,7 +1925,7 @@ mod tests {
         // A 24-byte plaintext wraps to a 32-byte blob -- valid AES-KW, but
         // the wrong length for one AES-128 key (and for two).
         let wrong_length_wrapped =
-            wrap_sek(&kek, &[0x11; 24], KeyLength::Aes128).expect("valid AES-KW wrap");
+            wrap_sek(&kek, &fixture_key(0x51, 24), KeyLength::Aes128).expect("valid AES-KW wrap");
         for keys in [KmKeySelection::Odd, KmKeySelection::Both] {
             let error = crypto
                 .install_rx_keys(keys, salt, &wrong_length_wrapped)
@@ -1931,18 +1941,19 @@ mod tests {
     #[test]
     fn install_rx_keys_installs_both_receive_slots_only() {
         let passphrase = "passphrase";
-        let salt = [0x42; 16];
+        let salt = fixture_salt(0x42);
         let mut crypto = CryptoContext::new_sender(
             passphrase,
             KeyLength::Aes128,
             salt,
-            &[0x24; 16],
+            &fixture_key(0x64, 16),
             CipherMode::Ctr,
         )
         .expect("valid sender context");
         let before = crypto.key_state_for_test();
         let kek = derive_kek(passphrase.as_bytes(), &salt, KeyLength::Aes128);
-        let both = [[0x31; 16], [0x32; 16]].concat();
+        let (even, odd) = (fixture_key(0x71, 16), fixture_key(0x72, 16));
+        let both = [even.clone(), odd.clone()].concat();
         let wrapped = wrap_sek(&kek, &both, KeyLength::Aes128).expect("valid AES-KW wrap");
 
         let update = crypto
@@ -1950,8 +1961,8 @@ mod tests {
             .expect("valid both-key announcement");
         assert_eq!(update, RxKeyUpdate::Installed);
         let after = crypto.key_state_for_test();
-        assert_eq!(after.rx_even, Some((vec![0x31; 16], salt)));
-        assert_eq!(after.rx_odd, Some((vec![0x32; 16], salt)));
+        assert_eq!(after.rx_even, Some((even, salt)));
+        assert_eq!(after.rx_odd, Some((odd, salt)));
         assert_eq!(
             (
                 &after.tx_even,
