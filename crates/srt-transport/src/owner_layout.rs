@@ -955,6 +955,12 @@ pub(crate) mod relocation_test_support {
                 transport.promotion = crate::PromotionPolicy::Relocate;
             })
             .bonded_inputs(crate::BondedInputPolicy::Accept)
+            // A bonded caller refuses a response without the receiving
+            // group's mirror GROUP extension, as libsrt does.
+            .group(crate::GroupConfig::new(
+                0x77,
+                srt_proto::handshake::GroupType::Broadcast,
+            ))
             .build()
             .expect("relocating listener config")
     }

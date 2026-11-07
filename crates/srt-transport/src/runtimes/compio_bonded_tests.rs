@@ -74,6 +74,12 @@ fn owner_with_bonded_listener(tx_capacity: usize) -> (Owner, SocketAddr) {
     let sock = compio::net::UdpSocket::from_std(std_sock).expect("adopt listener");
     let config = crate::ListenerConfig::builder(addr)
         .bonded_inputs(crate::BondedInputPolicy::Accept)
+        // A bonded caller refuses a response without the receiving group's
+        // mirror GROUP extension, as libsrt does.
+        .group(crate::GroupConfig::new(
+            0x77,
+            srt_proto::handshake::GroupType::Broadcast,
+        ))
         .build()
         .expect("listener config");
     let side = ListenerSide::new(sock, &config).expect("listener side");
