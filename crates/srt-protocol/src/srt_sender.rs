@@ -25,6 +25,21 @@ use crate::time::Timestamp;
 const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
 const STALE_RETRANSMIT_COMPACT_THRESHOLD: usize = 1_024;
 
+/// Largest DATA message number (26 bits).
+const MESSAGE_NUMBER_MAX: u32 = 0x03FF_FFFF;
+
+/// The message number after `current`. Normal messages roll
+/// `MESSAGE_NUMBER_MAX` -> 1, as libsrt's `MsgNo` domain does (minimum 1,
+/// packet.h:184, buffer_snd.cpp:234): zero is the packet-filter control
+/// identity.
+const fn next_message_number(current: u32) -> u32 {
+    if current >= MESSAGE_NUMBER_MAX {
+        1
+    } else {
+        current + 1
+    }
+}
+
 /// Upper bound on repeated-DROPREQ responses to one peer loss report.
 ///
 /// A NAK can name a whole window, and every name inside a dropped message
@@ -1251,7 +1266,7 @@ impl SenderBuffer {
         self.record_sent_payload_size(payload_len);
 
         self.next_seq = self.next_seq.wrapping_add(1) & 0x7FFF_FFFF;
-        self.next_msg = self.next_msg.wrapping_add(1) & 0x03FF_FFFF;
+        self.next_msg = next_message_number(self.next_msg);
 
         Some((header, wire_payload))
     }
@@ -1327,7 +1342,7 @@ impl SenderBuffer {
         }
 
         if !results.is_empty() {
-            self.next_msg = self.next_msg.wrapping_add(1) & 0x03FF_FFFF;
+            self.next_msg = next_message_number(self.next_msg);
         }
 
         results
@@ -2392,6 +2407,31 @@ mod tests {
         assert_eq!(buf.packets_in_flight(), 0);
         assert_eq!(buf.next_sequence_number(), before_sequence);
         assert_eq!(buf.next_message_number(), before_message);
+    }
+
+    /// Normal message numbers roll 0x03ff_ffff -> 1 on every send path, as
+    /// libsrt's `MsgNo` rolling domain with minimum 1 does (packet.h:184,
+    /// buffer_snd.cpp:234): zero is the packet-filter control identity.
+    #[test]
+    fn message_numbers_wrap_to_one_never_zero() {
+        let now = Timestamp::default();
+        let mut buf = SenderBuffer::new(1000, 8192, 120);
+        buf.next_msg = 0x03FF_FFFF;
+        let single = buf.push(vec![1], 100, 1, now).expect("single packet");
+        assert_eq!(single.0.message_number, 0x03FF_FFFF);
+        assert_eq!(buf.next_message_number(), 1, "single-packet wrap");
+
+        buf.next_msg = 0x03FF_FFFF;
+        let fragments = buf.push_message(&[7; 9], 4, 100, 1, now);
+        assert_eq!(fragments.len(), 3);
+        assert!(
+            fragments
+                .iter()
+                .all(|(h, _)| h.message_number == 0x03FF_FFFF)
+        );
+        assert_eq!(buf.next_message_number(), 1, "fragmented wrap");
+        let next = buf.push_message(&[8; 3], 4, 100, 1, now);
+        assert_eq!(next[0].0.message_number, 1);
     }
 
     #[test]

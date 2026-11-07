@@ -206,6 +206,8 @@ Packets carry what libsrt 1.5.7 emits:
   handshake, DATA and control packets. The listener's TSBPD base comes from
   the CONCLUSION timestamp, so DATA is held for its latency however long the
   handshake took.
+- DATA message numbers roll `0x03ff_ffff` -> 1, never 0 (libsrt reserves
+  0 for packet-filter control packets).
 
 ## Testing
 
