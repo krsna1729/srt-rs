@@ -146,6 +146,11 @@ pub const SRT_REJ_FILTER: i32 = 14;
 /// (STREAM flag), which libsrt refuses in `processSrtMsg_HSREQ`.
 pub const SRT_REJ_MESSAGEAPI: i32 = 12;
 
+/// `SRT_REJ_CRYPTO`: conflicting cryptographic configurations (libsrt
+/// builds with the AEAD API). Used when an AES-GCM session would need
+/// libsrt's legacy (SRT 1.5.3 and older) GCM layout.
+pub const SRT_REJ_CRYPTO: i32 = 17;
+
 /// Default flow window size.
 pub const DEFAULT_FLOW_WINDOW: u32 = 8192;
 

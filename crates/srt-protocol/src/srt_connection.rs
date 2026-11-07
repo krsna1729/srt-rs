@@ -20,7 +20,7 @@ use crate::sender_rto::RtoArm;
 use crate::srt_handshake::{
     DEFAULT_FLOW_WINDOW, DEFAULT_MTU, GroupExtensionData, HS_VERSION_5, HandshakePacket,
     HandshakeState, HandshakeType, IpFamily, KmError, KmMessage, MAX_FLOW_WINDOW, SRT_MAGIC_CODE,
-    SRT_REJ_FILTER, SRT_REJ_MESSAGEAPI, SRT_REJ_ROGUE, SRT_REJ_VERSION, srt_flags,
+    SRT_REJ_CRYPTO, SRT_REJ_FILTER, SRT_REJ_MESSAGEAPI, SRT_REJ_ROGUE, SRT_REJ_VERSION, srt_flags,
 };
 use crate::srt_packet::{
     ControlPacket, ControlType, DataHeader, DataPacket, DatagramClass, PendingData,
@@ -165,6 +165,9 @@ pub const MIN_FLOW_WINDOW_PACKETS: u32 = 32;
 // HSv5 requires SRT 1.3.0 or newer. The peer flow-window field is signed
 // 32-bit and must advertise at least two packets.
 const MIN_HSV5_SRT_VERSION: u32 = 0x010300;
+/// Newest SRT version for which libsrt uses its legacy AES-GCM nonce/AAD
+/// layout (`crypto.cpp`: peers at or below 1.5.3), which is not supported.
+const LEGACY_GCM_MAX_SRT_VERSION: u32 = 0x010503;
 const MIN_PEER_FLOW_WINDOW: u32 = 2;
 
 /// libsrt-compatible zero padding (4 bytes).
@@ -855,6 +858,9 @@ pub struct SrtConnection {
     /// side's sender drop horizon (libsrt `m_iPeerTsbPdDelay_ms`), proposed
     /// by the peer's RCV half.
     peer_tsbpd_delay: u16,
+    /// SRT version the peer advertised in its HSREQ/HSRSP (libsrt
+    /// `SRTO_PEERVERSION`), once the CONCLUSION has been checked.
+    peer_srt_version: Option<u32>,
     /// The peer's advertised SRT flow window (its receive capacity, in
     /// packets); zero means it advertised nothing usable.
     ///
@@ -1279,6 +1285,7 @@ impl SrtConnection {
             handshake_state: HandshakeState::Initial,
             rcv_tsbpd_delay: options.tsbpd_delay,
             peer_tsbpd_delay: options.tsbpd_delay,
+            peer_srt_version: None,
             options,
             peer_socket_id: 0,
             syn_cookie: 0,
@@ -1335,6 +1342,7 @@ impl SrtConnection {
             handshake_state: HandshakeState::Initial,
             rcv_tsbpd_delay: options.tsbpd_delay,
             peer_tsbpd_delay: options.tsbpd_delay,
+            peer_srt_version: None,
             options,
             peer_socket_id: 0,
             syn_cookie: 0,
@@ -1415,6 +1423,12 @@ impl SrtConnection {
     /// Return the bonding group metadata advertised by the peer.
     pub fn peer_group_extension(&self) -> Option<GroupExtensionData> {
         self.peer_group_extension
+    }
+
+    /// Return the SRT version the peer advertised in its handshake
+    /// extension (libsrt `SRTO_PEERVERSION`), e.g. `0x010504` for 1.5.4.
+    pub fn peer_srt_version(&self) -> Option<u32> {
+        self.peer_srt_version
     }
 
     /// Return the SRT socket ID advertised by the peer during handshake.
@@ -1625,6 +1639,15 @@ impl SrtConnection {
         self.check_output_queue()?;
         if self.role != ConnectionRole::Caller {
             return Err(Error::invalid_state("only caller can initiate connection"));
+        }
+        if self.options.passphrase.is_some()
+            && self.options.cipher_mode == CipherMode::Gcm
+            && self.options.srt_version <= LEGACY_GCM_MAX_SRT_VERSION
+        {
+            return Err(Error::crypto_error(
+                "AES-GCM needs an srt_version of 1.5.4 or newer: libsrt peers use the \
+                 unsupported legacy GCM layout with 1.5.3 and older",
+            ));
         }
 
         self.start_time = Some(now);
@@ -3496,12 +3519,20 @@ impl SrtConnection {
     /// for a NAK loss record, and under GCM room for the authentication tag
     /// plus one byte of application data, so a negotiated session can always
     /// carry DATA (`effective_max_payload_size` subtracts the tag).
-    ///
-    /// The cipher is already known when the CONCLUSION is checked: the
-    /// caller built its crypto context (or configured one) before sending,
-    /// and a listener reads it from the peer's KMREQ.
     fn min_negotiated_payload(&self, hs: &HandshakePacket) -> usize {
-        let cipher = match self.role {
+        if self.handshake_cipher(hs) == Some(CipherMode::Gcm) {
+            MIN_NEGOTIATED_PAYLOAD_SIZE.max(GCM_TAG_LEN + 1)
+        } else {
+            MIN_NEGOTIATED_PAYLOAD_SIZE
+        }
+    }
+
+    /// The cipher this handshake negotiates. It is already known when the
+    /// CONCLUSION is checked: the caller built its crypto context (or
+    /// configured one) before sending, and a listener reads it from the
+    /// peer's KMREQ.
+    fn handshake_cipher(&self, hs: &HandshakePacket) -> Option<CipherMode> {
+        match self.role {
             ConnectionRole::Caller => match self.crypto.as_deref() {
                 Some(crypto) => Some(crypto.cipher_mode()),
                 None => self
@@ -3514,12 +3545,35 @@ impl SrtConnection {
                 .get_km_request()
                 .and_then(Result::ok)
                 .and_then(|km| CipherMode::from_km(&km)),
-        };
-        if cipher == Some(CipherMode::Gcm) {
-            MIN_NEGOTIATED_PAYLOAD_SIZE.max(GCM_TAG_LEN + 1)
-        } else {
-            MIN_NEGOTIATED_PAYLOAD_SIZE
         }
+    }
+
+    /// Refuse an AES-GCM session in which either side advertises SRT 1.5.3
+    /// or older. libsrt selects its legacy GCM nonce/AAD layout for such a
+    /// peer (`core.cpp:6295-6303`, `crypto.cpp:184,500-504`), which this
+    /// implementation does not support, so the session would fail to
+    /// decrypt. A listener answers `SRT_REJ_CRYPTO`, libsrt's code for
+    /// conflicting cryptographic configurations.
+    fn reject_legacy_gcm_peer(
+        &mut self,
+        hs: &HandshakePacket,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        if self.handshake_cipher(hs) != Some(CipherMode::Gcm) {
+            return Ok(());
+        }
+        let peer_legacy = hs
+            .get_hs_extension()
+            .is_some_and(|extension| extension.srt_version <= LEGACY_GCM_MAX_SRT_VERSION);
+        if !peer_legacy && self.options.srt_version > LEGACY_GCM_MAX_SRT_VERSION {
+            return Ok(());
+        }
+        Err(self.refuse_peer(
+            SRT_REJ_CRYPTO,
+            "AES-GCM with an SRT 1.5.3-or-older advertisement selects libsrt's legacy GCM \
+             layout, which this implementation does not support",
+            now,
+        ))
     }
 
     /// Reject a handshake in which the peer negotiates packet-filter
@@ -3650,6 +3704,7 @@ impl SrtConnection {
         self.reject_unsupported_packet_filter(&hs, now)?;
         self.reject_message_api_mismatch(&hs, now)?;
         self.reject_peer_without_rexmit_flag(&hs, now)?;
+        self.reject_legacy_gcm_peer(&hs, now)?;
         self.reject_missing_group_response(&hs)?;
         self.apply_peer_mss(&hs);
 
@@ -3791,6 +3846,7 @@ impl SrtConnection {
         self.reject_unsupported_packet_filter(&hs, now)?;
         self.reject_message_api_mismatch(&hs, now)?;
         self.reject_peer_without_rexmit_flag(&hs, now)?;
+        self.reject_legacy_gcm_peer(&hs, now)?;
         self.apply_peer_mss(&hs);
         self.note_peer_flow_window(hs.flow_window);
 
@@ -4708,6 +4764,7 @@ impl SrtConnection {
             self.peer_tsbpd_delay = peer;
         }
         self.peer_srt_flags = Some(extension.srt_flags);
+        self.peer_srt_version = Some(extension.srt_version);
     }
 
     /// Flags and (RCV, SND) latency halves of this listener's HSRSP.
@@ -10679,6 +10736,113 @@ mod tests {
             .expect_err("caller refuses an HSRSP without REXMITFLG");
         assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
         assert_ne!(attempt.caller.state(), ConnectionState::Connected);
+    }
+
+    /// Encrypted options for one side of a legacy-GCM boundary case.
+    fn cipher_options(socket_id: u32, cipher_mode: CipherMode) -> ConnectionOptions {
+        ConnectionOptions {
+            socket_id,
+            syn_cookie: Some(7),
+            passphrase: Some("interop-passphrase".to_owned()),
+            cipher_mode,
+            ..ConnectionOptions::default()
+        }
+    }
+
+    /// libsrt uses its legacy GCM layout with a peer at SRT 1.5.3 or older.
+    /// A GCM session whose peer advertises 0x010503 is refused in both
+    /// roles (listener: `SRT_REJ_CRYPTO`); 0x010504 connects and is
+    /// recorded as the peer version; CTR is unaffected.
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "constructs a real CryptoContext, deriving its KEK via 2048               \
+                  PBKDF2-HMAC-SHA1 iterations (per the SRT spec) under Miri; correctness    \
+                  is proven outside Miri, and this property is unrelated to PBKDF2's own    \
+                  iteration count. Run in the miri-extended scheduled job."
+    )]
+    fn gcm_with_a_peer_at_srt_1_5_3_or_older_is_refused_in_both_roles() {
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        let mut legacy = plain;
+        legacy.srt_version = Some(0x0001_0503);
+        let mut modern = plain;
+        modern.srt_version = Some(0x0001_0504);
+        let gcm = |id| cipher_options(id, CipherMode::Gcm);
+
+        let mut attempt = handshake_with_options(&legacy, &plain, gcm(1), gcm(2));
+        let error = attempt.listener_result.expect_err("legacy GCM caller");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_eq!(
+            rejection_reason(&mut attempt.listener),
+            Some(SRT_REJ_CRYPTO)
+        );
+        assert_ne!(attempt.listener.state(), ConnectionState::Connected);
+
+        let attempt = handshake_with_options(&plain, &legacy, gcm(1), gcm(2));
+        attempt.listener_result.expect("listener accepts");
+        let error = attempt.caller_result.expect_err("legacy GCM listener");
+        assert_eq!(error.kind, crate::ErrorKind::HandshakeRejected);
+        assert_ne!(attempt.caller.state(), ConnectionState::Connected);
+
+        let attempt = handshake_with_options(&modern, &modern, gcm(1), gcm(2));
+        attempt.listener_result.expect("1.5.4 caller");
+        attempt.caller_result.expect("1.5.4 listener");
+        assert_eq!(attempt.listener.peer_srt_version(), Some(0x0001_0504));
+        assert_eq!(attempt.caller.peer_srt_version(), Some(0x0001_0504));
+
+        let ctr = |id| cipher_options(id, CipherMode::Ctr);
+        let attempt = handshake_with_options(&legacy, &legacy, ctr(1), ctr(2));
+        attempt.listener_result.expect("legacy CTR caller");
+        attempt.caller_result.expect("legacy CTR listener");
+    }
+
+    /// A local `srt_version` of 1.5.3 or older with GCM would make a libsrt
+    /// peer use the legacy layout: a caller refuses it when it starts, a
+    /// listener refuses a GCM caller with `SRT_REJ_CRYPTO`.
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "constructs a real CryptoContext, deriving its KEK via 2048               \
+                  PBKDF2-HMAC-SHA1 iterations (per the SRT spec) under Miri; correctness    \
+                  is proven outside Miri, and this property is unrelated to PBKDF2's own    \
+                  iteration count. Run in the miri-extended scheduled job."
+    )]
+    fn a_local_srt_1_5_3_advertisement_cannot_use_gcm() {
+        for (version, allowed) in [(0x0001_0503, false), (0x0001_0504, true)] {
+            let mut caller = SrtConnection::new_caller(ConnectionOptions {
+                srt_version: version,
+                ..cipher_options(1, CipherMode::Gcm)
+            });
+            let started = caller.connect(Timestamp::default());
+            assert_eq!(started.is_ok(), allowed, "{version:#x}");
+            if let Err(error) = started {
+                assert_eq!(error.kind, crate::ErrorKind::CryptoError);
+            }
+        }
+        let mut ctr = SrtConnection::new_caller(ConnectionOptions {
+            srt_version: 0x0001_0503,
+            ..cipher_options(1, CipherMode::Ctr)
+        });
+        ctr.connect(Timestamp::default())
+            .expect("CTR is unaffected");
+
+        let plain = HandshakeRewrite::mss(1500, IpFamily::V4);
+        let mut attempt = handshake_with_options(
+            &plain,
+            &plain,
+            cipher_options(1, CipherMode::Gcm),
+            ConnectionOptions {
+                srt_version: 0x0001_0503,
+                ..cipher_options(2, CipherMode::Gcm)
+            },
+        );
+        attempt
+            .listener_result
+            .expect_err("a 1.5.3 listener refuses GCM");
+        assert_eq!(
+            rejection_reason(&mut attempt.listener),
+            Some(SRT_REJ_CRYPTO)
+        );
     }
 
     /// A peer that negotiates packet-filter behaviour gets a refusal, not a

@@ -191,6 +191,12 @@ HSv5 negotiation follows libsrt 1.5.7:
 - A peer that does not advertise REXMITFLG is refused (`SRT_REJ_ROGUE` from a
   listener). Every libsrt since 1.2.0 advertises it, and this implementation
   does not support the legacy 27-bit message-number layout.
+- AES-GCM uses the modern (libsrt 1.5.4+) nonce/AAD layout only. A GCM
+  session whose peer advertises SRT 1.5.3 or older, for which libsrt would
+  use its legacy layout, is refused in both roles (`SRT_REJ_CRYPTO`, libsrt's
+  code for conflicting cryptographic configurations, from a listener), and
+  `connect` refuses a local `srt_version` of 1.5.3 or older with GCM.
+  `SrtConnection::peer_srt_version` reports the peer's advertised version.
 
 ## Testing
 
