@@ -208,6 +208,9 @@ Packets carry what libsrt 1.5.7 emits:
   handshake took.
 - DATA message numbers roll `0x03ff_ffff` -> 1, never 0 (libsrt reserves
   0 for packet-filter control packets).
+- A listener's INDUCTION response echoes the caller's ISN. A caller refuses
+  a CONCLUSION response that carries another ISN (libsrt `MN_SECURITY`);
+  the INDUCTION response's ISN is not checked, as in libsrt.
 
 ## Testing
 

@@ -428,7 +428,8 @@ fn dropreq_range(pkt: &PendingDatagram) -> Option<(u32, u32)> {
 pub struct ConnectionOptions {
     /// Local socket ID. Zero means auto-assign a random nonzero value.
     pub socket_id: u32,
-    /// Initial sequence number.
+    /// Initial sequence number. Only its low 31 bits are used: the wire
+    /// field is a 31-bit sequence number.
     pub initial_seq: Option<u32>,
     /// SYN cookie (Listener only).
     pub syn_cookie: Option<u32>,
@@ -918,6 +919,9 @@ fn normalize_buffer_options(mut options: ConnectionOptions) -> ConnectionOptions
         .delivery_queue_packets
         .max(1)
         .min(options.receive_buffer_packets);
+    // The handshake carries 31 bits; keep the local identity identical to
+    // the wire one so the CONCLUSION response's echo compares equal.
+    options.initial_seq = options.initial_seq.map(|seq| seq & 0x7FFF_FFFF);
     if let Some(stream_id) = options.stream_id.as_mut() {
         truncate_utf8(stream_id, MAX_HANDSHAKE_OPTION_BYTES);
     }
@@ -3684,6 +3688,20 @@ impl SrtConnection {
         ))
     }
 
+    /// Refuse a CONCLUSION response that does not carry this caller's ISN.
+    /// A libsrt caller fails its connect with `MN_SECURITY` on that
+    /// mismatch (core.cpp:4085-4086), sending nothing to the listener. The
+    /// INDUCTION response is not checked: libsrt takes only its cookie,
+    /// version and type (`processConnectResponse`).
+    fn reject_foreign_response_isn(&mut self, hs: &HandshakePacket) -> Result<(), Error> {
+        if hs.initial_packet_seq == self.initial_seq {
+            return Ok(());
+        }
+        Err(self.fail_caller_handshake(
+            "CONCLUSION response ISN is not the caller's (libsrt MN_SECURITY)",
+        ))
+    }
+
     fn handle_caller_conclusion(
         &mut self,
         hs: HandshakePacket,
@@ -3706,6 +3724,7 @@ impl SrtConnection {
         self.reject_peer_without_rexmit_flag(&hs, now)?;
         self.reject_legacy_gcm_peer(&hs, now)?;
         self.reject_missing_group_response(&hs)?;
+        self.reject_foreign_response_isn(&hs)?;
         self.apply_peer_mss(&hs);
 
         self.peer_socket_id = hs.socket_id;
@@ -3820,7 +3839,7 @@ impl SrtConnection {
         if self.start_time.is_none() {
             self.start_time = Some(now);
         }
-        self.send_induction_response(now);
+        self.send_induction_response(hs.initial_packet_seq, now);
         self.handshake_state = HandshakeState::InductionReceived;
         self.arm_handshake_timer(now);
         Ok(())
@@ -4823,7 +4842,10 @@ impl SrtConnection {
         self.negotiated_srt_flags() & srt_flags::PERIODICNAK != 0
     }
 
-    fn send_induction_response(&mut self, now: Timestamp) {
+    /// Answer an INDUCTION request. The response echoes the request's ISN,
+    /// as libsrt answers by rewriting the received handshake in place
+    /// (core.cpp:11768-11811); the listener adopts its ISN at CONCLUSION.
+    fn send_induction_response(&mut self, request_isn: u32, now: Timestamp) {
         let encryption_field = if self.options.passphrase.is_some() {
             self.options.key_length.to_encryption_field()
         } else {
@@ -4835,6 +4857,7 @@ impl SrtConnection {
             self.syn_cookie,
             encryption_field,
         );
+        hs.initial_packet_seq = request_isn;
         hs.flow_window = self.flight_capacity_packets();
         let pkt = hs.encode(self.relative_timestamp(now), self.peer_socket_id);
         self.queue_handshake_control_packet(pkt, now);
@@ -5708,23 +5731,44 @@ mod tests {
         assert_eq!(caller.peer_socket_id(), 0);
     }
 
+    /// The first datagram `conn` queues.
+    fn next_wire(conn: &mut SrtConnection) -> Vec<u8> {
+        drain_outputs(conn)
+            .into_iter()
+            .find_map(|output| match output {
+                ConnectionOutput::SendPacket(wire) => Some(wire),
+                _ => None,
+            })
+            .expect("one protocol datagram")
+    }
+
+    fn decode_handshake(wire: &[u8]) -> (HandshakePacket, u32) {
+        let SrtPacket::Control(packet) = SrtPacket::decode(wire).unwrap() else {
+            panic!("handshake control packet");
+        };
+        (HandshakePacket::decode(&packet).unwrap(), packet.timestamp)
+    }
+
+    fn handshake_sequence(wire: &[u8]) -> u32 {
+        decode_handshake(wire).0.initial_packet_seq
+    }
+
+    fn isn_pair(initial: u32) -> (SrtConnection, SrtConnection) {
+        let caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 1,
+            initial_seq: Some(initial),
+            ..Default::default()
+        });
+        let listener = SrtConnection::new_listener(ConnectionOptions {
+            socket_id: 2,
+            syn_cookie: Some(7),
+            ..Default::default()
+        });
+        (caller, listener)
+    }
+
     #[test]
     fn handshake_and_first_data_keep_the_same_initial_sequence() {
-        let next_wire = |conn: &mut SrtConnection| {
-            drain_outputs(conn)
-                .into_iter()
-                .find_map(|output| match output {
-                    ConnectionOutput::SendPacket(wire) => Some(wire),
-                    _ => None,
-                })
-                .expect("one protocol datagram")
-        };
-        let handshake_sequence = |wire: &[u8]| {
-            let SrtPacket::Control(packet) = SrtPacket::decode(wire).unwrap() else {
-                panic!("handshake control packet");
-            };
-            HandshakePacket::decode(&packet).unwrap().initial_packet_seq
-        };
         for initial in [17, 0x7fff_fffe] {
             let mut caller = SrtConnection::new_caller(ConnectionOptions {
                 socket_id: 1,
@@ -5768,6 +5812,64 @@ mod tests {
             );
             assert_eq!(first.sequence_number, initial);
         }
+    }
+
+    /// A listener's INDUCTION response echoes the request's ISN: libsrt
+    /// answers by rewriting the received handshake (core.cpp:11768-11811).
+    #[test]
+    fn listener_induction_response_echoes_the_request_isn() {
+        for initial in [17, 0x7fff_fffe] {
+            let (mut caller, mut listener) = isn_pair(initial);
+            caller.connect(Timestamp::default()).unwrap();
+            listener
+                .feed_recv_buf(&next_wire(&mut caller), Timestamp::from_micros(1))
+                .unwrap();
+            let response = next_wire(&mut listener);
+            assert_eq!(handshake_sequence(&response), initial);
+        }
+    }
+
+    /// A caller refuses a CONCLUSION response carrying another ISN, as a
+    /// libsrt caller's connect fails with `MN_SECURITY` (core.cpp:4085).
+    #[test]
+    fn caller_refuses_a_conclusion_response_with_another_isn() {
+        for (response_isn, connects) in [(17, true), (18, false), (0, false)] {
+            let (mut caller, mut listener) = isn_pair(17);
+            caller.connect(Timestamp::default()).unwrap();
+            listener
+                .feed_recv_buf(&next_wire(&mut caller), Timestamp::from_micros(1))
+                .unwrap();
+            caller
+                .feed_recv_buf(&next_wire(&mut listener), Timestamp::from_micros(2))
+                .unwrap();
+            listener
+                .feed_recv_buf(&next_wire(&mut caller), Timestamp::from_micros(3))
+                .unwrap();
+            let (mut response, timestamp) = decode_handshake(&next_wire(&mut listener));
+            response.initial_packet_seq = response_isn;
+            let result =
+                caller.handle_handshake_caller(response, timestamp, Timestamp::from_micros(4));
+            assert_eq!(
+                result.is_ok(),
+                connects,
+                "response ISN {response_isn}: {result:?}"
+            );
+            let expected = if connects {
+                ConnectionState::Connected
+            } else {
+                ConnectionState::Disconnected
+            };
+            assert_eq!(caller.state(), expected, "response ISN {response_isn}");
+        }
+    }
+
+    /// Only the low 31 bits of a configured ISN are used, so the
+    /// CONCLUSION response's echo of the wire ISN is the caller's own.
+    #[test]
+    fn a_configured_isn_above_31_bits_uses_its_wire_value() {
+        let (mut caller, mut listener) = isn_pair(0x8000_0011);
+        drive_handshake_to_connected(&mut caller, &mut listener);
+        assert_eq!(caller.initial_seq, 0x11);
     }
 
     /// Drive a full caller/listener handshake to `Connected` on both ends,
