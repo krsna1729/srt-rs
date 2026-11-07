@@ -10287,6 +10287,13 @@ mod tests {
     /// completes. This is the reliability property the hostile-input test
     /// cannot see, because it only ever sends invalid controls.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "a real KM handshake derives its KEK via 2048 PBKDF2-HMAC-SHA1 iterations   \
+                  (per the SRT spec) on each side under Miri, which dominates this job's     \
+                  time; correctness is proven outside Miri, and this property is unrelated   \
+                  to PBKDF2's own iteration count. Run in the miri-extended scheduled job."
+    )]
     fn a_lost_kmrsp_is_retried_and_the_rotation_completes() {
         let (mut caller, mut listener) = encrypted_pair(CipherMode::Ctr);
         for connection in [&mut caller, &mut listener] {
@@ -10355,6 +10362,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "a real KM handshake derives its KEK via 2048 PBKDF2-HMAC-SHA1 iterations   \
+                  (per the SRT spec) on each side under Miri, which dominates this job's     \
+                  time; correctness is proven outside Miri, and this property is unrelated   \
+                  to PBKDF2's own iteration count. Run in the miri-extended scheduled job."
+    )]
     fn exhausting_km_responses_cannot_leave_peers_on_different_keys() {
         let (mut caller, mut listener) = encrypted_pair(CipherMode::Ctr);
         for connection in [&mut caller, &mut listener] {
@@ -10403,6 +10417,13 @@ mod tests {
     /// If no response arrives after all retries, the sender cannot know
     /// whether the peer installed the key, so it must close the session.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "a real KM handshake derives its KEK via 2048 PBKDF2-HMAC-SHA1 iterations   \
+                  (per the SRT spec) on each side under Miri, which dominates this job's     \
+                  time; correctness is proven outside Miri, and this property is unrelated   \
+                  to PBKDF2's own iteration count. Run in the miri-extended scheduled job."
+    )]
     fn a_lost_kmreq_is_retried_and_an_unanswered_rotation_fails_closed() {
         let (mut caller, mut listener) = encrypted_pair(CipherMode::Ctr);
         for connection in [&mut caller, &mut listener] {
@@ -10637,6 +10658,13 @@ mod tests {
     /// SEK in one KM message (KK = 3, even SEK first) under the unchanged
     /// salt, then the switched-to key alone once the old one is retired.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "a real KM handshake derives its KEK via 2048 PBKDF2-HMAC-SHA1 iterations   \
+                  (per the SRT spec) on each side under Miri, which dominates this job's     \
+                  time; correctness is proven outside Miri, and this property is unrelated   \
+                  to PBKDF2's own iteration count. Run in the miri-extended scheduled job."
+    )]
     fn libsrt_both_key_announcement_installs_both_receive_slots() {
         for (cipher_mode, key_length) in [
             (CipherMode::Ctr, KeyLength::Aes128),
@@ -10674,6 +10702,13 @@ mod tests {
     /// direction only. Its own transmit selector and in-flight rotation
     /// stay as they were, even when both sides rotate at once.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "a real KM handshake derives its KEK via 2048 PBKDF2-HMAC-SHA1 iterations   \
+                  (per the SRT spec) on each side under Miri, which dominates this job's     \
+                  time; correctness is proven outside Miri, and this property is unrelated   \
+                  to PBKDF2's own iteration count. Run in the miri-extended scheduled job."
+    )]
     fn peer_key_announcement_leaves_the_local_transmit_key_unchanged() {
         let (mut caller, mut listener) = quiet_encrypted_pair(CipherMode::Ctr, KeyLength::Aes128);
         let now = Timestamp::from_micros(10_000_000);
@@ -10747,6 +10782,13 @@ mod tests {
     /// installs a changed same-selector KM, salt included
     /// (`hcrypt_ctx_rx.c`); so does an SEK-only change.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "a real KM handshake derives its KEK via 2048 PBKDF2-HMAC-SHA1 iterations   \
+                  (per the SRT spec) on each side under Miri, which dominates this job's     \
+                  time; correctness is proven outside Miri, and this property is unrelated   \
+                  to PBKDF2's own iteration count. Run in the miri-extended scheduled job."
+    )]
     fn same_selector_replacement_after_connect_is_installed() {
         for cipher_mode in [CipherMode::Ctr, CipherMode::Gcm] {
             for (salt, sek) in [
@@ -10818,6 +10860,13 @@ mod tests {
     /// is never installed as a receive key -- verbatim or re-wrapped under
     /// another salt.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "a real KM handshake derives its KEK via 2048 PBKDF2-HMAC-SHA1 iterations   \
+                  (per the SRT spec) on each side under Miri, which dominates this job's     \
+                  time; correctness is proven outside Miri, and this property is unrelated   \
+                  to PBKDF2's own iteration count. Run in the miri-extended scheduled job."
+    )]
     fn a_reflected_transmit_key_is_not_installed_as_a_receive_key() {
         let (mut caller, _listener) = quiet_encrypted_pair(CipherMode::Ctr, KeyLength::Aes128);
         let now = Timestamp::from_micros(10_000_000);
@@ -10844,6 +10893,13 @@ mod tests {
     /// Hardening: the wrap authenticates neither selector nor salt, so a
     /// key already held must keep both.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "a real KM handshake derives its KEK via 2048 PBKDF2-HMAC-SHA1 iterations   \
+                  (per the SRT spec) on each side under Miri, which dominates this job's     \
+                  time; correctness is proven outside Miri, and this property is unrelated   \
+                  to PBKDF2's own iteration count. Run in the miri-extended scheduled job."
+    )]
     fn a_known_receive_key_cannot_change_selector_or_salt() {
         let (mut listener, now) = listener_with_replaced_even_key();
         assert_km_control_rejected(
@@ -10865,6 +10921,13 @@ mod tests {
     /// Hardening: a recently replaced receive key is not reinstalled,
     /// under either selector.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "a real KM handshake derives its KEK via 2048 PBKDF2-HMAC-SHA1 iterations   \
+                  (per the SRT spec) on each side under Miri, which dominates this job's     \
+                  time; correctness is proven outside Miri, and this property is unrelated   \
+                  to PBKDF2's own iteration count. Run in the miri-extended scheduled job."
+    )]
     fn a_retired_receive_key_cannot_be_reinstalled() {
         let (mut listener, now) = listener_with_replaced_even_key();
         assert_km_control_rejected(
@@ -10885,6 +10948,13 @@ mod tests {
 
     /// Hardening: a both-key announcement cannot install one SEK as both.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "a real KM handshake derives its KEK via 2048 PBKDF2-HMAC-SHA1 iterations   \
+                  (per the SRT spec) on each side under Miri, which dominates this job's     \
+                  time; correctness is proven outside Miri, and this property is unrelated   \
+                  to PBKDF2's own iteration count. Run in the miri-extended scheduled job."
+    )]
     fn a_both_key_announcement_of_one_key_twice_is_refused() {
         let (mut listener, now) = listener_with_replaced_even_key();
         assert_km_control_rejected(
@@ -10899,6 +10969,13 @@ mod tests {
     /// An identical repeat of the current KM is answered with the same
     /// KMRSP and reinstalls nothing.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "a real KM handshake derives its KEK via 2048 PBKDF2-HMAC-SHA1 iterations   \
+                  (per the SRT spec) on each side under Miri, which dominates this job's     \
+                  time; correctness is proven outside Miri, and this property is unrelated   \
+                  to PBKDF2's own iteration count. Run in the miri-extended scheduled job."
+    )]
     fn an_identical_current_kmreq_is_answered_without_reinstalling() {
         let (mut listener, now) = listener_with_replaced_even_key();
         let before = km_security_snapshot(&listener);
@@ -10913,6 +10990,13 @@ mod tests {
     /// A KMREQ whose wrap fails under a freshly derived KEK leaves every key
     /// and the cached KEK as they were; the intact request then installs.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "a real KM handshake derives its KEK via 2048 PBKDF2-HMAC-SHA1 iterations   \
+                  (per the SRT spec) on each side under Miri, which dominates this job's     \
+                  time; correctness is proven outside Miri, and this property is unrelated   \
+                  to PBKDF2's own iteration count. Run in the miri-extended scheduled job."
+    )]
     fn a_failed_unwrap_under_a_fresh_salt_leaves_every_key_untouched() {
         let (_caller, mut listener) = quiet_encrypted_pair(CipherMode::Ctr, KeyLength::Aes128);
         let now = Timestamp::from_micros(10_000_000);
@@ -10941,6 +11025,13 @@ mod tests {
     /// changes nothing; salts with a cached KEK cost nothing; the peer's
     /// retry after the interval installs.
     #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "a real KM handshake derives its KEK via 2048 PBKDF2-HMAC-SHA1 iterations   \
+                  (per the SRT spec) on each side under Miri, which dominates this job's     \
+                  time; correctness is proven outside Miri, and this property is unrelated   \
+                  to PBKDF2's own iteration count. Run in the miri-extended scheduled job."
+    )]
     fn fresh_salt_kek_derivations_are_bounded_per_connection() {
         let (_caller, mut listener) = quiet_encrypted_pair(CipherMode::Ctr, KeyLength::Aes128);
         let now = Timestamp::from_micros(10_000_000);
