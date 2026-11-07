@@ -798,10 +798,7 @@ impl HandshakePacket {
     pub fn add_km_error(&mut self, error: KmError) {
         self.extensions.push(HandshakeExtension {
             ext_type: ExtensionType::KmRsp,
-            // libsrt copies SRT_KM_STATE into the KM payload as a native
-            // 32-bit word before the handshake codec performs its own word
-            // swapping. The resulting extension bytes are little-endian.
-            data: (error as u32).to_le_bytes().to_vec(),
+            data: error.to_state_bytes().to_vec(),
         });
         self.extension_field |= extension_flags::KMREQ;
     }
@@ -824,12 +821,10 @@ impl HandshakePacket {
         for ext in &self.extensions {
             if ext.ext_type == ExtensionType::KmRsp {
                 // An error response is 4 bytes.
-                if ext.data.len() == 4 {
-                    let error_code =
-                        u32::from_le_bytes([ext.data[0], ext.data[1], ext.data[2], ext.data[3]]);
-                    if let Some(km_error) = KmError::from_u32(error_code) {
-                        return Err(km_error);
-                    }
+                if let Ok(state) = <[u8; 4]>::try_from(ext.data.as_slice())
+                    && let Some(km_error) = KmError::from_state_bytes(state)
+                {
+                    return Err(km_error);
                 }
                 // A normal KM message.
                 match KmMessage::decode(&ext.data) {
@@ -1010,7 +1005,7 @@ fn validate_extension_data(ext_type: ExtensionType, data: &[u8]) -> Result<(), E
             let Ok(code) = <[u8; 4]>::try_from(data) else {
                 return Err(Error::invalid_data("KMRSP error payload must be 4 bytes"));
             };
-            KmError::from_u32(u32::from_le_bytes(code))
+            KmError::from_state_bytes(code)
                 .map(|_| ())
                 .ok_or_else(|| Error::invalid_data("unknown KMRSP error code"))
         }
@@ -1434,6 +1429,24 @@ impl KmError {
             5 => Some(Self::BadCryptoMode),
             _ => None,
         }
+    }
+
+    /// The four-byte KMRSP body reporting this state, for both the
+    /// handshake extension and the runtime control packet.
+    ///
+    /// libsrt stores `SRT_KM_STATE` as a native 32-bit word and pre-swaps
+    /// it to cancel the channel's own word conversion
+    /// (`srtcore/crypto.cpp`, `srtcore/core.cpp`), so on the little-endian
+    /// hosts it ships on the bytes are little-endian: NOSECRET is
+    /// `03 00 00 00`.
+    pub fn to_state_bytes(self) -> [u8; 4] {
+        (self as u32).to_le_bytes()
+    }
+
+    /// Decode a four-byte KMRSP state body written by
+    /// [`Self::to_state_bytes`]; `None` for an unknown state.
+    pub fn from_state_bytes(bytes: [u8; 4]) -> Option<Self> {
+        Self::from_u32(u32::from_le_bytes(bytes))
     }
 }
 

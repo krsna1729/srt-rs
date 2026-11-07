@@ -4157,8 +4157,8 @@ impl SrtConnection {
         // ignores it without changing security state
         // (`CUDT::processSrtMsg_KMRSP`); the pending rotation keeps its own
         // bounded retries. An unknown code is malformed input.
-        if let Ok(code) = <[u8; 4]>::try_from(control_info) {
-            return KmError::from_u32(u32::from_le_bytes(code))
+        if let Ok(state) = <[u8; 4]>::try_from(control_info) {
+            return KmError::from_state_bytes(state)
                 .map(|_| ())
                 .ok_or_else(|| Error::invalid_data("unknown KMRSP error code"));
         }
@@ -4314,10 +4314,10 @@ impl SrtConnection {
         self.queue_control_packet(pkt, now);
     }
 
-    /// Send a KM refresh error response (KMRSP with its four-byte state).
+    /// Send a KM refresh error response: a KMRSP carrying the four-byte KM
+    /// state, encoded exactly as the handshake's (`KmError::to_state_bytes`).
     fn send_km_error_response(&mut self, error: KmError, now: Timestamp) {
-        let mut control_info = Vec::with_capacity(4);
-        write_u32(&mut control_info, error as u32);
+        let control_info = error.to_state_bytes().to_vec();
         let pkt = ControlPacket {
             control_type: ControlType::UserDefined,
             subtype: SRT_CMD_KMRSP,
@@ -5328,9 +5328,18 @@ mod tests {
         assert_eq!(response.control_type, ControlType::UserDefined);
         assert_eq!(response.subtype, 4, "KMRSP subtype");
         assert_eq!(response.dest_socket_id, 0x2000_0002);
+        // Same little-endian KM-state word as the handshake KMRSP
+        // (`HandshakePacket::add_km_error`): libsrt pre-swaps the native
+        // word so the channel's word conversion emits `03 00 00 00`.
+        assert_eq!(response.control_info, [0x03, 0x00, 0x00, 0x00]);
+        let state = <[u8; 4]>::try_from(response.control_info.as_slice()).expect("one word");
+        assert_eq!(KmError::from_state_bytes(state), Some(KmError::NoSecret));
+        let mut handshake = HandshakePacket::new_conclusion_request(1, 2, 3, 2, true);
+        handshake.add_km_error(KmError::NoSecret);
         assert_eq!(
-            response.control_info,
-            (KmError::NoSecret as u32).to_be_bytes()
+            handshake.extensions.last().map(|extension| extension.data.as_slice()),
+            Some(response.control_info.as_slice()),
+            "runtime and handshake KMRSP share one KM-state encoding"
         );
     }
 
