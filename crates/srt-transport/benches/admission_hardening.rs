@@ -280,6 +280,17 @@ fn bench_bonded_second_leg_admission(c: &mut Criterion) {
             || {
                 let mut options = AdmissionOptions::basic(7, 120, true);
                 options.bonded_inputs = BondedInputPolicy::Accept;
+                // A bonded caller refuses a response without the listener's
+                // own GROUP (libsrt `SRT_REJ_GROUP`), so the listener has one.
+                options.connection_template = Some(ConnectionOptions {
+                    group_extension: Some(GroupExtensionData {
+                        group_id: SRTGROUP_MASK | 2,
+                        group_type: GroupType::Broadcast,
+                        flags: 0,
+                        weight: 1,
+                    }),
+                    ..ConnectionOptions::default()
+                });
                 let telemetry = IngressTelemetry::new();
                 let mut table = PeerTable::new();
                 let mut first_caller = SrtConnection::new_caller(caller_options(11));
