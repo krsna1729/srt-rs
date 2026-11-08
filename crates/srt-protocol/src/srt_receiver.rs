@@ -70,7 +70,6 @@
 use crate::adaptive_receiver_packet_window::AdaptiveReceiverPacketWindow;
 use crate::range_bitset::RangeBitset;
 use bytes::Bytes;
-use rustc_hash::FxHashSet;
 
 use std::ops::ControlFlow;
 
@@ -98,6 +97,11 @@ pub const MAX_LIGHT_ACK_INTERVAL_PACKETS: u32 = 256;
 /// Contabo-measured 4× Light ACK coalesce for high-fan-in listeners
 /// (issue #30). Optional evidence target; **not** the protocol default.
 pub const HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS: u32 = MAX_LIGHT_ACK_INTERVAL_PACKETS;
+
+/// Most gaps one [`ReceiverBuffer::drop_too_late`] call gives up. Each costs
+/// a constant amount of work, so a backlog of due gaps is retired over
+/// several visits instead of in one window-sized pass.
+pub const MAX_EXPIRED_GAPS_PER_VISIT: usize = 64;
 
 /// Sequence numbers are carried in the low 31 bits of each wire word.
 const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
@@ -1822,67 +1826,91 @@ impl ReceiverBuffer {
         })
     }
 
-    /// Remove expired packets (TLPKTDROP).
-    pub fn drop_too_late(&mut self, now: Timestamp) -> Vec<u32> {
-        if !self.tsbpd_enabled {
-            return Vec::new();
-        }
-
-        let tlpktdrop_threshold = self.tlpktdrop_threshold_us();
-
+    /// Give up, TLPKTDROP style, on missing positions the packet after them
+    /// has become due for, oldest gap first, and return the gaps given up.
+    ///
+    /// Like libsrt (`CUDT::tsbpd` checks only the first valid packet after
+    /// the head gap, `core.cpp`), only the head gap is inspected: its
+    /// successor's deadline is evaluated once, the whole gap goes in one
+    /// range clear, and the walk stops at the first gap that is not yet
+    /// due. A tick that expires nothing therefore costs one successor lookup
+    /// and one deadline however many losses wait behind the head. Each
+    /// returned range runs from the gap's oldest loss to the position before
+    /// the packet that made it due (or to the classification frontier when no
+    /// later packet is retained).
+    ///
+    /// At most [`MAX_EXPIRED_GAPS_PER_VISIT`] gaps go per call; a caller that
+    /// gets that many back calls again to continue.
+    pub fn drop_too_late(&mut self, now: Timestamp) -> Vec<LossRange> {
         let mut dropped = Vec::new();
-
-        let expired: Vec<u32> = self
-            .loss_list
-            .iter()
-            .filter(|&seq| {
-                let now = now.as_micros();
-                if let Some(packet) = self.packets.get(seq) {
-                    return now > self.delivery_time(packet).as_micros() + tlpktdrop_threshold;
-                }
-                count_work!(SuccessorProbes);
-                let next_packet = self
-                    .packets
-                    .successor_after(seq)
-                    .and_then(|next_seq| self.packets.get(next_seq));
-                match next_packet {
-                    // Like libsrt (`CUDT::tsbpd` drops up to the first
-                    // received packet once it is due): the gap goes when the
-                    // packet after it is due. The 1 s floor of the threshold
-                    // is the sender's drop rule, not the receiver's.
-                    Some(next) => now >= self.delivery_time(next).as_micros(),
-                    None => {
-                        let base = self.tsbpd_time_base + self.tsbpd_delay_us;
-                        let estimated_delivery = if self.wrapping_period_active {
-                            base + MAX_TIMESTAMP + 1
-                        } else {
-                            base
-                        };
-                        now > estimated_delivery + tlpktdrop_threshold
-                    }
-                }
-            })
-            .collect();
-
-        for seq in expired {
-            self.loss_list.remove(seq);
-            dropped.push(seq);
+        if !self.tsbpd_enabled {
+            return dropped;
         }
-
-        self.total_dropped = self.total_dropped.saturating_add(dropped.len() as u64);
-
+        while dropped.len() < MAX_EXPIRED_GAPS_PER_VISIT {
+            let Some(gap) = self.due_head_gap(now) else {
+                break;
+            };
+            let removed = self
+                .loss_list
+                .remove_range(gap.first_seq, gap.sequence_count());
+            self.total_dropped = self.total_dropped.saturating_add(u64::from(removed));
+            dropped.push(gap);
+        }
         if !dropped.is_empty() {
-            let dropped_set: FxHashSet<u32> = dropped.iter().copied().collect();
-            while self.packets.contains_key(self.expected_seq)
-                || dropped_set.contains(&self.expected_seq)
-            {
-                count_work!(FrontierSteps);
-                self.expected_seq = self.expected_seq.wrapping_add(1) & 0x7FFF_FFFF;
-            }
+            self.expected_seq = self.first_unresolved_seq();
             self.loss_list.set_base(self.expected_seq);
         }
-
         dropped
+    }
+
+    /// The head gap -- from the oldest loss to the packet retained after it
+    /// -- if that packet is due. Every loss in the gap shares that packet,
+    /// so one deadline decides them all. Losses after the last retained
+    /// packet share its circular successor (the oldest one retained) and run
+    /// to the classification frontier; with nothing retained they wait for
+    /// the estimated play time plus the TLPKTDROP threshold.
+    fn due_head_gap(&self, now: Timestamp) -> Option<LossRange> {
+        let first_seq = self.loss_list.first()?;
+        count_work!(SuccessorProbes);
+        let successor = self
+            .packets
+            .successor_after(first_seq)
+            .and_then(|next| Some((next, self.packets.get(next)?)));
+        let now = now.as_micros();
+        let (last_seq, due) = match successor {
+            // Like libsrt (`CUDT::tsbpd` drops up to the first received
+            // packet once it is due): the gap goes when the packet after it
+            // is due. The 1 s floor of the threshold is the sender's drop
+            // rule, not the receiver's.
+            Some((next, packet)) => {
+                let last_seq = if sequence_greater_than(next, first_seq) {
+                    next.wrapping_sub(1) & SEQUENCE_MASK
+                } else {
+                    self.loss_detection_frontier
+                };
+                (last_seq, now >= self.delivery_time(packet).as_micros())
+            }
+            None => (
+                self.loss_detection_frontier,
+                now > self.estimated_tail_drop_time(),
+            ),
+        };
+        due.then_some(LossRange {
+            first_seq,
+            last_seq,
+        })
+    }
+
+    /// When a loss with no later packet retained is given up: the play time
+    /// estimated from the time base, plus the TLPKTDROP threshold.
+    fn estimated_tail_drop_time(&self) -> u64 {
+        let base = self.tsbpd_time_base + self.tsbpd_delay_us;
+        let estimated_delivery = if self.wrapping_period_active {
+            base + MAX_TIMESTAMP + 1
+        } else {
+            base
+        };
+        estimated_delivery + self.tlpktdrop_threshold_us()
     }
 
     /// Validate a 31-bit inclusive DROPREQ range against this receiver's
@@ -2182,6 +2210,7 @@ pub struct ReceiverStats {
 mod tests {
     use super::*;
     use crate::test_support::WorkCounters;
+    use rustc_hash::FxHashSet;
 
     fn loss_set(buf: &ReceiverBuffer) -> FxHashSet<u32> {
         buf.loss_list.iter().collect()
@@ -2445,6 +2474,94 @@ mod tests {
         assert_eq!(buf.expected_sequence(), 106);
         assert_eq!(buf.generate_ack(now).ack_seq, 106);
     }
+
+    /// F01: an ACK tick that expires nothing inspects only the head gap --
+    /// one successor lookup and one deadline -- however many losses wait
+    /// behind it. A due backlog of gaps is retired in bounded visits.
+    #[test]
+    fn tlpktdrop_tick_work_is_window_independent() {
+        let start = Timestamp::from_micros(0);
+        let mut results = Vec::new();
+        for window in WORK_BOUND_WINDOWS {
+            // One DATA a window ahead, due in 100 s: W - 1 losses behind it.
+            let mut buf = ReceiverBuffer::with_buffer_size(0, 120, start, 0, window);
+            buf.receive(make_packet(window - 1, 100_000_000), start);
+            let mut idle = WorkCounters::default();
+            for tick in 1..=8u64 {
+                let (dropped, work) = WorkCounters::measure(|| {
+                    buf.drop_too_late(Timestamp::from_micros(tick * 10_000))
+                });
+                assert!(dropped.is_empty());
+                idle = WorkCounters {
+                    loss_entries_visited: idle.loss_entries_visited.max(work.loss_entries_visited),
+                    successor_probes: idle.successor_probes.max(work.successor_probes),
+                    deadline_probes: idle.deadline_probes.max(work.deadline_probes),
+                    bitmap_data_words: idle.bitmap_data_words.max(work.bitmap_words()),
+                    ..idle
+                };
+            }
+            assert_eq!(buf.loss_list.len(), window - 1);
+            results.push((window, idle));
+        }
+        eprintln!("(window, worst idle tick): {results:?}");
+        for (window, idle) in results {
+            assert!(
+                idle.loss_entries_visited == 0
+                    && idle.successor_probes <= 1
+                    && idle.deadline_probes <= 1
+                    && idle.bitmap_data_words <= EXPIRY_TICK_BITMAP_WORD_LIMIT,
+                "window {window}: {idle:?}"
+            );
+        }
+    }
+
+    /// Bitmap words one given-up gap may cost: finding it and clearing it.
+    const EXPIRED_GAP_BITMAP_WORDS: u64 = 24;
+
+    /// F01: a backlog of due gaps goes `MAX_EXPIRED_GAPS_PER_VISIT` at a
+    /// time, each gap a constant amount of work, until none is left.
+    #[test]
+    fn tlpktdrop_due_backlog_retires_in_bounded_visits() {
+        let start = Timestamp::from_micros(0);
+        let late = Timestamp::from_micros(1_000_000);
+        let budget = MAX_EXPIRED_GAPS_PER_VISIT as u64;
+        for window in WORK_BOUND_WINDOWS {
+            let mut buf = ReceiverBuffer::with_buffer_size(0, 120, start, 0, window);
+            for seq in (1..window).step_by(2) {
+                buf.receive(make_packet(seq, 0), start);
+            }
+            let gaps = (window / 2) as usize;
+            let mut given_up = Vec::new();
+            loop {
+                let (dropped, work) = WorkCounters::measure(|| buf.drop_too_late(late));
+                assert!(dropped.len() <= MAX_EXPIRED_GAPS_PER_VISIT);
+                assert!(
+                    work.loss_entries_visited == 0
+                        && work.successor_probes <= budget + 1
+                        && work.deadline_probes <= budget + 1
+                        && work.bitmap_words() <= (budget + 1) * EXPIRED_GAP_BITMAP_WORDS,
+                    "window {window}: {work:?}"
+                );
+                let done = dropped.len() < MAX_EXPIRED_GAPS_PER_VISIT;
+                given_up.extend(dropped);
+                if done {
+                    break;
+                }
+            }
+            let expected: Vec<_> = (0..window)
+                .step_by(2)
+                .map(|seq| loss_range(seq, seq))
+                .collect();
+            assert_eq!(given_up.len(), gaps);
+            assert_eq!(given_up, expected);
+            assert_eq!(buf.expected_sequence(), window);
+            assert!(buf.loss_list.is_empty());
+            assert_eq!(buf.stats().total_dropped, gaps as u64);
+        }
+    }
+
+    /// Bitmap words a tick may read to find and inspect the head gap.
+    const EXPIRY_TICK_BITMAP_WORD_LIMIT: u64 = 16;
 
     /// A periodic NAK walks a wrapped window oldest first, resumes inside
     /// either side of the wrap, reports a straddled run from the resume
@@ -3680,7 +3797,7 @@ mod tests {
         // 次側パケット seq 1001 の delivery_time = 500_000 + 200_000 + 120_000 = 820_000
         // now = 2_000_000 > 820_000 + 1_000_000 = 1_820_000 なので削除される
         let dropped = buf.drop_too_late(Timestamp::from_micros(2_000_000));
-        assert_eq!(dropped, vec![1000]);
+        assert_eq!(dropped, vec![loss_range(1000, 1000)]);
     }
 
     /// Like libsrt's receiver (`CUDT::tsbpd`, which drops up to the first
@@ -3700,7 +3817,7 @@ mod tests {
         assert!(buf.drop_too_late(before).is_empty());
         assert!(buf.pop_ready(before).is_none());
 
-        assert_eq!(buf.drop_too_late(due), vec![1000]);
+        assert_eq!(buf.drop_too_late(due), vec![loss_range(1000, 1000)]);
         assert_eq!(
             buf.pop_ready(due).map(|packet| packet.sequence_number),
             Some(1001)
@@ -3726,8 +3843,12 @@ mod tests {
         let dropped = buf.drop_too_late(Timestamp::from_micros(2_000_000));
 
         assert_eq!(
-            FxHashSet::from_iter(dropped),
-            FxHashSet::from_iter([1000, 1001, 1003, 1005])
+            dropped,
+            vec![
+                loss_range(1000, 1001),
+                loss_range(1003, 1003),
+                loss_range(1005, 1005)
+            ]
         );
         assert!(buf.loss_list.is_empty());
         assert_eq!(buf.expected_sequence(), 1007);
@@ -3764,7 +3885,7 @@ mod tests {
 
         // TLPKTDROP で 1000 を諦める。
         let dropped = buf.drop_too_late(Timestamp::from_micros(2_000_000));
-        assert_eq!(dropped, vec![1000]);
+        assert_eq!(dropped, vec![loss_range(1000, 1000)]);
 
         // 修正前は expected_seq が 1000 に張り付いたままだった。
         // 1000 (諦めた) と 1001 (受信済み) の両方を追い越して 1002 まで
@@ -3805,7 +3926,7 @@ mod tests {
         // now = 2_200_000: 1000 は超過、1001 は未到達 → 1000 のみ削除 (1000 は loss_list にないので削除されない)
         // now = 2_400_000: 両方超過 → 1001 が削除される
         let dropped = buf.drop_too_late(Timestamp::from_micros(2_400_000));
-        assert_eq!(dropped, vec![1001]);
+        assert_eq!(dropped, vec![loss_range(1001, 1001)]);
         assert!(buf.loss_list.is_empty());
     }
 
@@ -4030,7 +4151,7 @@ mod tests {
 
         // drop_too_late で期限切れの穴 (0x7FFF_FFFE) を loss_list から除去する。
         let dropped = buf.drop_too_late(late_now);
-        assert_eq!(dropped, vec![0x7FFF_FFFE]);
+        assert_eq!(dropped, vec![loss_range(0x7FFF_FFFE, 0x7FFF_FFFE)]);
 
         // 穴が消えた後、後続が循環順で配信される。
         let mut popped = Vec::new();
@@ -4161,7 +4282,11 @@ mod tests {
 
         let after = Timestamp::from_micros(4_296_788_000);
         let dropped = buf.drop_too_late(after);
-        assert_eq!(dropped, vec![1001], "閾値超過で削除されるはず");
+        assert_eq!(
+            dropped,
+            vec![loss_range(1001, 1001)],
+            "閾値超過で削除されるはず"
+        );
     }
 
     #[test]

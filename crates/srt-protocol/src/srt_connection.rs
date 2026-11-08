@@ -27,7 +27,7 @@ use crate::srt_packet::{
     ControlPacket, ControlType, DataHeader, DataPacket, DatagramClass, PendingData,
     PendingDatagram, SRT_CMD_KMREQ, SRT_CMD_KMRSP, SRT_HEADER_SIZE, SrtPacket, sequence_less_than,
 };
-use crate::srt_receiver::{LossRange, ReceiverBuffer};
+use crate::srt_receiver::{LossRange, MAX_EXPIRED_GAPS_PER_VISIT, ReceiverBuffer};
 use crate::srt_sender::{NakReceipt, PeerRateFeedback, SenderBuffer};
 use crate::stats::ConnectionStats;
 use crate::time::Timestamp;
@@ -822,6 +822,9 @@ pub struct SrtConnection {
     /// window and the peer has not been told yet. Cleared when a Small/Full
     /// ACK actually carries the new window.
     receive_window_reopen_pending: bool,
+    /// A TLPKTDROP visit stopped at its gap budget with more gaps possibly
+    /// due; the next `DeliveryContinue` visit continues it.
+    receive_expiry_continues: bool,
     /// Whether the peer closed its send half and this connection is still
     /// delivering what it had already accepted. Terminal on drain.
     peer_shutdown_pending: bool,
@@ -1363,6 +1366,7 @@ impl SrtConnection {
             pending_tx_even: 0,
             pending_tx_odd: 0,
             receive_window_reopen_pending: false,
+            receive_expiry_continues: false,
             peer_shutdown_pending: false,
             output_overflowed: false,
             event_overflowed: false,
@@ -1423,6 +1427,7 @@ impl SrtConnection {
             pending_tx_even: 0,
             pending_tx_odd: 0,
             receive_window_reopen_pending: false,
+            receive_expiry_continues: false,
             peer_shutdown_pending: false,
             output_overflowed: false,
             event_overflowed: false,
@@ -2237,7 +2242,11 @@ impl SrtConnection {
             }
             TimerId::DeliveryContinue => {
                 if self.state != ConnectionState::Disconnected {
-                    self.enqueue_ready_data(now);
+                    if std::mem::take(&mut self.receive_expiry_continues) {
+                        self.service_receive_deadlines(now);
+                    } else {
+                        self.enqueue_ready_data(now);
+                    }
                     self.finish_peer_shutdown_if_drained();
                 }
             }
@@ -2296,9 +2305,19 @@ impl SrtConnection {
         if self.tlpktdrop_enabled()
             && let Some(receiver) = self.receiver.as_mut()
         {
-            for seq in receiver.drop_too_late(now) {
-                if let Some(sender) = self.sender.as_mut() {
-                    sender.discard_acked(seq);
+            let dropped = receiver.drop_too_late(now);
+            if dropped.len() == MAX_EXPIRED_GAPS_PER_VISIT {
+                // More gaps may be due: continue at once rather than a tick
+                // later, as the uncapped walk did.
+                self.receive_expiry_continues = true;
+                self.queue_output(QueuedOutput::SetTimer {
+                    id: TimerId::DeliveryContinue,
+                    duration_micros: 0,
+                });
+            }
+            if let Some(sender) = self.sender.as_mut() {
+                for gap in dropped {
+                    sender.discard_acked_within(gap.first_seq, gap.last_seq);
                 }
             }
             self.continue_acked_release_later();
@@ -8123,6 +8142,62 @@ mod tests {
         }
         let cap = MAX_DELIVERY_PER_VISIT as u32;
         assert_eq!(delivered, [cap, 2 * cap, 3 * cap, READY]);
+    }
+
+    /// A TLPKTDROP tick that stops at its gap budget continues on the
+    /// zero-delay `DeliveryContinue` visit rather than a tick later, so a
+    /// backlog of due gaps is given up as promptly as one uncapped pass.
+    #[test]
+    fn a_due_gap_backlog_is_given_up_in_continued_visits() {
+        const WINDOW: u32 = 512;
+        let mut conn = SrtConnection::new_listener(ConnectionOptions {
+            tsbpd_delay: 120,
+            flow_window_packets: WINDOW,
+            receive_buffer_packets: WINDOW,
+            delivery_queue_packets: WINDOW,
+            ..ConnectionOptions::default()
+        });
+        conn.peer_srt_flags = Some(srt_flags::TSBPDSND | srt_flags::TLPKTDROP);
+        conn.set_state(ConnectionState::Connected);
+        let _ = conn.poll_event();
+        conn.init_buffers(Timestamp::from_micros(0), 0, 0);
+        let now = Timestamp::from_micros(0);
+        // 160 one-packet gaps, each before a packet due at 120 ms.
+        for sequence_number in (1..320).step_by(2) {
+            conn.handle_data_packet(
+                DataPacket::new(sequence_number, sequence_number, 0, 0, vec![1].into()),
+                now,
+            )
+            .expect("data behind each gap is accepted");
+        }
+        while conn.poll_output().unwrap().is_some() {}
+
+        let expected = |conn: &SrtConnection| conn.receiver.as_ref().unwrap().expected_sequence();
+        let continued = |conn: &mut SrtConnection| {
+            let mut armed = false;
+            while let Some(output) = conn.poll_output().unwrap() {
+                armed |= matches!(
+                    output,
+                    ConnectionOutput::SetTimer {
+                        id: TimerId::DeliveryContinue,
+                        duration_micros: 0,
+                    }
+                );
+            }
+            armed
+        };
+        let late = Timestamp::from_micros(1_000_000);
+        conn.handle_timer(TimerId::Ack, late).expect("ACK tick");
+        let mut progress = vec![expected(&conn)];
+        while continued(&mut conn) {
+            conn.handle_timer(TimerId::DeliveryContinue, late)
+                .expect("continuation visit");
+            progress.push(expected(&conn));
+        }
+        let gap = 2 * MAX_EXPIRED_GAPS_PER_VISIT as u32;
+        assert_eq!(progress[..3], [gap, 2 * gap, 320]);
+        assert_eq!(*progress.last().unwrap(), 320);
+        assert_eq!(conn.receiver.as_ref().unwrap().stats().total_dropped, 160);
     }
 
     /// A local close releases the whole TSBPD-buffered tail in the call that
