@@ -715,10 +715,10 @@ Before/after counts and mutations are in each commit message.
 
 ## Send-side work is independent of the window
 
-Every send-side entry point -- a submission, an ACK, a NAK, an ACK tick, an
-output poll -- does work bounded by a constant (or by what it reports) at
-every window, up to 65,536 packets. Each site below was position-scale
-before.
+Every send-side path a peer can trigger once per datagram -- an ACK, a NAK,
+and the ticks and output polls they set off -- does work bounded by a
+constant at every window, up to 65,536 packets. Each site below could be
+made window-sized, repeatedly, before.
 
 - A NAK into a dropped message (F02). TLPKTDROP keeps a sequence-ordered
   record of every message it gave up until the cumulative ACK retires it.
@@ -727,3 +727,25 @@ before.
   outward from the named position, outside the report's position budget.
   The report is still charged the message's span, so when a report defers
   is unchanged.
+- A duplicate or non-advancing ACK (F03). Only an ACK that retired
+  something (or a TLPKTDROP drop) purges stale DATA from the output queue,
+  in one in-place pass; every ACK used to scan the whole queue and remove
+  each stale entry with its own shift.
+- Stale retransmission entries (F17). Past 1,024 stale entries the loss
+  list is compacted in place a bounded step per call (256 per ACK or tick,
+  two per entry a NAK visit queues) instead of swept whole on every ACK;
+  `pop_retransmit` inspects at most 64 entries per call.
+- The DROPREQ answer to a NAK (F17) takes its at most 16 tombstone runs by
+  index instead of rotating every run the report found.
+- The RTO probe walk was already one step: it runs only while the newest
+  submitted packet is live, because TLPKTDROP tombstones only a prefix.
+
+Cumulative-ACK retirement, sender expiry, DROPREQ submission and output
+overflow teardown stay amortized O(1) per submitted packet, as in libsrt;
+crates/srt-protocol/VENDOR.md (Sender-side work bounds) explains why they
+are not indexed.
+
+Evidence. One test per finding compares W = 32 / 8,192 / 65,536 with
+`WorkCounters`; `send_entry_points_do_window_independent_work` replays
+random send-side streams at all three windows. Before/after counts and
+mutations are in each commit message.
