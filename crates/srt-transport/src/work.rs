@@ -1,0 +1,72 @@
+//! Per-thread counters of loop work done by transport entry points.
+//!
+//! Each counter is incremented inside the loop that does the work, once per
+//! iteration, so a test can bound what one admission, service visit,
+//! maintenance pass or retirement did by taking a [`WorkCounters::snapshot`]
+//! before and after it. Counters are thread-local, so parallel tests do not
+//! interfere.
+//!
+//! The module and every counting site exist only in this crate's own unit
+//! tests: production builds, benches and dependents carry none of it.
+
+use std::cell::Cell;
+
+/// One kind of counted work.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Counter {
+    ArenaSlotProbes,
+    RouteIndexProbes,
+}
+
+const COUNTERS: usize = Counter::RouteIndexProbes as usize + 1;
+
+thread_local! {
+    static WORK: [Cell<u64>; COUNTERS] = const { [const { Cell::new(0) }; COUNTERS] };
+}
+
+pub(crate) fn add(counter: Counter, units: u64) {
+    WORK.with(|work| {
+        let cell = &work[counter as usize];
+        cell.set(cell.get().saturating_add(units));
+    });
+}
+
+/// A scalar snapshot of this thread's work counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WorkCounters {
+    /// Dense-arena slots visited by a whole-arena walk, empty slots included.
+    pub arena_slot_probes: u64,
+    /// Listener route-index lookups (address, caller ID, cookie).
+    pub route_index_probes: u64,
+}
+
+impl WorkCounters {
+    /// This thread's counters now.
+    #[must_use]
+    pub(crate) fn snapshot() -> Self {
+        WORK.with(|work| {
+            let get = |counter: Counter| work[counter as usize].get();
+            Self {
+                arena_slot_probes: get(Counter::ArenaSlotProbes),
+                route_index_probes: get(Counter::RouteIndexProbes),
+            }
+        })
+    }
+
+    /// Work done since `before`, a snapshot taken earlier on this thread.
+    #[must_use]
+    pub(crate) fn since(before: Self) -> Self {
+        let now = Self::snapshot();
+        Self {
+            arena_slot_probes: now.arena_slot_probes - before.arena_slot_probes,
+            route_index_probes: now.route_index_probes - before.route_index_probes,
+        }
+    }
+
+    /// Run `f` and return its result with the work it did.
+    pub(crate) fn measure<T>(f: impl FnOnce() -> T) -> (T, Self) {
+        let before = Self::snapshot();
+        let result = f();
+        (result, Self::since(before))
+    }
+}

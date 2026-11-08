@@ -1040,6 +1040,9 @@ impl PeerSlotTarget {
 pub struct PeerTable {
     slots: DenseSlotArena<PeerSlotTarget>,
     half_open_by_caller: HashMap<(std::net::SocketAddr, u32), usize>,
+    /// Address, caller-ID and cookie indexes of every occupied slot, so a
+    /// handshake that names no slot routes without walking the arena.
+    routes: crate::route_index::RouteIndex,
     logical_peers: HashMap<LogicalPeerId, LogicalPeerTarget>,
     next_logical_peer: u64,
     source_counts: HashMap<std::net::IpAddr, usize>,
@@ -1243,6 +1246,7 @@ impl PeerTable {
         Self {
             slots: DenseSlotArena::with_partition(config.max_peers, index, count),
             half_open_by_caller: HashMap::new(),
+            routes: crate::route_index::RouteIndex::default(),
             logical_peers: HashMap::new(),
             next_logical_peer: 1,
             source_counts: HashMap::new(),
@@ -1481,6 +1485,45 @@ impl PeerTable {
         prev.extract_direct()
     }
 
+    /// Re-index `slot_idx`'s routing keys from its current contents. Called
+    /// wherever they can change: a slot filled, emptied or changing kind, and
+    /// after handshake input (which sets a listener's peer socket ID and SYN
+    /// cookie). Completed handshakes never change either, so the established
+    /// data path needs no call.
+    fn sync_route(&mut self, slot_idx: usize) {
+        let keys = self.slots.get_by_slot(slot_idx).map(|slot| {
+            let (caller_socket_id, syn_cookie) = match slot.value {
+                PeerSlotTarget::Direct(entry) => (
+                    Some(entry.conn.peer_socket_id()),
+                    Some(entry.conn.syn_cookie()),
+                ),
+                PeerSlotTarget::GroupLeg(handle) => (
+                    self.groups
+                        .get(&handle.key)
+                        .and_then(|group| group.group.member(handle.member_id))
+                        .map(|member| member.connection().peer_socket_id()),
+                    None,
+                ),
+                PeerSlotTarget::Detached => (None, None),
+            };
+            crate::route_index::RouteKeys {
+                address: slot.address,
+                caller_socket_id,
+                syn_cookie,
+            }
+        });
+        self.routes.sync(slot_idx as u32, keys);
+    }
+
+    /// The physical key of the peer occupying `slot_idx`.
+    fn physical_at_slot(&self, slot_idx: u32) -> Option<PhysicalPeerKey> {
+        let slot = self.slots.get_by_slot(slot_idx as usize)?;
+        Some(PhysicalPeerKey {
+            address: slot.address,
+            local_socket_id: slot.socket_id,
+        })
+    }
+
     fn allocate_listener_socket_id(&mut self, preferred: u32) -> u32 {
         let (_, socket_id) = self
             .slots
@@ -1500,29 +1543,10 @@ impl PeerTable {
             return physical;
         }
         let identity = conclusion?;
-        self.slots
-            .iter()
-            .find_map(|slot| {
-                let entry = slot.value.direct()?;
-                (slot.address == peer && entry.conn.syn_cookie() == identity.syn_cookie).then_some(
-                    PhysicalPeerKey {
-                        address: slot.address,
-                        local_socket_id: slot.socket_id,
-                    },
-                )
-            })
-            .or_else(|| {
-                let mut candidates = self.slots.iter().filter(|slot| slot.address == peer);
-                let first = candidates.next()?;
-                if candidates.next().is_none() {
-                    Some(PhysicalPeerKey {
-                        address: first.address,
-                        local_socket_id: first.socket_id,
-                    })
-                } else {
-                    None
-                }
-            })
+        self.routes
+            .first_for_cookie(peer, identity.syn_cookie)
+            .or_else(|| self.routes.sole_at(peer))
+            .and_then(|slot| self.physical_at_slot(slot))
     }
 
     fn stale_conclusion(
@@ -1613,40 +1637,17 @@ impl PeerTable {
                 local_socket_id: slot.socket_id,
             });
         }
-        self.slots.iter().find_map(|slot| {
-            if slot.address != address {
-                return None;
-            }
-            match &slot.value {
-                PeerSlotTarget::Direct(entry) => (entry.conn.peer_socket_id() == caller_socket_id)
-                    .then_some(PhysicalPeerKey {
-                        address: slot.address,
-                        local_socket_id: slot.socket_id,
-                    }),
-                PeerSlotTarget::GroupLeg(handle) => {
-                    let member = self
-                        .groups
-                        .get(&handle.key)
-                        .and_then(|group| group.group.member(handle.member_id))?;
-                    (member.connection().peer_socket_id() == caller_socket_id).then_some(
-                        PhysicalPeerKey {
-                            address: slot.address,
-                            local_socket_id: slot.socket_id,
-                        },
-                    )
-                }
-                PeerSlotTarget::Detached => None,
-            }
-        })
+        self.routes
+            .first_for_caller(address, caller_socket_id)
+            .and_then(|slot| self.physical_at_slot(slot))
     }
+
+    /// The lowest-slot peer at `address`; an address alone does not tell
+    /// apart several SRT legs sharing it.
     pub fn physical_for_address(&self, address: std::net::SocketAddr) -> Option<PhysicalPeerKey> {
-        self.slots
-            .iter()
-            .find(|slot| slot.address == address)
-            .map(|slot| PhysicalPeerKey {
-                address: slot.address,
-                local_socket_id: slot.socket_id,
-            })
+        self.routes
+            .first_at(address)
+            .and_then(|slot| self.physical_at_slot(slot))
     }
 
     fn group_admission_allowed(
@@ -2008,6 +2009,7 @@ impl PeerTable {
         if became_terminal {
             entry.rejected = true;
         }
+        self.sync_route(entry_slot);
         self.index_idle_peer(physical);
         AdmissionFeedResult {
             fed,
@@ -2221,6 +2223,7 @@ impl PeerTable {
             .source_counts
             .entry(source_key(address.ip()))
             .or_default() += 1;
+        self.sync_route(slot_idx);
         self.index_idle_peer(physical);
         self.adopt_bonded_peer(physical);
         self.mark_ready_physical(physical);
@@ -2364,6 +2367,7 @@ impl PeerTable {
                 member_id,
             });
         }
+        self.sync_route(slot_idx);
         self.mark_group_leg_ready(&key, member_id);
         self.sync_group_leg_deadline(&key, member_id);
     }
@@ -4411,6 +4415,67 @@ impl PeerTable {
         self.physical_for_address(*peer).is_some()
     }
 
+    /// Test-only: assert the route indexes answer, for every occupied slot's
+    /// address, caller socket ID and cookie, exactly what the ascending
+    /// arena walk they replaced found.
+    #[cfg(test)]
+    pub(crate) fn assert_routes_match_arena_walk(&self) {
+        let caller_of =
+            |slot: &crate::dense_slot_arena::SlotRef<'_, PeerSlotTarget>| match slot.value {
+                PeerSlotTarget::Direct(entry) => Some(entry.conn.peer_socket_id()),
+                PeerSlotTarget::GroupLeg(handle) => self
+                    .groups
+                    .get(&handle.key)
+                    .and_then(|group| group.group.member(handle.member_id))
+                    .map(|member| member.connection().peer_socket_id()),
+                PeerSlotTarget::Detached => None,
+            };
+        let cookie_of = |slot: &crate::dense_slot_arena::SlotRef<'_, PeerSlotTarget>| {
+            slot.value.direct().map(|entry| entry.conn.syn_cookie())
+        };
+        let walk =
+            |matches: &dyn Fn(&crate::dense_slot_arena::SlotRef<'_, PeerSlotTarget>) -> bool| {
+                self.slots
+                    .iter()
+                    .filter(|slot| matches(slot))
+                    .map(|slot| self.slots.slot_index_for_socket_id(slot.socket_id) as u32)
+                    .collect::<Vec<_>>()
+            };
+        let callers = self.slots.iter().filter(|slot| caller_of(slot).is_some());
+        let cookies = self.slots.iter().filter(|slot| cookie_of(slot).is_some());
+        assert_eq!(
+            self.routes.sizes(),
+            (self.slots.len(), callers.count(), cookies.count()),
+            "one entry per occupied slot and key"
+        );
+        for slot in self.slots.iter() {
+            let address = slot.address;
+            let at = walk(&|other| other.address == address);
+            assert_eq!(self.routes.first_at(address), at.first().copied());
+            assert_eq!(self.routes.sole_at(address), (at.len() == 1).then(|| at[0]));
+            let caller = caller_of(&slot).unwrap_or(0);
+            for probe in [caller, caller.wrapping_add(1)] {
+                let found =
+                    walk(&|other| other.address == address && caller_of(other) == Some(probe));
+                assert_eq!(
+                    self.routes.first_for_caller(address, probe),
+                    found.first().copied(),
+                    "caller {probe:#x} at {address}"
+                );
+            }
+            let cookie = cookie_of(&slot).unwrap_or(0);
+            for probe in [cookie, cookie.wrapping_add(1)] {
+                let found =
+                    walk(&|other| other.address == address && cookie_of(other) == Some(probe));
+                assert_eq!(
+                    self.routes.first_for_cookie(address, probe),
+                    found.first().copied(),
+                    "cookie {probe:#x} at {address}"
+                );
+            }
+        }
+    }
+
     /// Test-only: the arena slot index holding a direct peer's address.
     #[cfg(test)]
     pub(crate) fn peer_slot_index_for_test(&self, peer: std::net::SocketAddr) -> Option<usize> {
@@ -4448,6 +4513,7 @@ impl PeerTable {
         self.half_open_deadlines.remove(&peer);
         self.idle_deadlines.remove(&peer);
         if let Some(slot_idx) = self.slot_index_for_key(&peer) {
+            self.routes.sync(slot_idx as u32, None);
             self.deadlines.remove(slot_idx, &mut self.slots);
             self.slots.clear_ready(slot_idx);
             self.slots.clear_event_ready(slot_idx);
@@ -5055,6 +5121,137 @@ mod tests {
         (admit, conclusion)
     }
 
+    /// F06: a handshake that names no slot -- an INDUCTION from a caller
+    /// the table has not seen, a CONCLUSION with a cookie it never issued --
+    /// is routed before capacity rejection, so any source can repeat it per
+    /// datagram. Routing must not walk the arena's slot domain: the work is
+    /// a few index probes whatever the capacity, while the arena holds one
+    /// peer.
+    #[test]
+    fn unknown_handshakes_route_without_walking_the_arena() {
+        let telemetry = IngressTelemetry::new();
+        let options = default_options();
+        let now = Timestamp::from_micros(1_000);
+        for max_peers in [64usize, 4_096, MAX_DENSE_SLOTS] {
+            let mut table = PeerTable::with_config(PeerTableConfig {
+                max_peers,
+                max_half_open_peers: max_peers,
+                max_established_peers: max_peers,
+                max_peers_per_ip: 1,
+                half_open_timeout: Duration::from_secs(60),
+                ..PeerTableConfig::default()
+            });
+            let established: std::net::SocketAddr = "10.0.0.1:5000".parse().unwrap();
+            let (admit, _) = conclude_as(&mut table, established, None, &options, &telemetry, now);
+            assert_eq!(admit, Admit::Fed);
+
+            // An INDUCTION from a new caller on the same IP misses every
+            // index, then meets the per-source cap.
+            let (admit, induction) = crate::work::WorkCounters::measure(|| {
+                table.admit(
+                    "10.0.0.1:5001".parse().unwrap(),
+                    &induction_packet(77),
+                    now,
+                    &options,
+                    0,
+                    1,
+                    &telemetry,
+                )
+            });
+            assert_eq!(admit, Admit::Dropped(AdmissionDropReason::SourceCapacity));
+
+            // A CONCLUSION carrying another table's cookie, from an address
+            // this table has never seen.
+            let stranger: std::net::SocketAddr = "10.0.0.2:6000".parse().unwrap();
+            let mut other = PeerTable::new();
+            let conclusion = induct(&mut other, stranger, None, &options, &telemetry, now);
+            let (admit, stale) = crate::work::WorkCounters::measure(|| {
+                table.admit(stranger, &conclusion, now, &options, 0, 1, &telemetry)
+            });
+            assert_eq!(admit, Admit::Dropped(AdmissionDropReason::StaleConclusion));
+
+            for (what, work) in [("induction", induction), ("conclusion", stale)] {
+                assert_eq!(
+                    work.arena_slot_probes, 0,
+                    "{what} miss at capacity {max_peers}: {work:?}"
+                );
+                assert!(
+                    work.route_index_probes <= 2,
+                    "{what} miss at capacity {max_peers}: {work:?}"
+                );
+            }
+        }
+    }
+
+    proptest! {
+        /// F06: under admission, completion, expiry and retirement churn the
+        /// route indexes answer exactly what the arena walk they replace did.
+        #[test]
+        fn route_indexes_track_the_arena_walk(
+            ops in proptest::collection::vec((0..4u8, 0..3u16, 0..4u32), 1..40),
+        ) {
+            let mut table = PeerTable::with_config(PeerTableConfig {
+                max_peers: 64,
+                max_half_open_peers: 64,
+                max_established_peers: 64,
+                max_peers_per_ip: 64,
+                half_open_timeout: Duration::from_secs(1),
+                ..PeerTableConfig::default()
+            });
+            let telemetry = IngressTelemetry::new();
+            let options = default_options();
+            let addresses: Vec<std::net::SocketAddr> = (0..3u16)
+                .map(|port| std::net::SocketAddr::from(([10, 0, 0, 1], 7000 + port)))
+                .collect();
+            let mut now = 1_000u64;
+            for (op, port, caller) in ops {
+                now += 100_000;
+                let at = Timestamp::from_micros(now);
+                let peer = addresses[usize::from(port)];
+                match op {
+                    0 => {
+                        let _ = table.admit(peer, &induction_packet(caller), at, &options, 0, 1, &telemetry);
+                    }
+                    1 => {
+                        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+                            socket_id: 1 + caller,
+                            ..ConnectionOptions::default()
+                        });
+                        caller.connect(at).expect("start caller");
+                        let induction = next_packet(&mut caller);
+                        let _ = table.admit(peer, &induction, at, &options, 0, 1, &telemetry);
+                        let mut outbound = Vec::new();
+                        table.poll_outbound(at, &mut outbound);
+                        for (outbound_peer, packet) in outbound {
+                            if outbound_peer == peer {
+                                let _ = caller.feed_recv_buf(&packet, at);
+                            }
+                        }
+                        while let Ok(Some(output)) = caller.poll_output() {
+                            if let ConnectionOutput::SendPacket(conclusion) = output {
+                                let _ = table.admit(peer, &conclusion, at, &options, 0, 1, &telemetry);
+                                break;
+                            }
+                        }
+                    }
+                    2 => {
+                        if let Some(id) = table
+                            .physical_for_address(peer)
+                            .and_then(|physical| table.get_peer(&physical))
+                            .map(|entry| entry.logical_peer)
+                        {
+                            drop(table.remove(id));
+                        }
+                    }
+                    _ => {
+                        let _ = table.prune_half_open(at);
+                    }
+                }
+                table.assert_routes_match_arena_walk();
+            }
+        }
+    }
+
     fn encrypted_listener_options() -> AdmissionOptions {
         AdmissionOptions {
             connection_template: Some(ConnectionOptions {
@@ -5471,6 +5668,7 @@ mod tests {
         table
             .slots
             .insert_at_slot(slot_idx, actual_id, addr, PeerSlotTarget::Direct(entry));
+        table.sync_route(slot_idx);
         table.established_peers += 1;
         (physical, slot_idx)
     }
@@ -5630,6 +5828,7 @@ mod tests {
                 member_id: 1,
             });
         }
+        table.sync_route(slot_idx);
 
         // 1. Mark ready enqueues slot
         table.mark_ready_physical(peer);

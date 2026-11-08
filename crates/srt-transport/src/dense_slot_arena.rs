@@ -575,9 +575,11 @@ impl<T> DenseSlotArena<T> {
             generation,
         })
     }
-    /// Iterator over all occupied peer slots.
+    /// Iterator over all occupied peer slots. Visits the whole slot domain,
+    /// empty slots included: never call it from a per-datagram path.
     pub fn iter(&self) -> impl Iterator<Item = SlotRef<'_, T>> {
         self.slots.iter().filter_map(|slot| {
+            count_work!(ArenaSlotProbes);
             let value = slot.value.as_deref()?;
             Some(SlotRef {
                 socket_id: slot.socket_id,

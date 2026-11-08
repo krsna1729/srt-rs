@@ -92,6 +92,19 @@
 use srt_proto::{ConnectionOptions, Error as SrtError, SrtConnection};
 use std::time::Duration;
 
+/// Count `units` of loop work under a `work::WorkCounters` counter. Expands
+/// to nothing outside this crate's own unit tests, so production builds,
+/// benches and dependents measure uncounted code.
+macro_rules! count_work {
+    ($counter:ident) => {
+        count_work!($counter, 1)
+    };
+    ($counter:ident, $units:expr) => {
+        #[cfg(test)]
+        $crate::work::add($crate::work::Counter::$counter, ($units) as u64);
+    };
+}
+
 // --- Private submodules ---
 
 mod admission;
@@ -113,11 +126,14 @@ mod id_hash;
 mod owner_layout;
 mod retirement;
 mod reuseport_group;
+mod route_index;
 pub use owner_layout::{ListenerTransfer, OwnerListenerPlan, ReusePortMember, owner_plans};
 mod sink;
 mod socket_io;
 mod telemetry;
 mod timer;
+#[cfg(test)]
+mod work;
 pub use sink::{DatagramSink, DatagramSlot, SinkOutcome, VecSlot};
 
 /// Explicit composition APIs for applications that own a runtime, socket
