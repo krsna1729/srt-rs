@@ -680,6 +680,18 @@ fn broadcast_send_reaches_every_established_leg() {
         assert_eq!(stats.aggregate.logical_payloads_sent, 1, "one logical send");
         assert!(stats.aggregate.wire_unique_packets_sent >= 2, "duplicated on the wire");
         assert!(received >= 1, "the listener received the payload");
+
+        // Retiring the listener's bonded group cancels its legs' timers:
+        // nothing is left on the table to wake for.
+        let table = &mut owner.listener.as_mut().expect("listener side").table;
+        for id in table.logical_peer_ids_for_test() {
+            drop(table.remove(id));
+        }
+        assert!(table.is_empty());
+        assert_eq!(
+            table.time_until_next_deadline(Timestamp::from_micros(now), 777),
+            777
+        );
     });
 }
 

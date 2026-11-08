@@ -6087,13 +6087,13 @@ mod tests {
     }
 
     #[test]
-    fn due_index_replaces_deadlines_and_ignores_stale_entries() {
+    fn due_index_replaces_deadlines() {
         let mut index = DueIndex::default();
         index.set("a", Timestamp::from_micros(100));
         index.set("b", Timestamp::from_micros(200));
         index.set("a", Timestamp::from_micros(300));
 
-        assert_eq!(index.peek_min_deadline(), Some(Timestamp::from_micros(200)));
+        assert_eq!(index.earliest(), Some(Timestamp::from_micros(200)));
         let mut due = Vec::new();
         index.pop_due(Timestamp::from_micros(200), &mut due);
         assert_eq!(due, vec!["b"]);
@@ -6103,11 +6103,11 @@ mod tests {
     }
 
     #[test]
-    fn due_index_remove_lazily_discards_heap_entry() {
+    fn due_index_remove_discards_the_entry() {
         let mut index = DueIndex::default();
         index.set(7, Timestamp::from_micros(100));
         index.remove(&7);
-        assert_eq!(index.peek_min_deadline(), None);
+        assert_eq!(index.earliest(), None);
         assert!(index.is_empty());
     }
 

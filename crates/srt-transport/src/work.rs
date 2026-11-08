@@ -16,9 +16,11 @@ use std::cell::Cell;
 pub(crate) enum Counter {
     ArenaSlotProbes,
     RouteIndexProbes,
+    HeapEntriesVisited,
+    HeapEntriesCloned,
 }
 
-const COUNTERS: usize = Counter::RouteIndexProbes as usize + 1;
+const COUNTERS: usize = Counter::HeapEntriesCloned as usize + 1;
 
 thread_local! {
     static WORK: [Cell<u64>; COUNTERS] = const { [const { Cell::new(0) }; COUNTERS] };
@@ -38,6 +40,10 @@ pub(crate) struct WorkCounters {
     pub arena_slot_probes: u64,
     /// Listener route-index lookups (address, caller ID, cookie).
     pub route_index_probes: u64,
+    /// Deadline-heap entries popped, inspected at the head, or moved by a sift.
+    pub heap_entries_visited: u64,
+    /// Deadline-heap keys cloned into a rebuilt heap.
+    pub heap_entries_cloned: u64,
 }
 
 impl WorkCounters {
@@ -49,6 +55,8 @@ impl WorkCounters {
             Self {
                 arena_slot_probes: get(Counter::ArenaSlotProbes),
                 route_index_probes: get(Counter::RouteIndexProbes),
+                heap_entries_visited: get(Counter::HeapEntriesVisited),
+                heap_entries_cloned: get(Counter::HeapEntriesCloned),
             }
         })
     }
@@ -60,6 +68,8 @@ impl WorkCounters {
         Self {
             arena_slot_probes: now.arena_slot_probes - before.arena_slot_probes,
             route_index_probes: now.route_index_probes - before.route_index_probes,
+            heap_entries_visited: now.heap_entries_visited - before.heap_entries_visited,
+            heap_entries_cloned: now.heap_entries_cloned - before.heap_entries_cloned,
         }
     }
 

@@ -123,6 +123,7 @@ mod group_conn;
 mod handoff;
 mod high_res_waiter;
 mod id_hash;
+mod indexed_heap;
 mod owner_layout;
 mod retirement;
 mod reuseport_group;
@@ -247,7 +248,7 @@ pub mod advanced {
 #[cfg(feature = "bench-internals")]
 pub mod test_support {
     pub use super::admission::PhysicalPeerKey;
-    pub use super::dense_due_index::{DenseDueEntry, DenseDueIndex};
+    pub use super::dense_due_index::DenseDueIndex;
     pub use super::dense_slot_arena::{
         DenseSlotArena, MAX_DENSE_SLOTS, PeerSlot, PeerSlotId, RouteSlot, SlotMut, SlotRef,
     };

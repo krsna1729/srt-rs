@@ -6564,6 +6564,60 @@ mod tests {
             bg_handle.join().unwrap();
         });
     }
+
+    /// F05: every service visit's report finalization reads the listener's
+    /// next idle and protocol deadlines outside any budget. After deadline
+    /// churn across many peers, a visit with a zero budget -- no RX, no
+    /// maintenance, no TX -- still costs O(log n) heap work at most.
+    #[test]
+    fn zero_budget_visit_finalizes_without_heap_cleanup() {
+        use crate::admission::tests::{established_callers, next_packet};
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            for peers in [64usize, 512, 4_096] {
+                let l_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind listener");
+                let l_addr = l_std.local_addr().expect("listener addr");
+                let l_sock = compio::net::UdpSocket::from_std(l_std).expect("adopt listener");
+                let l_cfg = crate::ListenerConfig::builder(l_addr)
+                    .build()
+                    .expect("listener config");
+                let listener = ListenerSide::new(l_sock, &l_cfg).expect("listener side");
+                let mut owner = Owner::new(16).with_listener(listener);
+                let options = crate::AdmissionOptions::basic(0x3335, 0, false);
+                let telemetry = IngressTelemetry::new();
+                let table = &mut owner.listener.as_mut().expect("listener").table;
+                let mut callers = established_callers(table, peers, &options, &telemetry);
+                let mut out = Vec::new();
+                for round in 0..8u64 {
+                    let now = Timestamp::from_micros(10_000 + round * 1_000);
+                    for (peer, caller) in &mut callers {
+                        caller.send(b"refresh", now).expect("caller sends DATA");
+                        let datagram = next_packet(caller);
+                        table.admit(*peer, &datagram, now, &options, 0, 1, &telemetry);
+                    }
+                    table.poll_outbound(now, &mut out);
+                }
+                let zero = OwnerServiceBudget {
+                    max_completions: 0,
+                    max_rx_packets: 0,
+                    max_rx_bytes: 0,
+                    max_actions: 0,
+                    max_maintenance_actions: 0,
+                    max_tx_packets: 0,
+                    max_tx_bytes: 0,
+                };
+                let before = crate::work::WorkCounters::snapshot();
+                let report = owner.service(Timestamp::from_micros(20_000), zero).await;
+                let work = crate::work::WorkCounters::since(before);
+                assert!(report.next_deadline_us.is_some());
+                let limit = 4 * u64::from(peers.ilog2()) + 8;
+                assert!(
+                    work.heap_entries_visited + work.heap_entries_cloned <= limit,
+                    "zero-budget visit at {peers} peers: {work:?} (limit {limit})"
+                );
+            }
+        });
+    }
     #[test]
     fn staged_pending_rx_obeys_rx_budget_and_signals_continuation() {
         let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");

@@ -50,8 +50,6 @@ pub struct RouteSlot<T> {
     pub address: SocketAddr,
     pub ready_queued: bool,
     pub event_ready_queued: bool,
-    pub deadline_micros: Option<u64>,
-    pub deadline_version: u32,
     pub value: Option<Box<T>>,
 }
 
@@ -59,9 +57,6 @@ pub struct RouteSlot<T> {
 pub struct SlotRef<'a, T> {
     pub socket_id: u32,
     pub address: SocketAddr,
-    pub deadline_micros: Option<u64>,
-    #[allow(dead_code)]
-    pub deadline_version: u32,
     pub value: &'a T,
 }
 
@@ -70,8 +65,6 @@ pub struct SlotRef<'a, T> {
 pub struct SlotMut<'a, T> {
     pub socket_id: u32,
     pub address: SocketAddr,
-    pub deadline_micros: Option<u64>,
-    pub deadline_version: u32,
     pub value: &'a mut T,
 }
 /// Generational dense slot arena for established SRT peer dispatch.
@@ -129,8 +122,6 @@ impl<T> DenseSlotArena<T> {
             address: SocketAddr::from(([0, 0, 0, 0], 0)),
             ready_queued: false,
             event_ready_queued: false,
-            deadline_micros: None,
-            deadline_version: 0,
             value: None,
         });
 
@@ -266,8 +257,6 @@ impl<T> DenseSlotArena<T> {
             address,
             ready_queued: false,
             event_ready_queued: false,
-            deadline_micros: None,
-            deadline_version: 0,
             value: Some(Box::new(value)),
         };
         self.len += 1;
@@ -313,8 +302,6 @@ impl<T> DenseSlotArena<T> {
         Some(SlotRef {
             socket_id: slot.socket_id,
             address: slot.address,
-            deadline_micros: slot.deadline_micros,
-            deadline_version: slot.deadline_version,
             value,
         })
     }
@@ -327,8 +314,6 @@ impl<T> DenseSlotArena<T> {
         Some(SlotMut {
             socket_id: slot.socket_id,
             address: slot.address,
-            deadline_micros: slot.deadline_micros,
-            deadline_version: slot.deadline_version,
             value,
         })
     }
@@ -404,8 +389,6 @@ impl<T> DenseSlotArena<T> {
         slot.socket_id = 0;
         slot.ready_queued = false;
         slot.event_ready_queued = false;
-        slot.deadline_micros = None;
-        slot.deadline_version = slot.deadline_version.wrapping_add(1);
         let current_gen = self.slot_generations[slot_idx];
         self.slot_generations[slot_idx] = current_gen.wrapping_add(1).max(1);
         if free {
@@ -502,79 +485,6 @@ impl<T> DenseSlotArena<T> {
         }
         true
     }
-    /// Verify whether a deadline heap entry is still live and un-rescheduled.
-    #[inline]
-    pub fn is_live_deadline(
-        &self,
-        slot_idx: usize,
-        generation: u32,
-        version: u32,
-        deadline_micros: u64,
-    ) -> bool {
-        if slot_idx >= self.slots.len() {
-            return false;
-        }
-        if self.slot_generations.get(slot_idx).copied() != Some(generation) {
-            return false;
-        }
-        let slot = &self.slots[slot_idx];
-        slot.value.is_some()
-            && slot.deadline_version == version
-            && slot.deadline_micros == Some(deadline_micros)
-    }
-
-    /// Update the established deadline for an occupied slot.
-    ///
-    /// Advances `deadline_version` and records the new deadline. Returns `Some((generation, version))`
-    /// on success, or `None` if the slot is unoccupied.
-    #[inline]
-    pub fn set_slot_deadline(
-        &mut self,
-        slot_idx: usize,
-        deadline_micros: u64,
-    ) -> Option<(u32, u32)> {
-        let generation = self.slot_generation(slot_idx);
-        let slot = self.slots.get_mut(slot_idx)?;
-        slot.value.as_ref()?;
-        slot.deadline_version = slot.deadline_version.wrapping_add(1);
-        slot.deadline_micros = Some(deadline_micros);
-        Some((generation, slot.deadline_version))
-    }
-
-    /// Clear the deadline for a slot, advancing `deadline_version` to invalidate lazy heap entries.
-    ///
-    /// Returns `true` if an active deadline was cleared.
-    #[inline]
-    pub fn clear_slot_deadline(&mut self, slot_idx: usize) -> bool {
-        let Some(slot) = self.slots.get_mut(slot_idx) else {
-            return false;
-        };
-        slot.deadline_version = slot.deadline_version.wrapping_add(1);
-        slot.deadline_micros.take().is_some()
-    }
-
-    /// Validate and consume a due deadline in a single pass.
-    ///
-    /// If the entry matches current occupant identity, deadline version, and deadline value,
-    /// clears `deadline_micros` and returns `Some(PeerSlotId)`. Returns `None` if stale.
-    #[inline]
-    pub fn consume_due_deadline(
-        &mut self,
-        slot_idx: usize,
-        generation: u32,
-        version: u32,
-        deadline_micros: u64,
-    ) -> Option<PeerSlotId> {
-        if !self.is_live_deadline(slot_idx, generation, version, deadline_micros) {
-            return None;
-        }
-        let slot = self.slots.get_mut(slot_idx)?;
-        slot.deadline_micros = None;
-        Some(PeerSlotId {
-            slot_idx: slot_idx as u32,
-            generation,
-        })
-    }
     /// Iterator over all occupied peer slots. Visits the whole slot domain,
     /// empty slots included: never call it from a per-datagram path.
     pub fn iter(&self) -> impl Iterator<Item = SlotRef<'_, T>> {
@@ -584,8 +494,6 @@ impl<T> DenseSlotArena<T> {
             Some(SlotRef {
                 socket_id: slot.socket_id,
                 address: slot.address,
-                deadline_micros: slot.deadline_micros,
-                deadline_version: slot.deadline_version,
                 value,
             })
         })
@@ -600,8 +508,6 @@ impl<T> DenseSlotArena<T> {
             Some(SlotMut {
                 socket_id,
                 address,
-                deadline_micros: slot.deadline_micros,
-                deadline_version: slot.deadline_version,
                 value,
             })
         })

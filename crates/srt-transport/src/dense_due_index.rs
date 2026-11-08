@@ -1,273 +1,134 @@
-//! Dense generational deadline index for established physical peers.
+//! Dense deadline index for established physical peers.
 //!
-//! Replaces the generic `HashMap<PhysicalPeerKey, u64>` + `BinaryHeap` with
-//! a generational binary heap indexing dense route slots in `DenseSlotArena`.
+//! An exact indexed min-heap keyed by `DenseSlotArena` slot index: each slot
+//! has at most one node, so updates and cancellations are one sift and the
+//! earliest deadline is the root. There is no stale history, no lazy cleanup
+//! and no rebuild, so no single call's work grows with the peer population
+//! beyond O(log n). Positions live in a vector indexed by slot, so a sift
+//! never hashes.
 //!
-//! Updates and cancellations operate directly on slot metadata without hashing.
-//! Lazy heap stale amplification is bounded by an amortized rebuild threshold.
-
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+//! A node also records the slot generation it was set for. Every slot
+//! removal cancels its deadline first, so a popped node always names its
+//! current occupant; the generation is a defensive check, not a cleanup
+//! mechanism.
 
 use srt_proto::Timestamp;
 
 use crate::dense_slot_arena::{DenseSlotArena, PeerSlotId};
-
-/// Minimum heap size before stale amplification triggers an amortized rebuild pass.
-pub const DEFAULT_REBUILD_FLOOR: usize = 64;
-
-/// Maximum allowable ratio of `heap_len / live_deadlines` before rebuilding.
-pub const DEFAULT_REBUILD_RATIO: usize = 4;
-
-/// Generational deadline entry in the dense heap.
-#[derive(Debug, Clone, Copy)]
-pub struct DenseDueEntry {
-    pub deadline_micros: u64,
-    pub slot_idx: u32,
-    pub generation: u32,
-    pub version: u32,
-}
-
-impl PartialEq for DenseDueEntry {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.deadline_micros == other.deadline_micros
-    }
-}
-
-impl Eq for DenseDueEntry {}
-
-impl PartialOrd for DenseDueEntry {
-    #[inline]
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for DenseDueEntry {
-    #[inline]
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.deadline_micros.cmp(&other.deadline_micros)
-    }
-}
+use crate::indexed_heap::IndexedHeap;
 
 /// Deadline index specialized for established peers in `DenseSlotArena`.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct DenseDueIndex {
-    heap: BinaryHeap<Reverse<DenseDueEntry>>,
-    live: usize,
-    stale_popped: usize,
-    rebuild_count: usize,
-    rebuild_floor: usize,
-    rebuild_threshold_ratio: usize,
+    heap: IndexedHeap,
+    /// Slot generation each live node was set for.
+    generations: Vec<u32>,
 }
 
-impl Default for DenseDueIndex {
-    fn default() -> Self {
-        Self::new(DEFAULT_REBUILD_FLOOR, DEFAULT_REBUILD_RATIO)
-    }
-}
 #[allow(dead_code)]
 impl DenseDueIndex {
-    #[must_use]
-    pub fn new(rebuild_floor: usize, rebuild_threshold_ratio: usize) -> Self {
-        Self {
-            heap: BinaryHeap::new(),
-            live: 0,
-            stale_popped: 0,
-            rebuild_count: 0,
-            rebuild_floor,
-            rebuild_threshold_ratio,
-        }
-    }
-
-    /// Set or update the established deadline for an occupied slot.
+    /// Set or update the deadline of an occupied slot; an empty slot is
+    /// ignored.
     #[inline]
-    pub fn set<T>(&mut self, slot_idx: usize, deadline: Timestamp, slots: &mut DenseSlotArena<T>) {
-        let deadline_micros = deadline.as_micros();
-        let was_active = slots
-            .get_by_slot(slot_idx)
-            .is_some_and(|s| s.deadline_micros.is_some());
-        let Some((generation, version)) = slots.set_slot_deadline(slot_idx, deadline_micros) else {
+    pub fn set<T>(&mut self, slot_idx: usize, deadline: Timestamp, slots: &DenseSlotArena<T>) {
+        if slots.get_by_slot(slot_idx).is_none() {
             return;
-        };
-        if !was_active {
-            self.live += 1;
         }
-        self.heap.push(Reverse(DenseDueEntry {
-            deadline_micros,
-            slot_idx: slot_idx as u32,
-            generation,
-            version,
-        }));
-        self.maybe_rebuild(slots);
+        if slot_idx >= self.generations.len() {
+            self.generations.resize(slot_idx + 1, 0);
+        }
+        self.generations[slot_idx] = slots.slot_generation(slot_idx);
+        self.heap.set(slot_idx as u32, deadline.as_micros());
     }
 
-    /// Clear the deadline for a slot without scanning the heap.
+    /// Cancel a slot's deadline.
     #[inline]
-    pub fn remove<T>(&mut self, slot_idx: usize, slots: &mut DenseSlotArena<T>) {
-        if slots.clear_slot_deadline(slot_idx) {
-            self.live = self.live.saturating_sub(1);
-            self.maybe_rebuild(slots);
-        }
+    pub fn remove(&mut self, slot_idx: usize) {
+        self.heap.remove(slot_idx as u32);
     }
 
-    /// Drain every currently indexed due deadline. The index itself is
-    /// bounded by the caller-owned slot arena and stale-amplification rule.
+    /// Drain every currently due deadline.
     pub fn pop_due<T>(
         &mut self,
         now: Timestamp,
-        slots: &mut DenseSlotArena<T>,
+        slots: &DenseSlotArena<T>,
         out: &mut Vec<PeerSlotId>,
     ) {
-        let _ = self.pop_due_bounded(now, slots, self.heap.len(), out);
+        let _ = self.pop_due_bounded(now, slots, usize::MAX, out);
     }
 
-    /// Drain at most `max_work` due heap entries, including stale entries.
-    /// Returns `(entries_visited, due_entries_remaining)` so a maintenance
-    /// caller can cap stale cleanup as well as live timer work.
+    /// Drain at most `max_work` due deadlines, earliest first. Returns
+    /// `(entries_visited, due_entries_remaining)`.
     pub fn pop_due_bounded<T>(
         &mut self,
         now: Timestamp,
-        slots: &mut DenseSlotArena<T>,
+        slots: &DenseSlotArena<T>,
         max_work: usize,
         out: &mut Vec<PeerSlotId>,
     ) -> (usize, bool) {
         out.clear();
-        let now_micros = now.as_micros();
         let mut visited = 0;
-        while let Some(Reverse(top)) = self.heap.peek()
-            && top.deadline_micros <= now_micros
-            && visited < max_work
-        {
-            let Reverse(entry) = self.heap.pop().expect("peeked entry exists");
+        while visited < max_work && self.has_due(now) {
+            let (_, slot_idx) = self.heap.pop().expect("a due node exists");
             visited += 1;
-            let idx = entry.slot_idx as usize;
-            if let Some(slot_id) = slots.consume_due_deadline(
-                idx,
-                entry.generation,
-                entry.version,
-                entry.deadline_micros,
-            ) {
-                self.live = self.live.saturating_sub(1);
-                out.push(slot_id);
-            } else {
-                self.stale_popped += 1;
+            let generation = self.generations[slot_idx as usize];
+            debug_assert_eq!(
+                generation,
+                slots.slot_generation(slot_idx as usize),
+                "slot removal cancels its deadline"
+            );
+            if generation == slots.slot_generation(slot_idx as usize) {
+                out.push(PeerSlotId {
+                    slot_idx,
+                    generation,
+                });
             }
         }
-        let due_remaining = self
-            .heap
-            .peek()
-            .is_some_and(|top| top.0.deadline_micros <= now_micros);
-        (visited, due_remaining)
+        (visited, self.has_due(now))
     }
 
-    /// Conservative O(1) due probe. A stale heap head may report work that
-    /// the next bounded pop will discard, which is intentional: callers can
-    /// wake for a cheap extra maintenance visit without scanning stale slots.
+    /// Whether the earliest deadline is due at `now`. O(1).
     #[must_use]
     #[inline]
     pub fn has_due(&self, now: Timestamp) -> bool {
         self.heap
             .peek()
-            .is_some_and(|top| top.0.deadline_micros <= now.as_micros())
+            .is_some_and(|(deadline, _)| deadline <= now.as_micros())
     }
 
-    /// Earliest live deadline, discarding stale heap heads lazily.
-    pub fn peek_min_deadline<T>(&mut self, slots: &DenseSlotArena<T>) -> Option<Timestamp> {
-        // Peeking never inserts entries, so the initial heap length is a hard
-        // upper bound on stale heads this call can inspect.
-        let max_work = self.heap.len();
-        for _ in 0..max_work {
-            let Some(Reverse(entry)) = self.heap.peek() else {
-                break;
-            };
-            let idx = entry.slot_idx as usize;
-            if slots.is_live_deadline(idx, entry.generation, entry.version, entry.deadline_micros) {
-                return Some(Timestamp::from_micros(entry.deadline_micros));
-            }
-            let Reverse(_) = self.heap.pop().expect("peeked entry exists");
-            self.stale_popped += 1;
-        }
-        None
-    }
-
-    /// Rebuild the heap in a single $O(H)$ pass, purging all entries that no longer match slot state.
-    pub fn rebuild<T>(&mut self, slots: &DenseSlotArena<T>) {
-        self.rebuild_count += 1;
-        let mut raw = std::mem::take(&mut self.heap).into_vec();
-        raw.retain(|Reverse(entry)| {
-            let idx = entry.slot_idx as usize;
-            slots.is_live_deadline(idx, entry.generation, entry.version, entry.deadline_micros)
-        });
-        self.heap = BinaryHeap::from(raw);
-    }
-
-    #[inline]
-    fn maybe_rebuild<T>(&mut self, slots: &DenseSlotArena<T>) {
-        if self.live == 0 {
-            if !self.heap.is_empty() {
-                self.heap.clear();
-            }
-            return;
-        }
-        if self.rebuild_threshold_ratio > 0
-            && self.heap.len() > self.rebuild_floor
-            && self.heap.len() > self.live * self.rebuild_threshold_ratio
-        {
-            self.rebuild(slots);
-        }
-    }
+    /// The earliest live deadline. O(1).
     #[must_use]
     #[inline]
-    pub fn len(&self) -> usize {
-        self.live
+    pub fn earliest(&self) -> Option<Timestamp> {
+        self.heap
+            .peek()
+            .map(|(deadline, _)| Timestamp::from_micros(deadline))
+    }
+
+    /// The deadline indexed for `slot_idx`.
+    #[must_use]
+    #[inline]
+    pub fn get(&self, slot_idx: usize) -> Option<Timestamp> {
+        self.heap.get(slot_idx as u32).map(Timestamp::from_micros)
     }
 
     #[must_use]
     #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.live == 0
-    }
-
-    #[must_use]
-    #[inline]
-    pub fn live_count(&self) -> usize {
-        self.live
-    }
-
-    #[must_use]
-    #[inline]
-    pub fn heap_len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.heap.len()
     }
 
     #[must_use]
     #[inline]
-    pub fn stale_popped_count(&self) -> usize {
-        self.stale_popped
-    }
-
-    #[must_use]
-    #[inline]
-    pub fn rebuild_count(&self) -> usize {
-        self.rebuild_count
-    }
-
-    #[must_use]
-    #[inline]
-    pub fn amplification_ratio(&self) -> f64 {
-        if self.live == 0 {
-            self.heap.len() as f64
-        } else {
-            self.heap.len() as f64 / self.live as f64
-        }
+    pub fn is_empty(&self) -> bool {
+        self.heap.is_empty()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::work::WorkCounters;
     use std::net::SocketAddr;
 
     fn ts(micros: u64) -> Timestamp {
@@ -291,19 +152,18 @@ mod tests {
         let s0 = insert_slot(&mut arena, "p0");
         let mut idx = DenseDueIndex::default();
 
-        idx.set(s0, ts(100), &mut arena);
+        idx.set(s0, ts(100), &arena);
         assert_eq!(idx.len(), 1);
-        assert_eq!(idx.peek_min_deadline(&arena), Some(ts(100)));
+        assert_eq!(idx.earliest(), Some(ts(100)));
 
         let mut due = Vec::new();
-        idx.pop_due(ts(99), &mut arena, &mut due);
+        idx.pop_due(ts(99), &arena, &mut due);
         assert!(due.is_empty());
         assert_eq!(idx.len(), 1);
 
-        idx.pop_due(ts(100), &mut arena, &mut due);
+        idx.pop_due(ts(100), &arena, &mut due);
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].slot_idx, s0 as u32);
-        assert_eq!(idx.len(), 0);
         assert!(idx.is_empty());
     }
 
@@ -313,16 +173,22 @@ mod tests {
         let s0 = insert_slot(&mut arena, "p0");
         let mut idx = DenseDueIndex::default();
 
-        idx.set(s0, ts(100), &mut arena);
-        assert_eq!(idx.len(), 1);
-
-        idx.remove(s0, &mut arena);
+        idx.set(s0, ts(100), &arena);
+        idx.remove(s0);
         assert_eq!(idx.len(), 0);
-        assert_eq!(idx.peek_min_deadline(&arena), None);
+        assert_eq!(idx.earliest(), None);
 
         let mut due = Vec::new();
-        idx.pop_due(ts(200), &mut arena, &mut due);
+        idx.pop_due(ts(200), &arena, &mut due);
         assert!(due.is_empty());
+    }
+
+    #[test]
+    fn an_empty_slot_takes_no_deadline() {
+        let arena = new_test_arena(4);
+        let mut idx = DenseDueIndex::default();
+        idx.set(0, ts(100), &arena);
+        assert!(idx.is_empty());
     }
 
     #[test]
@@ -331,47 +197,21 @@ mod tests {
         let s0 = insert_slot(&mut arena, "p0");
         let mut idx = DenseDueIndex::default();
 
-        // 1. Overwrite later: 100 -> 200
-        idx.set(s0, ts(100), &mut arena);
-        idx.set(s0, ts(200), &mut arena);
+        idx.set(s0, ts(100), &arena);
+        idx.set(s0, ts(200), &arena);
         assert_eq!(idx.len(), 1);
-        assert_eq!(idx.peek_min_deadline(&arena), Some(ts(200)));
+        assert_eq!(idx.earliest(), Some(ts(200)));
 
         let mut due = Vec::new();
-        idx.pop_due(ts(150), &mut arena, &mut due);
+        idx.pop_due(ts(150), &arena, &mut due);
         assert!(due.is_empty());
 
-        // 2. Overwrite earlier: 200 -> 50
-        idx.set(s0, ts(50), &mut arena);
-        assert_eq!(idx.len(), 1);
-        assert_eq!(idx.peek_min_deadline(&arena), Some(ts(50)));
-
-        idx.pop_due(ts(50), &mut arena, &mut due);
+        idx.set(s0, ts(50), &arena);
+        assert_eq!(idx.earliest(), Some(ts(50)));
+        idx.pop_due(ts(50), &arena, &mut due);
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].slot_idx, s0 as u32);
-        assert_eq!(idx.len(), 0);
-    }
-
-    #[test]
-    fn repeated_overwrite_in_same_slot_invalidates_all_predecessors() {
-        let mut arena = new_test_arena(4);
-        let s0 = insert_slot(&mut arena, "p0");
-        let mut idx = DenseDueIndex::default();
-
-        idx.set(s0, ts(10), &mut arena);
-        idx.set(s0, ts(20), &mut arena);
-        idx.set(s0, ts(30), &mut arena);
-        assert_eq!(idx.len(), 1);
-        assert_eq!(idx.peek_min_deadline(&arena), Some(ts(30)));
-
-        let mut due = Vec::new();
-        idx.pop_due(ts(25), &mut arena, &mut due);
-        assert!(due.is_empty());
-
-        idx.pop_due(ts(30), &mut arena, &mut due);
-        assert_eq!(due.len(), 1);
-        assert_eq!(due[0].slot_idx, s0 as u32);
-        assert_eq!(idx.len(), 0);
+        assert!(idx.is_empty());
     }
 
     #[test]
@@ -382,43 +222,33 @@ mod tests {
         let s2 = insert_slot(&mut arena, "p2");
         let mut idx = DenseDueIndex::default();
 
-        idx.set(s0, ts(300), &mut arena);
-        idx.set(s1, ts(100), &mut arena);
-        idx.set(s2, ts(200), &mut arena);
-        assert_eq!(idx.len(), 3);
-        assert_eq!(idx.peek_min_deadline(&arena), Some(ts(100)));
+        idx.set(s0, ts(300), &arena);
+        idx.set(s1, ts(100), &arena);
+        idx.set(s2, ts(200), &arena);
+        assert_eq!(idx.earliest(), Some(ts(100)));
 
         let mut due = Vec::new();
-        idx.pop_due(ts(250), &mut arena, &mut due);
+        idx.pop_due(ts(250), &arena, &mut due);
         assert_eq!(due.len(), 2);
         assert_eq!(due[0].slot_idx, s1 as u32);
         assert_eq!(due[1].slot_idx, s2 as u32);
-        assert_eq!(idx.len(), 1);
-        assert_eq!(idx.peek_min_deadline(&arena), Some(ts(300)));
+        assert_eq!(idx.earliest(), Some(ts(300)));
 
-        idx.pop_due(ts(300), &mut arena, &mut due);
+        idx.pop_due(ts(300), &arena, &mut due);
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].slot_idx, s0 as u32);
-        assert_eq!(idx.len(), 0);
     }
 
     #[test]
-    fn slot_removal_and_reuse_safety() {
+    fn a_reused_slot_fires_with_its_new_generation() {
         let mut arena = new_test_arena(64);
         let s0 = insert_slot(&mut arena, "peerA");
         let mut idx = DenseDueIndex::default();
 
-        // 1. Peer A occupies slot S, sets deadline A1 at 100
-        idx.set(s0, ts(100), &mut arena);
-        assert_eq!(idx.len(), 1);
-
-        // 2. Remove peer A
-        // Index removes A, then arena removes slot
-        idx.remove(s0, &mut arena);
+        idx.set(s0, ts(100), &arena);
+        idx.remove(s0);
         arena.remove_by_slot(s0).unwrap();
-        assert_eq!(idx.len(), 0);
 
-        // 3. Reuse slot S for peer B
         let (s_reused, id_b) = loop {
             let (s, id) = arena.allocate_socket_id(0).unwrap();
             if s == s0 {
@@ -427,124 +257,17 @@ mod tests {
             let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
             arena.insert_at_slot(s, id, addr, "dummy");
         };
-        assert_eq!(s_reused, s0);
         let addr: SocketAddr = "127.0.0.1:5001".parse().unwrap();
         arena.insert_at_slot(s_reused, id_b, addr, "peerB");
+        idx.set(s_reused, ts(200), &arena);
 
-        // 4. Set deadline B1 at 200
-        idx.set(s_reused, ts(200), &mut arena);
-        assert_eq!(idx.len(), 1);
-
-        // 5. Advance time past A1 (100) but before B1 (200)
         let mut due = Vec::new();
-        idx.pop_due(ts(150), &mut arena, &mut due);
-        // A1 must be discarded without modifying/firing B
-        assert!(due.is_empty());
-        assert_eq!(idx.len(), 1);
-        assert_eq!(idx.peek_min_deadline(&arena), Some(ts(200)));
-
-        // 6. Time reaches B1 (200)
-        idx.pop_due(ts(200), &mut arena, &mut due);
+        idx.pop_due(ts(150), &arena, &mut due);
+        assert!(due.is_empty(), "peer A's cancelled deadline never fires");
+        idx.pop_due(ts(200), &arena, &mut due);
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].slot_idx, s_reused as u32);
         assert_eq!(due[0].generation, arena.slot_generation(s_reused));
-        assert_eq!(idx.len(), 0);
-    }
-
-    #[test]
-    fn rebuild_removes_stale_amplification_and_preserves_live_deadlines() {
-        let mut arena = new_test_arena(64);
-        let mut idx = DenseDueIndex::new(8, 2); // Floor 8, 2x ratio
-
-        let s0 = insert_slot(&mut arena, "p0");
-        let s1 = insert_slot(&mut arena, "p1");
-
-        // Set live deadlines
-        idx.set(s0, ts(100), &mut arena);
-        idx.set(s1, ts(200), &mut arena);
-        assert_eq!(idx.live_count(), 2);
-        assert_eq!(idx.heap_len(), 2);
-
-        // Create churn on s0: 10 reschedules
-        for i in 1..=10 {
-            idx.set(s0, ts(100 + i), &mut arena);
-        }
-
-        // Rebuild should have triggered when heap_len > 8 && heap_len > 2 * 2
-        assert!(idx.rebuild_count() > 0);
-        // Explicit rebuild purges all remaining lazy stale entries
-        idx.rebuild(&arena);
-        assert_eq!(idx.live_count(), 2);
-        assert_eq!(idx.heap_len(), 2);
-        assert_eq!(idx.peek_min_deadline(&arena), Some(ts(110)));
-
-        let mut due = Vec::new();
-        idx.pop_due(ts(200), &mut arena, &mut due);
-        assert_eq!(due.len(), 2);
-        assert_eq!(idx.live_count(), 0);
-    }
-
-    #[test]
-    fn cancel_all_deadlines_purges_stale_heap_entries() {
-        let mut arena = new_test_arena(128);
-        let mut idx = DenseDueIndex::new(32, 2); // Floor 32, 2x ratio
-        let mut slots = Vec::new();
-        for i in 0..50 {
-            let s = insert_slot(&mut arena, "peer");
-            slots.push(s);
-            idx.set(s, ts(100 + i as u64), &mut arena);
-        }
-        assert_eq!(idx.live_count(), 50);
-        assert_eq!(idx.heap_len(), 50);
-
-        // Reschedule each slot twice to generate stale heap entries
-        for &s in &slots {
-            idx.set(s, ts(500), &mut arena);
-            idx.set(s, ts(1000), &mut arena);
-        }
-        assert_eq!(idx.live_count(), 50);
-        assert!(idx.heap_len() >= 50);
-
-        // Cancel all 50 deadlines
-        for &s in &slots {
-            idx.remove(s, &mut arena);
-        }
-        assert_eq!(idx.live_count(), 0);
-        // With live == 0 and heap_len > floor (32), rebuild triggered on remove
-        // and purged all stale entries down to 0!
-        assert_eq!(idx.heap_len(), 0);
-        assert_eq!(idx.peek_min_deadline(&arena), None);
-    }
-
-    #[test]
-    fn partial_cancellation_maintains_heap_live_ratio_bound() {
-        let mut arena = new_test_arena(256);
-        let mut idx = DenseDueIndex::new(32, 2); // Floor 32, 2x ratio
-        let mut slots = Vec::new();
-        for i in 0..100 {
-            let s = insert_slot(&mut arena, "peer");
-            slots.push(s);
-            idx.set(s, ts(100 + i as u64), &mut arena);
-        }
-        assert_eq!(idx.live_count(), 100);
-
-        // Churn: reschedule each slot twice
-        for &s in &slots {
-            idx.set(s, ts(500), &mut arena);
-            idx.set(s, ts(1000), &mut arena);
-        }
-
-        // Cancel 90 deadlines, leaving 10 live
-        for &s in &slots[..90] {
-            idx.remove(s, &mut arena);
-        }
-        assert_eq!(idx.live_count(), 10);
-        // Heap must be strictly bounded to live * ratio or <= floor
-        assert!(
-            idx.heap_len() <= 32 || idx.heap_len() <= idx.live_count() * 2,
-            "heap_len {} must be bounded by floor or live*ratio",
-            idx.heap_len()
-        );
     }
 
     #[test]
@@ -557,20 +280,45 @@ mod tests {
         let u31_max = 0x7fff_ffffu64;
         let u64_large = u64::MAX - 1000;
 
-        idx.set(s0, ts(u31_max), &mut arena);
-        idx.set(s1, ts(u64_large), &mut arena);
-        assert_eq!(idx.peek_min_deadline(&arena), Some(ts(u31_max)));
+        idx.set(s0, ts(u31_max), &arena);
+        idx.set(s1, ts(u64_large), &arena);
+        assert_eq!(idx.earliest(), Some(ts(u31_max)));
 
         let mut due = Vec::new();
-        idx.pop_due(ts(u31_max), &mut arena, &mut due);
+        idx.pop_due(ts(u31_max), &arena, &mut due);
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].slot_idx, s0 as u32);
-        assert_eq!(idx.peek_min_deadline(&arena), Some(ts(u64_large)));
+        assert_eq!(idx.earliest(), Some(ts(u64_large)));
 
-        idx.pop_due(ts(u64_large), &mut arena, &mut due);
+        idx.pop_due(ts(u64_large), &arena, &mut due);
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].slot_idx, s1 as u32);
         assert!(idx.is_empty());
+    }
+
+    /// F05: rescheduling every slot of a full 4,096-slot arena in both
+    /// directions never costs one call more than a logarithmic number of
+    /// node moves, and the earliest deadline is read without any.
+    #[test]
+    fn every_call_does_logarithmic_work() {
+        let mut arena = new_test_arena(4_096);
+        let slots: Vec<usize> = (0..4_096).map(|_| insert_slot(&mut arena, "p")).collect();
+        let mut idx = DenseDueIndex::default();
+        let mut worst = 0;
+        for round in 0..8u64 {
+            for (i, &slot) in slots.iter().enumerate() {
+                let deadline = if round % 2 == 0 {
+                    1_000_000 + round * 10_000 + i as u64
+                } else {
+                    1_000_000 - round * 10_000 - i as u64
+                };
+                let ((), work) = WorkCounters::measure(|| idx.set(slot, ts(deadline), &arena));
+                worst = worst.max(work.heap_entries_visited);
+            }
+        }
+        assert!(worst <= 12, "worst set: {worst} node moves");
+        let (_, peek) = WorkCounters::measure(|| idx.earliest());
+        assert_eq!(peek.heap_entries_visited, 0);
     }
 
     proptest::proptest! {
@@ -590,31 +338,27 @@ mod tests {
                 slots.push(slot_idx);
             }
 
-            let mut idx = DenseDueIndex::new(8, 2);
+            let mut idx = DenseDueIndex::default();
             let mut ref_map = std::collections::HashMap::<usize, u64>::new();
 
             for (slot_choice, op_type, value) in ops {
                 let slot_idx = slots[slot_choice];
                 match op_type {
                     0 => {
-                        // Set
-                        idx.set(slot_idx, ts(value), &mut arena);
+                        idx.set(slot_idx, ts(value), &arena);
                         ref_map.insert(slot_idx, value);
                     }
                     1 => {
-                        // Remove
-                        idx.remove(slot_idx, &mut arena);
+                        idx.remove(slot_idx);
                         ref_map.remove(&slot_idx);
                     }
                     2 => {
-                        // Peek
                         let expected = ref_map.values().min().copied().map(ts);
-                        assert_eq!(idx.peek_min_deadline(&arena), expected);
+                        assert_eq!(idx.earliest(), expected);
                     }
                     _ => {
-                        // Pop due
                         let mut due = Vec::new();
-                        idx.pop_due(ts(value), &mut arena, &mut due);
+                        idx.pop_due(ts(value), &arena, &mut due);
                         let mut ref_due = Vec::new();
                         ref_map.retain(|&slot, &mut deadline| {
                             if deadline <= value {
@@ -627,7 +371,7 @@ mod tests {
                         assert_eq!(due.len(), ref_due.len());
                     }
                 }
-                assert_eq!(idx.live_count(), ref_map.len());
+                assert_eq!(idx.len(), ref_map.len());
             }
         }
     }

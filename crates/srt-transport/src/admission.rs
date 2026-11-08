@@ -1075,7 +1075,6 @@ pub struct PeerTable {
     idle_deadlines: DueIndex<PhysicalPeerKey>,
     deadlines: DenseDueIndex,
     group_deadlines: DueIndex<GroupDeadlineKey>,
-    group_deadline_values: HashMap<GroupDeadlineKey, u64>,
     ready: VecDeque<PeerSlotId>,
     event_ready: VecDeque<PeerSlotId>,
     group_ready: VecDeque<GroupReadyKey>,
@@ -1263,7 +1262,6 @@ impl PeerTable {
             idle_deadlines: DueIndex::default(),
             deadlines: DenseDueIndex::default(),
             group_deadlines: DueIndex::default(),
-            group_deadline_values: HashMap::new(),
             ready: VecDeque::new(),
             event_ready: VecDeque::new(),
             group_ready: VecDeque::new(),
@@ -1437,25 +1435,13 @@ impl PeerTable {
         let new_deadline = group
             .legs
             .get(&member_id)
-            .and_then(|leg| leg.timers.next_deadline())
-            .map(|deadline| deadline.as_micros());
-        let old_deadline = self.group_deadline_values.get(&deadline_key).copied();
-        if old_deadline == new_deadline {
+            .and_then(|leg| leg.timers.next_deadline());
+        if self.group_deadlines.get(&deadline_key) == new_deadline {
             return;
         }
-        if old_deadline.is_some() {
-            self.group_deadlines.remove(&deadline_key);
-        }
         match new_deadline {
-            Some(deadline) => {
-                self.group_deadline_values
-                    .insert(deadline_key.clone(), deadline);
-                self.group_deadlines
-                    .set(deadline_key, Timestamp::from_micros(deadline));
-            }
-            None => {
-                self.group_deadline_values.remove(&deadline_key);
-            }
+            Some(deadline) => self.group_deadlines.set(deadline_key, deadline),
+            None => self.group_deadlines.remove(&deadline_key),
         }
     }
 
@@ -1468,14 +1454,18 @@ impl PeerTable {
             })
             .map(|entry| entry.last_datagram_at);
         match last_datagram {
-            Some(last_datagram) => self.idle_deadlines.set(peer, last_datagram),
+            // Refreshed on every accepted datagram, so only ever moved
+            // earlier here: a later activity stamp leaves the entry where it
+            // is, and the idle prune re-indexes it from the peer's real stamp
+            // when it surfaces. No per-datagram heap work.
+            Some(last_datagram) => self.idle_deadlines.set_no_later(peer, last_datagram),
             None => self.idle_deadlines.remove(&peer),
         }
     }
 
     fn detach_peer_for_group(&mut self, peer: &PhysicalPeerKey) -> Option<AdmissionPeer> {
         let slot_idx = self.slot_index_for_key(peer)?;
-        self.deadlines.remove(slot_idx, &mut self.slots);
+        self.deadlines.remove(slot_idx);
         self.half_open_deadlines.remove(peer);
         self.idle_deadlines.remove(peer);
         self.slots.clear_ready(slot_idx);
@@ -2911,7 +2901,7 @@ impl PeerTable {
     /// can only over-report, which the next bounded prune clears.
     #[must_use]
     pub fn has_idle_due(&self, now: Timestamp, idle_timeout: Duration) -> bool {
-        self.idle_deadlines.earliest_hint().is_some_and(|last| {
+        self.idle_deadlines.earliest().is_some_and(|last| {
             last.as_micros()
                 .saturating_add(duration_micros_saturating(idle_timeout))
                 <= now.as_micros()
@@ -3154,7 +3144,7 @@ impl PeerTable {
         let mut due = Vec::new();
         let (visited, due_remaining) =
             self.deadlines
-                .pop_due_bounded(now, &mut self.slots, max_work, &mut due);
+                .pop_due_bounded(now, &self.slots, max_work, &mut due);
         for slot_id in due {
             let slot_idx = slot_id.slot_idx as usize;
             if self.peer_slot_output_quarantined(slot_idx) {
@@ -3279,13 +3269,13 @@ impl PeerTable {
             if entry.output_faulted {
                 // Quarantined: leaving a live deadline would keep the table
                 // reporting due work it will never act on.
-                self.deadlines.remove(slot_idx, &mut self.slots);
+                self.deadlines.remove(slot_idx);
                 return;
             }
             if let Some(deadline) = entry.timers.next_deadline() {
-                self.deadlines.set(slot_idx, deadline, &mut self.slots);
+                self.deadlines.set(slot_idx, deadline, &self.slots);
             } else {
-                self.deadlines.remove(slot_idx, &mut self.slots);
+                self.deadlines.remove(slot_idx);
             }
         }
     }
@@ -3542,7 +3532,6 @@ impl PeerTable {
             .group_deadlines
             .pop_due_bounded(now, max_work, &mut due);
         for deadline_key in due {
-            self.group_deadline_values.remove(&deadline_key);
             self.mark_group_leg_ready(&deadline_key.group.key, deadline_key.member_id);
         }
         result
@@ -3858,7 +3847,7 @@ impl PeerTable {
         idle_timeout: Duration,
         default_us: u64,
     ) -> u64 {
-        let Some(deadline) = self.idle_deadlines.peek_min_deadline() else {
+        let Some(deadline) = self.idle_deadlines.earliest() else {
             return default_us;
         };
         let cutoff_micros = deadline
@@ -3899,12 +3888,12 @@ impl PeerTable {
     /// earlier direct-peer deadline whenever the group had any deadline).
     pub fn time_until_next_deadline(&mut self, now: Timestamp, default_us: u64) -> u64 {
         self.last_now = now;
-        let peer_deadline = self.deadlines.peek_min_deadline(&self.slots);
-        // `group_deadlines` is a `DueIndex` kept in sync with every leg's
-        // own timer (see its insert/remove call sites), so this is an
-        // O(log n) peek, not the O(groups × legs) full scan this used to
-        // be before that index existed (Opus review finding 6).
-        let group_deadline = self.group_deadlines.peek_min_deadline();
+        let peer_deadline = self.deadlines.earliest();
+        // Both indexes are exact indexed heaps kept in sync with every
+        // peer's and leg's own timers, so these are O(1) root reads: no
+        // stale-head cleanup and no O(groups × legs) scan, whatever the
+        // population (Opus review finding 6; F05).
+        let group_deadline = self.group_deadlines.earliest();
         match (peer_deadline, group_deadline) {
             (Some(a), Some(b)) => a.min(b).saturating_sub(now),
             (Some(deadline), None) | (None, Some(deadline)) => deadline.saturating_sub(now),
@@ -4326,7 +4315,15 @@ impl PeerTable {
         });
         let group = self.groups.remove(&key)?;
         self.logical_peers.remove(&group.logical_peer);
+        let token = GroupReadyKey {
+            key,
+            generation: group.generation,
+        };
         for (member_id, leg) in &group.legs {
+            self.group_deadlines.remove(&GroupDeadlineKey {
+                group: token.clone(),
+                member_id: *member_id,
+            });
             let connection = group
                 .group
                 .member(*member_id)
@@ -4413,6 +4410,12 @@ impl PeerTable {
     #[cfg(test)]
     pub(crate) fn contains(&self, peer: &std::net::SocketAddr) -> bool {
         self.physical_for_address(*peer).is_some()
+    }
+
+    /// Test-only: every live logical peer.
+    #[cfg(test)]
+    pub(crate) fn logical_peer_ids_for_test(&self) -> Vec<LogicalPeerId> {
+        self.logical_peers.keys().copied().collect()
     }
 
     /// Test-only: assert the route indexes answer, for every occupied slot's
@@ -4514,7 +4517,7 @@ impl PeerTable {
         self.idle_deadlines.remove(&peer);
         if let Some(slot_idx) = self.slot_index_for_key(&peer) {
             self.routes.sync(slot_idx as u32, None);
-            self.deadlines.remove(slot_idx, &mut self.slots);
+            self.deadlines.remove(slot_idx);
             self.slots.clear_ready(slot_idx);
             self.slots.clear_event_ready(slot_idx);
         }
@@ -4800,7 +4803,7 @@ fn within_output_budget(report: &OutputDrainReport, budget: OutputDrainBudget) -
 /// budget (distinct from the action count, which the caller already
 /// tracks against `self.ready`/due-remaining state directly).
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use proptest::prelude::*;
 
@@ -5119,6 +5122,81 @@ mod tests {
         let conclusion = induct(table, peer, passphrase, options, telemetry, now);
         let admit = table.admit(peer, &conclusion, now, options, 0, 1, telemetry);
         (admit, conclusion)
+    }
+
+    /// `peers` established callers on one table, each through a full
+    /// handshake from its own IPv4 address.
+    pub(crate) fn established_callers(
+        table: &mut PeerTable,
+        peers: usize,
+        options: &AdmissionOptions,
+        telemetry: &IngressTelemetry,
+    ) -> Vec<(std::net::SocketAddr, SrtConnection)> {
+        (0..peers)
+            .map(|i| {
+                let peer = std::net::SocketAddr::from(([10, 1, (i >> 8) as u8, i as u8], 9000));
+                let (mut caller, conclusion) =
+                    admit_up_to_conclusion(table, peer, 0x100 + i as u32, options, telemetry);
+                admit_conclusion(table, peer, &mut caller, &conclusion, options, telemetry);
+                (peer, caller)
+            })
+            .collect()
+    }
+
+    /// F05: established DATA refreshes the idle index on every datagram, and
+    /// the Owner's report finalization asks for the next idle and protocol
+    /// deadline outside any action budget. Neither may cost work that grows
+    /// with the peer population: no heap rebuild on the datagram that
+    /// crosses a stale-amplification threshold, no stale-head cleanup on the
+    /// finalization after churn. Bound: logarithmic per call.
+    #[test]
+    fn listener_deadline_indexes_do_bounded_work_per_call() {
+        let options = AdmissionOptions::basic(0x3335, 0, false);
+        let telemetry = IngressTelemetry::new();
+        for peers in [64usize, 512, 4_096] {
+            let mut table = PeerTable::with_config(PeerTableConfig {
+                max_peers: peers,
+                max_half_open_peers: peers,
+                max_established_peers: peers,
+                ..PeerTableConfig::default()
+            });
+            let mut callers = established_callers(&mut table, peers, &options, &telemetry);
+            let limit = 4 * u64::from(peers.ilog2()) + 8;
+            let mut worst_datagram = crate::work::WorkCounters::default();
+            let mut out = Vec::new();
+            for round in 0..8u64 {
+                let now = Timestamp::from_micros(10_000 + round * 1_000);
+                for (peer, caller) in &mut callers {
+                    caller.send(b"refresh", now).expect("caller sends DATA");
+                    let datagram = next_packet(caller);
+                    let (admit, work) = crate::work::WorkCounters::measure(|| {
+                        table.admit(*peer, &datagram, now, &options, 0, 1, &telemetry)
+                    });
+                    assert_eq!(admit, Admit::Fed);
+                    if work.heap_entries_visited + work.heap_entries_cloned
+                        > worst_datagram.heap_entries_visited + worst_datagram.heap_entries_cloned
+                    {
+                        worst_datagram = work;
+                    }
+                }
+                // A service visit reschedules every touched peer's protocol
+                // deadline; its own work is budgeted and not measured here.
+                table.poll_outbound(now, &mut out);
+            }
+            // Finalization with a zero service budget: nothing pruned or
+            // popped since the churn, then both deadline queries.
+            let now = Timestamp::from_micros(20_000);
+            let (_, finalize) = crate::work::WorkCounters::measure(|| {
+                table.time_until_next_deadline(now, 100_000)
+                    + table.time_until_idle_deadline(now, Duration::from_secs(5), 100_000)
+            });
+            for (what, work) in [("datagram", worst_datagram), ("finalization", finalize)] {
+                assert!(
+                    work.heap_entries_visited + work.heap_entries_cloned <= limit,
+                    "{what} at {peers} peers: {work:?} (limit {limit})"
+                );
+            }
+        }
     }
 
     /// F06: a handshake that names no slot -- an INDUCTION from a caller
@@ -5938,7 +6016,7 @@ mod tests {
         table.deadlines.set(
             slot_idx,
             Timestamp::from_micros(now.as_micros() + 10),
-            &mut table.slots,
+            &table.slots,
         );
         arm_group_leg_deadline(&mut table, now, 20);
         assert_eq!(table.time_until_next_deadline(now, 999), 10);
@@ -5949,7 +6027,7 @@ mod tests {
         table.deadlines.set(
             slot_idx,
             Timestamp::from_micros(now.as_micros() + 20),
-            &mut table.slots,
+            &table.slots,
         );
         arm_group_leg_deadline(&mut table, now, 10);
         assert_eq!(table.time_until_next_deadline(now, 999), 10);
@@ -5960,7 +6038,7 @@ mod tests {
         table.deadlines.set(
             slot_idx,
             Timestamp::from_micros(now.as_micros() + 15),
-            &mut table.slots,
+            &table.slots,
         );
         assert_eq!(table.time_until_next_deadline(now, 999), 15);
 
@@ -5981,13 +6059,13 @@ mod tests {
         table.deadlines.set(
             slot_idx,
             Timestamp::from_micros(now.as_micros() - 5),
-            &mut table.slots,
+            &table.slots,
         );
         arm_group_leg_deadline(&mut table, now, 30);
         assert_eq!(table.time_until_next_deadline(now, 999), 0);
     }
 
-    fn next_packet(conn: &mut SrtConnection) -> Vec<u8> {
+    pub(crate) fn next_packet(conn: &mut SrtConnection) -> Vec<u8> {
         loop {
             match conn
                 .poll_output()
@@ -7049,6 +7127,59 @@ mod tests {
                 .expect("entry present")
                 .connected,
             "the active peer must remain connected"
+        );
+    }
+
+    /// F05: an accepted datagram only ever moves a peer's idle entry
+    /// earlier, so an active peer's entry can surface before its real idle
+    /// deadline. The prune must re-index it from the real activity stamp:
+    /// the peer is left alone then, closed once it really goes quiet, and
+    /// the idle wait is exact again afterwards.
+    #[test]
+    fn a_refreshed_peer_surfacing_early_is_reindexed_and_closed_when_quiet() {
+        let peer = "127.0.0.1:11012".parse().expect("address");
+        let options = AdmissionOptions::basic(0x9999, 20, false);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        let (mut caller, conclusion) =
+            admit_up_to_conclusion(&mut table, peer, 0xCCCC, &options, &telemetry);
+        admit_conclusion(
+            &mut table,
+            peer,
+            &mut caller,
+            &conclusion,
+            &options,
+            &telemetry,
+        );
+        let mut events = Vec::new();
+        table.poll_events(&mut events);
+
+        let refreshed_at = Timestamp::from_micros(1_500_000);
+        caller.send(b"still here", refreshed_at).expect("send");
+        let refresh = next_packet(&mut caller);
+        assert_eq!(
+            table.admit(peer, &refresh, refreshed_at, &options, 0, 1, &telemetry),
+            Admit::Fed
+        );
+
+        let idle_timeout = Duration::from_micros(1_000_000);
+        let early = Timestamp::from_micros(2_000_000);
+        assert!(
+            table.has_idle_due(early, idle_timeout),
+            "conservative entry"
+        );
+        assert_eq!(table.prune_idle(early, idle_timeout), 0, "still active");
+        assert_eq!(
+            table.time_until_idle_deadline(early, idle_timeout, u64::MAX),
+            500_000,
+            "re-indexed at the real activity stamp"
+        );
+        assert!(!table.has_idle_due(early, idle_timeout));
+        let quiet = Timestamp::from_micros(2_500_000);
+        assert_eq!(
+            table.prune_idle(quiet, idle_timeout),
+            1,
+            "closed once quiet"
         );
     }
 
