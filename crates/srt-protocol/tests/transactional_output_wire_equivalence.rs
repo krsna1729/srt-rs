@@ -2,6 +2,7 @@
 
 use bytes::Bytes;
 use srt_proto::crypto::{CipherMode, KeyLength};
+use srt_proto::test_support::wire_checker::check_pair;
 use srt_proto::wire::SrtPacket;
 use srt_proto::{
     ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, ErrorKind, OutputInto,
@@ -48,6 +49,7 @@ fn establish_pair(
     // A zero-transit handshake: the listener's TSBPD base comes from the
     // CONCLUSION timestamp, so it must see the same transit as DATA.
     let now = ts(1_000);
+    check_pair(&mut caller, &mut listener);
     caller.connect(now).expect("caller connect");
 
     for _ in 0..10 {

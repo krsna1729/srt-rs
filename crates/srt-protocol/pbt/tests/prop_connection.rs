@@ -10,6 +10,7 @@
 
 use proptest::prelude::*;
 use srt_proto::handshake::DEFAULT_MTU;
+use srt_proto::test_support::wire_checker::check_pair;
 use srt_proto::wire::{ControlType, SrtPacket};
 use srt_proto::{
     ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, SrtConnection, TimerId,
@@ -135,6 +136,7 @@ proptest! {
         let mut caller = SrtConnection::new_caller(make_opts(1));
         let mut listener = SrtConnection::new_listener(make_opts(2));
 
+        check_pair(&mut caller, &mut listener);
         caller.connect(now).expect("接続は成功する想定");
 
         // INDUCTION
@@ -1114,6 +1116,7 @@ proptest! {
         let mut caller = SrtConnection::new_caller(make_opts(1));
         let mut listener = SrtConnection::new_listener(make_opts(2));
 
+        check_pair(&mut caller, &mut listener);
         caller.connect(now).expect("接続は成功する想定");
 
         let induction_req = drain_packets(&mut caller);
@@ -1247,12 +1250,14 @@ fn extract_received_data(events: &[ConnectionEvent]) -> Vec<u8> {
         .collect()
 }
 
-/// ハンドシェイクを完了させる
+/// ハンドシェイクを完了させる, with both ends under the strict wire checker
+/// (every later `drain_packets` emission is checked before any loss).
 fn establish_connection(
     caller: &mut SrtConnection,
     listener: &mut SrtConnection,
     now: &mut Timestamp,
 ) {
+    check_pair(caller, listener);
     caller.connect(*now).expect("connect should succeed");
 
     // INDUCTION

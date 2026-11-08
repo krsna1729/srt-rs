@@ -10,6 +10,7 @@
 //! by sleeping.
 
 use srt_proto::handshake::{HandshakePacket, HandshakeType};
+use srt_proto::test_support::wire_checker::check_pair;
 use srt_proto::wire::{ControlPacket, SrtPacket};
 use srt_proto::{
     ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, ErrorKind,
@@ -148,6 +149,7 @@ fn establish() -> Established {
         socket_id: LISTENER_SOCKET_ID,
         ..test_options()
     });
+    check_pair(&mut caller, &mut listener);
     caller.connect(ts(0)).expect("caller connects");
     let mut conclusion_request = None;
     let mut conclusion_response = None;

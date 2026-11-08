@@ -255,6 +255,48 @@ insertion, and application-event ownership require bounded allocations;
 measured 5/packet crate-side, with a generous 12/packet regression
 ceiling, documented in that file's header).
 
+**Strict wire checker.** Most tests run srt-rs against srt-rs, so srt-rs's
+own receiver decides what is acceptable, and an emitter regression it
+tolerates passes. The connected-wire fixtures therefore install
+`srt_proto::test_support::wire_checker` (built for this crate's tests and
+behind the opt-in `test-support` feature; production builds carry none of
+it). The hook sits in `SrtConnection::poll_output_into`, which
+`poll_output` delegates to, so every datagram is checked as it leaves the
+protocol, before any simulated loss, reordering or rewrite. The receive
+entry points record what the endpoint actually got (including packets a
+test fabricated or rewrote) as peer input, and negotiation-dependent rules
+are judged against that. The checker parses the raw header and CIF words
+itself rather than reusing `HandshakePacket::decode` or the connection's
+control validation, so it does not inherit their tolerance. A violation
+panics with the rule name and a packet summary.
+
+Each rule cites the libsrt 1.5.7 source it follows (`rule` module docs):
+INDUCTION request and response shape (ISN echo), CONCLUSION identity, ISN,
+cookie and extension categories, HSREQ/HSRSP role, version, REXMITFLG,
+STREAM and directional latency, KMRSP state byte order, SID/congestion
+bounds, GROUP validity, the word-swapped peer IP, DATA sequence continuity
+from the ISN, R only on retransmissions, nonzero message numbers, fragment
+boundaries, KK, one timestamp epoch and the destination ID, ACK sizes and
+the 31-bit ACK number, NAK encoding and frontier, ACKACK echo, reserved
+control fields and the DROPREQ shape. A sequence skip must be announced by a
+DROPREQ, sent or still queued when the connection drops; a bonded member's
+send-sequence override is judged at its next DATA. Profile rules libsrt and
+srt-rs deliberately differ on (live multi-packet messages) are
+`OptionalRule`s, off by default.
+
+Fixtures under the checker: `connected_pair`, `drive_handshake_to_connected`,
+`FlightHarness` and the handshake-rewrite helpers in `srt_connection.rs`;
+`establish_connection` and the manual handshakes in
+`tests/test_srt_connection.rs`; `tests/test_srt_group.rs`,
+`tests/handshake_admission.rs`, `tests/test_tsbpd_time_base.rs` and
+`tests/transactional_output_wire_equivalence.rs`; the `pbt` connection
+properties; and srt-transport's `deterministic_sim` and `tail_recovery`.
+Install it on a new caller/listener pair with
+`test_support::wire_checker::check_pair` before `connect`. A test that sets
+private state no wire could produce says so and opts out
+(`wire_checker = None`) or records the fixture context
+(`note_seeded_ack_number`, `record_received`).
+
 Fuzz targets under [`fuzz/`](fuzz/) (`cargo-fuzz`, nightly): decode paths
 and stateful connection input must never panic on attacker input. Run record and the panic they already
 caught: [VENDOR.md § Fuzzing](VENDOR.md#fuzzing).

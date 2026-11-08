@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use srt_proto::crypto::{CipherMode, CryptoContext, KeyFlag, KeyLength};
 use srt_proto::handshake::{GroupExtensionData, GroupType};
+use srt_proto::test_support::wire_checker::check_pair;
 use srt_proto::wire::{ControlPacket, ControlType, DataPacket, PacketPosition, SrtPacket};
 use srt_proto::{
     ConnectionEvent, ConnectionOptions, ConnectionOutput, ConnectionState, ConnectionStats,
@@ -89,12 +90,14 @@ fn capture_and_transfer(
     kk_fields
 }
 
-/// 接続が確立するまでパケットを交換
+/// 接続が確立するまでパケットを交換. Both ends run under the strict wire
+/// checker from their first datagram.
 fn establish_connection(
     caller: &mut SrtConnection,
     listener: &mut SrtConnection,
 ) -> Result<(), String> {
     let now = ts(0);
+    check_pair(caller, listener);
     caller.connect(now).map_err(|e| e.to_string())?;
 
     // 最大 10 ラウンドで接続確立を試みる. Every round runs at the connect
@@ -309,6 +312,7 @@ fn test_handshake_retransmits_after_packet_loss() {
     let mut caller = SrtConnection::new_caller(test_options());
     let mut listener = SrtConnection::new_listener(test_options());
 
+    check_pair(&mut caller, &mut listener);
     caller.connect(ts(0)).expect("caller connection starts");
     while caller.poll_output().unwrap().is_some() {}
 
@@ -377,6 +381,7 @@ fn encrypted_connections_generate_fresh_default_key_material() {
             socket_id: 0x2222,
             ..Default::default()
         });
+        check_pair(&mut caller, &mut listener);
         caller.connect(ts(0)).expect("start caller");
         transfer_caller_to_listener(&mut caller, &mut listener, ts(0));
         transfer_listener_to_caller(&mut listener, &mut caller, ts(1));
@@ -404,6 +409,7 @@ fn encrypted_connection_rejects_an_explicit_all_zero_sek() {
         socket_id: 0x2222,
         ..Default::default()
     });
+    check_pair(&mut caller, &mut listener);
     caller.connect(ts(0)).expect("start caller");
     transfer_caller_to_listener(&mut caller, &mut listener, ts(0));
 
@@ -432,6 +438,7 @@ fn listener_can_apply_stream_policy_before_encrypted_conclusion() {
     let mut caller = SrtConnection::new_caller(caller_opts);
     let mut listener = SrtConnection::new_listener(test_options());
 
+    check_pair(&mut caller, &mut listener);
     caller.connect(ts(0)).expect("caller connection starts");
     transfer_caller_to_listener(&mut caller, &mut listener, ts(0));
     transfer_listener_to_caller(&mut listener, &mut caller, ts(0));
@@ -486,6 +493,7 @@ fn listener_encryption_mismatches_fail_closed_with_km_errors() {
             tsbpd_delay: 0,
             ..ConnectionOptions::default()
         });
+        check_pair(&mut caller, &mut listener);
         caller.connect(ts(0)).expect("start caller");
         transfer_caller_to_listener(&mut caller, &mut listener, ts(0));
         transfer_listener_to_caller(&mut listener, &mut caller, ts(1));

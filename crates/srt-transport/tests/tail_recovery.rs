@@ -28,6 +28,7 @@
 //! absent. The sender's timeout is the only party left that can notice, which is
 //! why the assertions below check both endpoints.
 
+use srt_proto::test_support::wire_checker::check_pair;
 use srt_proto::wire::{DataPacket, SrtPacket};
 use srt_proto::{
     ConnectionOptions, ConnectionOutput, ConnectionState, OutputMeta, SrtConnection, TimerId,
@@ -132,6 +133,9 @@ fn connected_pair_with_tsbpd_delay(tsbpd_delay: u16) -> (Endpoint, Endpoint) {
         tsbpd_delay,
         ..ConnectionOptions::default()
     }));
+    // `move_outputs` drains through the checked output path, so every
+    // emission is held to libsrt's wire rules before its loss predicate.
+    check_pair(&mut caller.conn, &mut listener.conn);
     caller
         .conn
         .connect(Timestamp::from_micros(0))

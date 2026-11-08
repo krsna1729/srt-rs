@@ -17,6 +17,11 @@ mod srt_receiver;
 mod srt_sender;
 mod stats;
 pub mod stream_id;
+/// Test-only support: the strict wire checker for black-box fixtures.
+/// Built for this crate's tests and behind the opt-in `test-support`
+/// feature; production builds carry none of it.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 mod time;
 
 /// Supported sender-side SRT protocol component APIs.

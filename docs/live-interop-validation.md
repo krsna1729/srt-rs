@@ -67,6 +67,12 @@ lossy single-socket proxy at ~0.9 Mbps input cannot provide.
   [`VENDOR.md`](../crates/srt-protocol/VENDOR.md#protocol-compliance-remediation)
   for their regression evidence. The matching defaults used here are therefore
   a baseline rather than a limitation.
+- Between interop runs, srt-rs-to-srt-rs fixtures are held to the same
+  libsrt 1.5.7 wire rules by the strict wire checker
+  (`srt_proto::test_support::wire_checker`; see the srt-proto README,
+  "Testing"). It checks every emitted datagram, so an emitter regression
+  that srt-rs's own receiver tolerates fails the unit and integration tests
+  instead of waiting for this suite.
 
 ## Automation plan: capture these tests in `crates/srt-bench/tests/libsrt_interop.rs`
 
