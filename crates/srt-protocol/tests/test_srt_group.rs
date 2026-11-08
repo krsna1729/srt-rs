@@ -57,12 +57,14 @@ fn establish_pair_with_options(options: ConnectionOptions) -> (SrtConnection, Sr
         ..options
     });
     caller.connect(ts(0)).expect("caller should connect");
-    for round in 0..10 {
-        transfer(&mut caller, &mut listener, ts(round * 10_000));
+    // A zero-transit handshake: the listener's TSBPD base comes from the
+    // CONCLUSION timestamp, so it must see the same transit as DATA.
+    for _ in 0..10 {
+        transfer(&mut caller, &mut listener, ts(0));
         while let Some(output) = listener.poll_output().unwrap() {
             if let ConnectionOutput::SendPacket(packet) = output {
                 caller
-                    .feed_recv_buf(&packet, ts(round * 10_000))
+                    .feed_recv_buf(&packet, ts(0))
                     .expect("response should decode");
             }
         }

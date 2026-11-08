@@ -25,8 +25,10 @@ fn setup_pair() -> (SrtConnection, SrtConnection) {
     let mut caller = SrtConnection::new_caller(opts.clone());
     let mut listener = SrtConnection::new_listener(opts);
     caller.connect(ts(0)).unwrap();
-    for i in 0..10u64 {
-        let now = ts(i * 10_000);
+    // A zero-transit handshake: the listener's TSBPD base comes from the
+    // CONCLUSION timestamp, so it must see the same transit as DATA.
+    for _ in 0..10u64 {
+        let now = ts(0);
         for data in drain_sent(&mut caller) {
             let _ = listener.feed_recv_buf(&data, now);
         }

@@ -2484,8 +2484,9 @@ impl PreparedCaller {
     pub fn connection(&self, now: Timestamp) -> Result<SrtConnection, ConfigError> {
         let mut connection = self.session.caller(now)?;
         // Before the CONCLUSION response arrives: the peer MSS is turned into
-        // a datagram budget for this path's family there.
-        connection.set_ip_family(srt_proto::handshake::IpFamily::of(&self.remote));
+        // a datagram budget for this path's family there, and the remote IP
+        // fills the handshake's peer-IP field.
+        connection.set_peer_address(self.remote);
         Ok(connection)
     }
 

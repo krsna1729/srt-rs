@@ -1715,7 +1715,9 @@ fn libsrt_broadcast_group_interoperates_with_rust_listener() {
                     // caller's GROUP metadata in CONCLUSION. A real service
                     // would authorize this value before echoing it.
                     if let Some(group) = request.handshake.get_group_extension() {
-                        connection.set_group_extension(group);
+                        connection
+                            .set_group_extension(group)
+                            .expect("libsrt sends a valid GROUP");
                     }
                     AdmissionResolution::Accept
                 },

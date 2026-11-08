@@ -278,6 +278,9 @@ input-relative pacing), `set_listener_flow_control`,
 supported raw controls. Applications are not forced through the facade, but
 the facade remains the safer default because it validates typed units,
 composes overlays, accounts telemetry, and preserves admission ordering.
+`set_listener_group_extension` and `set_group_extension` refuse a GROUP that
+libsrt would refuse (an ID without `SRTGROUP_MASK`, or a type other than
+undefined, broadcast or backup).
 
 ## Security checklist
 

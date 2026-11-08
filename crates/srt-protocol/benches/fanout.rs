@@ -43,8 +43,11 @@ fn setup_connected_pair() -> (SrtConnection, SrtConnection) {
     let mut listener = SrtConnection::new_listener(connection_options());
     caller.connect(ts(0)).expect("connect");
 
-    for i in 0..10u64 {
-        let now = ts(i * 10_000);
+    // The handshake runs at the connect instant: the caller keeps its
+    // `connect` epoch, so the listener's TSBPD base must map caller time 0
+    // to local time 0 for zero-latency DATA to play when it arrives.
+    let now = ts(0);
+    for _ in 0..10 {
         for data in drain_sent(&mut caller) {
             let _ = listener.feed_recv_buf(&data, now);
         }

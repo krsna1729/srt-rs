@@ -65,11 +65,10 @@ pub const IP_UDP_HEADER_SIZE_IPV6: u32 = 48;
 ///
 /// The handshake MSS field is an IP-layer MTU, so turning it into an SRT
 /// datagram budget needs the path's IP + UDP header size. The handshake
-/// itself does not say which family the path uses (its peer-address field is
-/// advisory: this implementation writes the unspecified IPv4 address there,
-/// and libsrt's own `MinimumMSS` keys off the socket's `peer.family()`, not
-/// that field), so the transport, which knows the socket address, sets it
-/// with `SrtConnection::set_ip_family`.
+/// itself does not say which family the path uses (libsrt's own `MinimumMSS`
+/// keys off the socket's `peer.family()`, not the peer-IP field), so the
+/// transport, which knows the socket address, sets it with
+/// `SrtConnection::set_peer_address`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum IpFamily {
     /// IPv4 path (28 bytes of IP + UDP). The default when unset.
@@ -145,6 +144,15 @@ pub const SRT_REJ_FILTER: i32 = 14;
 /// `SRT_REJ_MESSAGEAPI`: the peers declare different transmission APIs
 /// (STREAM flag), which libsrt refuses in `processSrtMsg_HSREQ`.
 pub const SRT_REJ_MESSAGEAPI: i32 = 12;
+
+/// `SRT_REJ_CONGESTION`: incompatible congestion-controller type. Used when
+/// a listener's own congestion name cannot be emitted (see
+/// [`MAX_CONGESTION_NAME_BYTES`]).
+pub const SRT_REJ_CONGESTION: i32 = 13;
+
+/// Longest congestion-control name libsrt accepts, in bytes
+/// (`CSrtConfig::MAX_CONG_LENGTH`); it refuses empty names too.
+pub const MAX_CONGESTION_NAME_BYTES: usize = 16;
 
 /// `SRT_REJ_CRYPTO`: conflicting cryptographic configurations (libsrt
 /// builds with the AEAD API). Used when an AES-GCM session would need
@@ -329,8 +337,30 @@ pub struct GroupExtensionData {
     pub weight: u16,
 }
 
+impl GroupExtensionData {
+    /// Whether a libsrt peer accepts this GROUP extension: the ID carries
+    /// [`SRTGROUP_MASK`] and the type is one libsrt defines (below
+    /// `SRT_GTYPE_E_END`: undefined, broadcast, backup). libsrt's
+    /// `interpretGroup` refuses anything else (core.cpp:3317-3331), so an
+    /// outbound GROUP must satisfy it; a received one is still decoded raw
+    /// for policy inspection.
+    #[must_use]
+    pub const fn is_valid_for_libsrt(&self) -> bool {
+        self.group_id & SRTGROUP_MASK != 0
+            && matches!(self.group_type.to_u8(), 0..=MAX_LIBSRT_GROUP_TYPE)
+    }
+}
+
+/// Highest group type libsrt 1.5.7 defines (`SRT_GTYPE_BACKUP`).
+const MAX_LIBSRT_GROUP_TYPE: u8 = 2;
+
 /// Libsrt's marker bit for group identifiers.
 pub const SRTGROUP_MASK: u32 = 1 << 30;
+
+/// `SRT_REJ_GROUP`: incompatible group. Used when a listener's own GROUP
+/// extension is one libsrt would refuse
+/// ([`GroupExtensionData::is_valid_for_libsrt`]).
+pub const SRT_REJ_GROUP: i32 = 15;
 
 /// Synchronize group data on message boundaries.
 pub const GFLAG_SYNCONMSG: u8 = 0x01;
@@ -1046,6 +1076,15 @@ fn validate_extension_data(ext_type: ExtensionType, data: &[u8]) -> Result<(), E
         ExtensionType::Group if data.len() < 8 => Err(Error::invalid_data(
             "GROUP extension must be at least 8 bytes",
         )),
+        // libsrt refuses an empty SID and an empty or over-16-byte
+        // congestion block (`interpretSrtHandshake`, core.cpp:2950-2960 and
+        // 3001-3007), so neither is a shape a libsrt peer emits.
+        ExtensionType::Sid | ExtensionType::Congestion if data.is_empty() => {
+            Err(Error::invalid_data("empty SID or congestion extension"))
+        }
+        ExtensionType::Congestion if data.len() > MAX_CONGESTION_NAME_BYTES => {
+            Err(Error::invalid_data("congestion extension exceeds 16 bytes"))
+        }
         ExtensionType::Sid | ExtensionType::Congestion | ExtensionType::Filter
             if data.len() > 512 =>
         {
@@ -1118,40 +1157,46 @@ pub struct HsExtensionData {
     pub send_tsbpd_delay: u16,
 }
 
-/// Parse a peer IP.
-fn parse_peer_ip(bytes: &[u8]) -> IpAddr {
-    if bytes.len() < 16 {
-        return IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+/// libsrt copies an address into four native 32-bit words
+/// (`CIPAddress::ntop`, `common.cpp:162-175`) and byte-swaps every control
+/// word onto the wire (`CPacket::toNetworkByteOrder`, `packet.cpp:435-446`),
+/// so on the little-endian hosts it runs on each 4-byte group of the
+/// address arrives reversed: 192.0.2.1 is sent as `01 02 00 c0`.
+fn swap_peer_ip_words(bytes: [u8; 16]) -> [u8; 16] {
+    let mut swapped = [0u8; 16];
+    for (out, word) in swapped.chunks_exact_mut(4).zip(bytes.chunks_exact(4)) {
+        out.copy_from_slice(&[word[3], word[2], word[1], word[0]]);
     }
+    swapped
+}
 
-    // IPv4 case: the first 4 bytes are the IP, the rest are 0.
-    let is_ipv4 = bytes[4..16].iter().all(|&b| b == 0);
-
-    if is_ipv4 {
+/// Parse a peer IP in libsrt's layout ([`swap_peer_ip_words`]).
+fn parse_peer_ip(bytes: &[u8]) -> IpAddr {
+    let Some(wire) = bytes.get(..16).and_then(|b| <[u8; 16]>::try_from(b).ok()) else {
+        return IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+    };
+    let octets = swap_peer_ip_words(wire);
+    // IPv4 case: the first word is the IP, the rest are 0.
+    if octets[4..].iter().all(|&b| b == 0) {
         IpAddr::V4(std::net::Ipv4Addr::new(
-            bytes[0], bytes[1], bytes[2], bytes[3],
+            octets[0], octets[1], octets[2], octets[3],
         ))
     } else {
-        let mut octets = [0u8; 16];
-        octets.copy_from_slice(bytes);
         IpAddr::V6(std::net::Ipv6Addr::from(octets))
     }
 }
 
-/// Encode a peer IP.
+/// Encode a peer IP in libsrt's layout ([`swap_peer_ip_words`]).
 fn encode_peer_ip(ip: &IpAddr, buf: &mut Vec<u8>) {
-    match ip {
+    let octets = match ip {
         IpAddr::V4(ipv4) => {
-            write_bytes(buf, &ipv4.octets());
-            // The remaining 12 bytes are 0.
-            for _ in 0..12 {
-                write_u8(buf, 0);
-            }
+            let mut octets = [0u8; 16];
+            octets[..4].copy_from_slice(&ipv4.octets());
+            octets
         }
-        IpAddr::V6(ipv6) => {
-            write_bytes(buf, &ipv6.octets());
-        }
-    }
+        IpAddr::V6(ipv6) => ipv6.octets(),
+    };
+    write_bytes(buf, &swap_peer_ip_words(octets));
 }
 
 /// Handshake state.
@@ -1506,6 +1551,30 @@ pub fn peek_handshake(datagram: &[u8]) -> Option<HandshakePacket> {
 mod tests {
     use super::*;
     use crate::crypto_impl::KeyFlag;
+
+    /// The peer-IP field uses libsrt's layout on its little-endian hosts:
+    /// each 32-bit word of the address byte-reversed (`CIPAddress::ntop`
+    /// then `CPacket::toNetworkByteOrder`).
+    #[test]
+    fn peer_ip_uses_libsrts_word_swapped_layout() {
+        let cases: [(IpAddr, [u8; 16]); 2] = [
+            (
+                "192.0.2.1".parse().unwrap(),
+                [1, 2, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            ),
+            (
+                "2001:db8::1".parse().unwrap(),
+                [0xb8, 0x0d, 0x01, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
+            ),
+        ];
+        for (ip, wire) in cases {
+            let mut handshake = HandshakePacket::new_induction_request(1);
+            handshake.peer_ip = ip;
+            let packet = handshake.encode(0, 0);
+            assert_eq!(packet.control_info[32..48], wire, "{ip}");
+            assert_eq!(HandshakePacket::decode(&packet).unwrap().peer_ip, ip);
+        }
+    }
 
     /// Deterministic fixture salt for wire-format tests.
     ///
@@ -2063,17 +2132,34 @@ mod tests {
     }
 
     #[test]
-    fn test_sid_extension_empty() {
+    fn empty_config_strings_are_refused_like_libsrt() {
         let mut hs = conclusion_with_hs();
         hs.add_sid_extension("");
+        assert!(
+            HandshakePacket::decode(&hs.encode(1000, 0)).is_err(),
+            "an empty SID is refused"
+        );
 
-        let packet = hs.encode(1000, 0);
-        let decoded = HandshakePacket::decode(&packet)
-            .expect("decoding an encoded handshake packet should succeed");
+        let mut hs = conclusion_with_hs();
+        hs.add_congestion_extension("");
+        assert!(
+            HandshakePacket::decode(&hs.encode(1000, 0)).is_err(),
+            "an empty congestion name is refused"
+        );
+    }
 
-        // An empty string decodes to `Some("")` (all zero padding).
-        let sid = decoded.get_sid_extension();
-        assert_eq!(sid, Some("".to_string()));
+    /// libsrt's congestion block holds at most 16 bytes
+    /// (`CSrtConfig::MAX_CONG_LENGTH`): 16 decodes, 17 (20 padded) does not.
+    #[test]
+    fn congestion_names_above_16_bytes_are_refused_like_libsrt() {
+        let mut hs = conclusion_with_hs();
+        hs.add_congestion_extension(&"c".repeat(16));
+        let decoded = HandshakePacket::decode(&hs.encode(1000, 0)).expect("16 bytes decode");
+        assert_eq!(decoded.get_congestion_extension(), Some("c".repeat(16)));
+
+        let mut hs = conclusion_with_hs();
+        hs.add_congestion_extension(&"c".repeat(17));
+        assert!(HandshakePacket::decode(&hs.encode(1000, 0)).is_err());
     }
 
     #[test]
@@ -2221,7 +2307,7 @@ mod tests {
                 crate::crypto_impl::CipherMode::Ctr,
             )
             .encode(),
-            ExtensionType::Sid | ExtensionType::Congestion => Vec::new(),
+            ExtensionType::Sid | ExtensionType::Congestion => b"live".to_vec(),
             ExtensionType::Filter => b"fec\0".to_vec(),
             ExtensionType::Group => vec![0; 8],
         }

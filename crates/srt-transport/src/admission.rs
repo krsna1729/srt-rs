@@ -1922,8 +1922,9 @@ impl PeerTable {
         let mut conn = SrtConnection::new_listener(connection_options);
         // The peer's MSS is an IP-layer MTU: the path family (from the real
         // source address, not the handshake's advisory peer-IP field) turns
-        // it into a datagram budget.
-        conn.set_ip_family(srt_proto::handshake::IpFamily::of(&peer));
+        // it into a datagram budget. The source IP fills the peer-IP field of
+        // this side's handshakes.
+        conn.set_peer_address(peer);
         conn.set_handshake_timing(
             u64::try_from(options.handshake_retry_interval.as_micros()).unwrap_or(u64::MAX),
             u64::try_from(options.handshake_timeout.as_micros()).unwrap_or(u64::MAX),

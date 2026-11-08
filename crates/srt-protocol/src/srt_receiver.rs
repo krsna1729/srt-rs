@@ -103,6 +103,13 @@ pub const HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS: u32 = MAX_LIGHT_ACK_INTERVAL_PA
 /// Sequence numbers are carried in the low 31 bits of each wire word.
 const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
 
+/// Full ACK numbers are 31-bit, like libsrt's `CAckNo` (`m_iMaxAckSeqNo`).
+const ACK_NUMBER_MASK: u32 = 0x7FFF_FFFF;
+
+/// How far behind the current ACK number an ACKACK may still name a sent
+/// ACK: half the 31-bit domain.
+const ACK_NUMBER_HALF_DOMAIN: u64 = 1 << 30;
+
 /// Periodic ACK interval (microseconds).
 ///
 /// Haivision/UDT `COMM_SYN_INTERVAL_US` (10 ms). Named default **and floor**
@@ -1027,8 +1034,10 @@ pub struct ReceiverBuffer {
     /// Light ACK packet cadence for this connection (clamped).
     light_ack_interval_packets: u32,
 
-    /// ACK sequence number (the ACK packet's own number).
-    ack_number: u32,
+    /// Full ACKs generated so far. The current ACK number is its low 31
+    /// bits: libsrt's `CAckNo::incack` rolls 0x7fff_ffff -> 0, and the first
+    /// Full ACK is 1 (`common.h:728-735`, `core.cpp:8566-8571`).
+    full_acks_sent: u64,
 
     /// The sequence position the peer last confirmed via ACKACK. Periodic
     /// ACK generation is suppressed while this is unchanged (spec §4.8.1),
@@ -1192,7 +1201,7 @@ impl ReceiverBuffer {
             light_ack_interval_packets: LIGHT_ACK_INTERVAL_PACKETS,
             // The first Full ACK increments this to one, as required by the
             // wire specification.
-            ack_number: 0,
+            full_acks_sent: 0,
             tsbpd_delay_us: tsbpd_delay_ms as u64 * 1000,
             tsbpd_enabled: true,
             tsbpd_time_base,
@@ -1283,7 +1292,7 @@ impl ReceiverBuffer {
     pub fn should_emit_timer_ack(&self, now: Timestamp) -> bool {
         if u64::from(self.ack_interval_micros) <= ACK_INTERVAL_MICROS {
             self.ack_timestamps
-                .get_send_time(self.ack_number)
+                .get_send_time(self.ack_number())
                 .is_none_or(|last_full| {
                     now.as_micros().saturating_sub(last_full.as_micros())
                         >= u64::from(self.ack_interval_micros)
@@ -1746,7 +1755,7 @@ impl ReceiverBuffer {
     /// libsrt's `m_iRcvLastAckAck == ack` suppression check
     /// (`sendCtrl(UMSG_ACK)`, `core.cpp:8364`).
     fn position_already_ackacked(&self) -> bool {
-        self.last_ackacked_number == Some(self.ack_number)
+        self.last_ackacked_number == Some(self.ack_number())
             && self.last_ackacked_seq == Some(self.expected_seq)
     }
 
@@ -1787,16 +1796,21 @@ impl ReceiverBuffer {
 
     /// Whether `ack_number` could have come from an ACK this buffer sent.
     ///
-    /// The ACK's own number only ever increases, so a number above the
-    /// highest one assigned names an ACK that was never sent, and zero is
-    /// never assigned at all (a Light ACK carries zero in that field but is
-    /// never ACKACKed). An *old* number stays valid on purpose: libsrt
-    /// re-ACKACKs the same ACK number when it sees a duplicate Full ACK
-    /// (`srtcore/core.cpp` `processCtrlAck`), which is exactly what a lost
-    /// ACKACK produces, so age alone must not make the input malformed.
+    /// ACK numbers live in libsrt's 31-bit domain, which includes zero once
+    /// the counter has wrapped (`CAckNo::incack`); a Light ACK is told apart
+    /// by its 4-byte length, not by number zero, and is never ACKACKed. A
+    /// number is sent when it lies no further behind the current one than
+    /// the number of Full ACKs generated (and within half the domain), so a
+    /// number above the highest assigned names an ACK that was never sent.
+    /// An *old* number stays valid on purpose: libsrt re-ACKACKs the same
+    /// ACK number when it sees a duplicate Full ACK (`srtcore/core.cpp`
+    /// `processCtrlAck`), which is exactly what a lost ACKACK produces, so
+    /// age alone must not make the input malformed.
     #[must_use]
     pub fn ack_number_was_sent(&self, ack_number: u32) -> bool {
-        ack_number != 0 && self.ack_number.wrapping_sub(ack_number) < 0x8000_0000
+        let behind = self.ack_number().wrapping_sub(ack_number) & ACK_NUMBER_MASK;
+        ack_number <= ACK_NUMBER_MASK
+            && u64::from(behind) < self.full_acks_sent.min(ACK_NUMBER_HALF_DOMAIN)
     }
 
     /// Generate a Full ACK regardless of the Light ACK cadence.
@@ -1872,9 +1886,9 @@ impl ReceiverBuffer {
         self.packets_since_ack = 0;
 
         if !is_light {
-            self.ack_number = self.ack_number.wrapping_add(1);
+            self.full_acks_sent += 1;
             self.ack_timestamps
-                .record(self.ack_number, now, self.expected_seq);
+                .record(self.ack_number(), now, self.expected_seq);
             self.window_reopen_armed = !force_full && self.available_buffer_packets() == 0;
         }
         self.last_advertised_buffer = self.available_buffer_packets();
@@ -2202,9 +2216,15 @@ impl ReceiverBuffer {
         self.loss_list.set_base(self.expected_seq);
     }
 
-    /// Get the current ACK sequence number.
+    /// Get the current ACK sequence number (libsrt's 31-bit domain).
     pub fn ack_number(&self) -> u32 {
-        self.ack_number
+        (self.full_acks_sent & u64::from(ACK_NUMBER_MASK)) as u32
+    }
+
+    /// Seed the Full ACK counter, so a test can reach the ACK number wrap.
+    #[cfg(test)]
+    pub(crate) fn seed_full_acks_sent_for_test(&mut self, full_acks_sent: u64) {
+        self.full_acks_sent = full_acks_sent;
     }
 
     /// Get RTT.
@@ -2988,44 +3008,30 @@ mod tests {
         assert_eq!(ack.ack_seq, 1002);
     }
 
+    /// Full ACK numbers follow libsrt's 31-bit `CAckNo` domain: 0x7fff_ffff
+    /// rolls to 0, which is a real, ACKACK-able number (`common.h:728-735`).
     #[test]
-    fn ack_numbers_keep_all_32_bits_across_the_high_bit_and_wrap() {
+    fn ack_numbers_follow_libsrts_31_bit_domain_through_zero() {
         let mut receiver = ReceiverBuffer::new(1000, 120, Timestamp::from_micros(0), 0);
         receiver.set_tsbpd_enabled(false);
-        receiver.ack_number = 0x7FFF_FFFD;
+        assert!(!receiver.ack_number_was_sent(0), "nothing sent yet");
+        receiver.full_acks_sent = 0x7FFF_FFFD;
+        assert!(
+            !receiver.ack_number_was_sent(0),
+            "zero is not sent before the wrap"
+        );
 
-        for (index, expected) in [
-            0x7FFF_FFFE,
-            0x7FFF_FFFF,
-            0x8000_0000,
-            0xFFFF_FFFE,
-            0xFFFF_FFFF,
-            0,
-            1,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            if expected == 0xFFFF_FFFE {
-                receiver.ack_number = 0xFFFF_FFFD;
-            }
+        for (index, expected) in [0x7FFF_FFFE, 0x7FFF_FFFF, 0, 1].into_iter().enumerate() {
             let now = Timestamp::from_micros(10_000 + index as u64 * 10_000);
             let ack = receiver.generate_ack_inner(now, true);
             assert!(!ack.is_light);
             assert_eq!(receiver.ack_number(), expected);
-
-            // The ACK number is not a DATA sequence. Its high bit remains
-            // part of ACKACK identity, even though the cumulative position
-            // stays in the 31-bit DATA sequence space.
             assert_eq!(ack.ack_seq, 1000);
-            if expected & 0x8000_0000 != 0 {
-                receiver.handle_ackack(expected & 0x7FFF_FFFF, 0, now.add_micros(1_000));
-                assert_ne!(receiver.last_ackacked_number, Some(expected));
-            }
-            if expected != 0 {
-                receiver.handle_ackack(expected, 0, now.add_micros(2_000));
-                assert_eq!(receiver.last_ackacked_number, Some(expected));
-            }
+            assert!(receiver.ack_number_was_sent(expected));
+            assert!(!receiver.ack_number_was_sent(expected | 0x8000_0000));
+            assert!(!receiver.ack_number_was_sent((expected + 1) & 0x7FFF_FFFF));
+            receiver.handle_ackack(expected, 0, now.add_micros(2_000));
+            assert_eq!(receiver.last_ackacked_number, Some(expected));
         }
     }
 
@@ -3133,28 +3139,30 @@ mod tests {
         }
     }
 
-    /// ACK identity is all 32 bits across `u32::MAX -> 0`: two ACKs that
-    /// share a slot in different generations never alias.
+    /// ACK identity is the 31-bit number across `0x7fff_ffff -> 0`: two ACKs
+    /// that share a slot in different generations never alias.
     #[test]
     fn ackack_history_keeps_exact_identity_across_the_ack_number_wrap() {
+        const MASK: u32 = 0x7FFF_FFFF;
         let mut receiver = ackack_receiver();
-        let first = u32::MAX - 2;
-        receiver.ack_number = first.wrapping_sub(1);
+        let first = MASK - 2;
+        receiver.full_acks_sent = u64::from(first - 1);
         let horizon = ACKACK_HISTORY_ACKS;
         let spacing = 10_000u64;
-        let send_time = |ack_number: u32| spacing * (1 + u64::from(ack_number.wrapping_sub(first)));
+        let send_time =
+            |ack_number: u32| spacing * (1 + u64::from(ack_number.wrapping_sub(first) & MASK));
 
         // A full history whose oldest entry is `first`, straddling the wrap.
         let last = send_full_acks(&mut receiver, send_time(first), spacing, u64::from(horizon));
-        assert_eq!(receiver.ack_number(), first.wrapping_add(horizon - 1));
+        assert_eq!(receiver.ack_number(), (first + horizon - 1) & MASK);
         let now = last.add_micros(1_000);
-        for ack_number in [u32::MAX, 1] {
+        for ack_number in [MASK, 0, 1] {
             let sample = (now.as_micros() - send_time(ack_number)) as u32;
             assert_ackack_samples(&mut receiver, ack_number, now, sample);
         }
 
         // The next ACK takes `first`'s slot in the next generation.
-        let reuse = first.wrapping_add(horizon);
+        let reuse = (first + horizon) & MASK;
         assert_eq!(reuse & (horizon - 1), first & (horizon - 1));
         let last = send_full_acks(&mut receiver, send_time(reuse), spacing, 1);
         assert_eq!(receiver.ack_number(), reuse);

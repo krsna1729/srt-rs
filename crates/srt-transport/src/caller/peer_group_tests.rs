@@ -98,10 +98,12 @@ fn pump(
                         (mirror, request.handshake.get_group_extension())
                     {
                         // A real receiver answers with its own mirror group.
-                        connection.set_group_extension(GroupExtensionData {
-                            group_id: mirror,
-                            ..group
-                        });
+                        connection
+                            .set_group_extension(GroupExtensionData {
+                                group_id: mirror,
+                                ..group
+                            })
+                            .expect("the mirror group is a valid libsrt group");
                     }
                     AdmissionResolution::Accept
                 },

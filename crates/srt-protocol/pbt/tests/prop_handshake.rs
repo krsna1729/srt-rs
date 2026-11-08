@@ -143,8 +143,9 @@ fn arb_km_message() -> impl Strategy<Value = KmMessage> {
 }
 
 /// Stream ID 文字列の生成
+/// Non-empty: libsrt (and this decoder) refuses an empty SID block.
 fn arb_stream_id() -> impl Strategy<Value = String> {
-    prop::string::string_regex("[a-zA-Z0-9_#!:=/,.-]{0,100}")
+    prop::string::string_regex("[a-zA-Z0-9_#!:=/,.-]{1,100}")
         .expect("ストリーム ID 用の正規表現は有効な想定")
 }
 

@@ -45,11 +45,12 @@ fn establish_pair(
     let mut caller = SrtConnection::new_caller(caller_opts);
     let mut listener = SrtConnection::new_listener(listener_opts);
 
-    let mut now = ts(1_000);
+    // A zero-transit handshake: the listener's TSBPD base comes from the
+    // CONCLUSION timestamp, so it must see the same transit as DATA.
+    let now = ts(1_000);
     caller.connect(now).expect("caller connect");
 
-    for round in 0..10 {
-        now = ts(2_000 + round * 1_000);
+    for _ in 0..10 {
         let mut progress = false;
         while let Some(out) = caller.poll_output().unwrap() {
             progress = true;

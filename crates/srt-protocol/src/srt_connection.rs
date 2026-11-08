@@ -19,8 +19,9 @@ use crate::message_assembler::MessageAssembler;
 use crate::sender_rto::RtoArm;
 use crate::srt_handshake::{
     DEFAULT_FLOW_WINDOW, DEFAULT_MTU, GroupExtensionData, HS_VERSION_5, HandshakePacket,
-    HandshakeState, HandshakeType, IpFamily, KmError, KmMessage, MAX_FLOW_WINDOW, SRT_MAGIC_CODE,
-    SRT_REJ_CRYPTO, SRT_REJ_FILTER, SRT_REJ_MESSAGEAPI, SRT_REJ_ROGUE, SRT_REJ_VERSION, srt_flags,
+    HandshakeState, HandshakeType, IpFamily, KmError, KmMessage, MAX_CONGESTION_NAME_BYTES,
+    MAX_FLOW_WINDOW, SRT_MAGIC_CODE, SRT_REJ_CONGESTION, SRT_REJ_CRYPTO, SRT_REJ_FILTER,
+    SRT_REJ_GROUP, SRT_REJ_MESSAGEAPI, SRT_REJ_ROGUE, SRT_REJ_VERSION, srt_flags,
 };
 use crate::srt_packet::{
     ControlPacket, ControlType, DataHeader, DataPacket, DatagramClass, PendingData,
@@ -428,7 +429,8 @@ fn dropreq_range(pkt: &PendingDatagram) -> Option<(u32, u32)> {
 pub struct ConnectionOptions {
     /// Local socket ID. Zero means auto-assign a random nonzero value.
     pub socket_id: u32,
-    /// Initial sequence number.
+    /// Initial sequence number. Only its low 31 bits are used: the wire
+    /// field is a 31-bit sequence number.
     pub initial_seq: Option<u32>,
     /// SYN cookie (Listener only).
     pub syn_cookie: Option<u32>,
@@ -447,10 +449,13 @@ pub struct ConnectionOptions {
     /// SRT version.
     pub srt_version: u32,
     /// Stream ID (the identifier the Caller sends to the Listener, capped at
-    /// 512 bytes at construction).
+    /// 512 bytes at construction). An empty Stream ID is not sent: libsrt
+    /// refuses an empty SID block.
     pub stream_id: Option<String>,
     /// Congestion control mode name declared in the handshake extension
-    /// (e.g. "live", "file"), capped at 512 bytes at construction. A real
+    /// (e.g. "live", "file"). It must be 1 to 16 bytes, the names a libsrt
+    /// peer accepts (`CSrtConfig::MAX_CONG_LENGTH`): `connect` refuses
+    /// another, and a listener refuses callers with `SRT_REJ_CONGESTION`. A real
     /// libsrt peer that declares a mode itself refuses to transmit if the
     /// other side declares nothing at all, assuming a live/file mismatch
     /// (confirmed by interop testing against `srt-file-transmit`, which logs
@@ -778,6 +783,9 @@ pub struct SrtConnection {
     /// Address family of the UDP path, set by the transport; it turns the
     /// peer's IP-layer MSS into a datagram budget.
     ip_family: IpFamily,
+    /// The peer's IP, set by the transport and emitted in this side's
+    /// handshakes' peer-IP field, as libsrt does (`core.cpp:3782`, `6011`).
+    peer_ip: std::net::IpAddr,
 
     /// Event queue.
     event_queue: VecDeque<ConnectionEvent>,
@@ -903,6 +911,17 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) {
     }
 }
 
+/// Refuse an outbound GROUP extension a libsrt peer would refuse.
+fn ensure_libsrt_group(group: GroupExtensionData) -> Result<(), Error> {
+    if group.is_valid_for_libsrt() {
+        return Ok(());
+    }
+    Err(Error::invalid_data(
+        "GROUP extension needs an SRTGROUP_MASK group ID and a libsrt group type \
+         (undefined, broadcast or backup)",
+    ))
+}
+
 fn normalize_buffer_options(mut options: ConnectionOptions) -> ConnectionOptions {
     if options.socket_id == 0 {
         options.socket_id = random_nonzero_socket_id();
@@ -918,10 +937,14 @@ fn normalize_buffer_options(mut options: ConnectionOptions) -> ConnectionOptions
         .delivery_queue_packets
         .max(1)
         .min(options.receive_buffer_packets);
+    // The handshake carries 31 bits; keep the local identity identical to
+    // the wire one so the CONCLUSION response's echo compares equal.
+    options.initial_seq = options.initial_seq.map(|seq| seq & 0x7FFF_FFFF);
     if let Some(stream_id) = options.stream_id.as_mut() {
         truncate_utf8(stream_id, MAX_HANDSHAKE_OPTION_BYTES);
     }
-    truncate_utf8(&mut options.congestion_control, MAX_HANDSHAKE_OPTION_BYTES);
+    // The congestion name is validated, not truncated: a shortened name
+    // would declare a different mode.
     options.ack_interval_micros =
         crate::receiver::clamp_ack_interval_micros(options.ack_interval_micros);
     options.light_ack_interval_packets =
@@ -1297,6 +1320,7 @@ impl SrtConnection {
             assembler: MessageAssembler::new(),
             max_payload_size: DEFAULT_MTU as usize - SRT_HEADER_SIZE,
             ip_family: IpFamily::V4,
+            peer_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             event_queue: VecDeque::new(),
             key_refresh_notified: false,
             pending_data_events: 0,
@@ -1354,6 +1378,7 @@ impl SrtConnection {
             assembler: MessageAssembler::new(),
             max_payload_size: DEFAULT_MTU as usize - SRT_HEADER_SIZE,
             ip_family: IpFamily::V4,
+            peer_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             event_queue: VecDeque::new(),
             key_refresh_notified: false,
             pending_data_events: 0,
@@ -1554,12 +1579,17 @@ impl SrtConnection {
         Ok(())
     }
 
-    /// Set or clear listener-side GROUP metadata before CONCLUSION.
+    /// Set or clear listener-side GROUP metadata before CONCLUSION. A group
+    /// libsrt would refuse ([`GroupExtensionData::is_valid_for_libsrt`]) is
+    /// an error.
     pub fn set_listener_group_extension(
         &mut self,
         group: Option<GroupExtensionData>,
     ) -> Result<(), Error> {
         self.ensure_listener_policy_window()?;
+        if let Some(group) = group {
+            ensure_libsrt_group(group)?;
+        }
         self.options.group_extension = group;
         Ok(())
     }
@@ -1607,8 +1637,27 @@ impl SrtConnection {
     }
 
     /// Set listener-side GROUP metadata before processing the conclusion.
-    pub fn set_group_extension(&mut self, group: GroupExtensionData) {
+    /// A group libsrt would refuse
+    /// ([`GroupExtensionData::is_valid_for_libsrt`]) is an error.
+    pub fn set_group_extension(&mut self, group: GroupExtensionData) -> Result<(), Error> {
+        ensure_libsrt_group(group)?;
         self.options.group_extension = Some(group);
+        Ok(())
+    }
+
+    /// Set the peer's UDP address.
+    ///
+    /// The transport knows the socket address; the handshake does not carry
+    /// the path family reliably. It must be set before the peer's CONCLUSION
+    /// is processed, because that is where the peer MSS becomes this
+    /// connection's datagram budget. Its IP is emitted in this side's
+    /// handshakes' peer-IP field, which a libsrt peer records as its own
+    /// local address (`srt_getsockname` on an accepted socket, the group
+    /// member's `agent`; `core.cpp:4983`, `6055-6057`, `api.cpp:798-805`).
+    /// Unset, the path is taken to be IPv4 and the field is `0.0.0.0`.
+    pub fn set_peer_address(&mut self, peer: std::net::SocketAddr) {
+        self.ip_family = IpFamily::of(&peer);
+        self.peer_ip = peer.ip();
     }
 
     /// Configure retry spacing and the deadline for the whole handshake.
@@ -1617,16 +1666,6 @@ impl SrtConnection {
     /// never scheduled earlier than the requested cadence. Both values are
     /// clamped to at least one microsecond and the whole-attempt timeout is
     /// clamped to at least the retry interval.
-    /// Set the address family of this connection's UDP path.
-    ///
-    /// The transport knows the socket address; the handshake does not carry
-    /// the path family reliably. It must be set before the peer's CONCLUSION
-    /// is processed, because that is where the peer MSS becomes this
-    /// connection's datagram budget. Unset, the path is taken to be IPv4.
-    pub fn set_ip_family(&mut self, family: IpFamily) {
-        self.ip_family = family;
-    }
-
     pub fn set_handshake_timing(&mut self, retry_interval_micros: u64, timeout_micros: u64) {
         self.handshake_retry_interval_micros = retry_interval_micros.max(1);
         self.handshake_timeout_micros = timeout_micros
@@ -1649,6 +1688,14 @@ impl SrtConnection {
                  unsupported legacy GCM layout with 1.5.3 and older",
             ));
         }
+        if !self.congestion_name_is_emittable() {
+            return Err(Error::invalid_data(
+                "congestion_control must be 1 to 16 bytes, the names libsrt accepts",
+            ));
+        }
+        self.options
+            .group_extension
+            .map_or(Ok(()), ensure_libsrt_group)?;
 
         self.start_time = Some(now);
         self.handshake_started_at = Some(now);
@@ -2394,6 +2441,12 @@ impl SrtConnection {
     /// The payload is fragmented into multiple packets if it exceeds the
     /// negotiated maximum payload size. The receiver reassembles the
     /// fragments before delivering them as a single `DataReceived` event.
+    ///
+    /// In live (TSBPD) mode this is an srt-rs extension: libsrt's sender
+    /// refuses such a message (`MN_XSIZE`, `core.cpp:7003-7011`). A libsrt
+    /// receiver still reassembles it (`CRcvBuffer::updateNonreadPos` and
+    /// `readMessage`, `buffer_rcv.cpp`), but its application must read with
+    /// a buffer that holds the whole message, or libsrt truncates it.
     pub fn send_message(&mut self, payload: &[u8], now: Timestamp) -> Result<(), Error> {
         if self.state != ConnectionState::Connected {
             return Err(Error::invalid_state("not connected"));
@@ -3576,6 +3629,51 @@ impl SrtConnection {
         ))
     }
 
+    /// Whether the configured congestion name is one a libsrt peer accepts:
+    /// 1 to 16 bytes (`CSrtConfig::MAX_CONG_LENGTH`; `interpretSrtHandshake`
+    /// refuses any other, core.cpp:3001-3007).
+    fn congestion_name_is_emittable(&self) -> bool {
+        (1..=MAX_CONGESTION_NAME_BYTES).contains(&self.options.congestion_control.len())
+    }
+
+    /// A listener whose own congestion name libsrt would refuse does not
+    /// answer with it: it refuses the caller with `SRT_REJ_CONGESTION`. (A
+    /// caller refuses such a name in `connect`, before sending anything.)
+    fn reject_unemittable_congestion(&mut self, now: Timestamp) -> Result<(), Error> {
+        if self.congestion_name_is_emittable() {
+            return Ok(());
+        }
+        Err(self.refuse_peer(
+            SRT_REJ_CONGESTION,
+            "configured congestion_control is not 1 to 16 bytes, the names libsrt accepts",
+            now,
+        ))
+    }
+
+    /// A listener answers a GROUP request with its own GROUP extension; one
+    /// libsrt would refuse (configured through `ConnectionOptions`) is not
+    /// emitted: the caller is refused with `SRT_REJ_GROUP`.
+    fn reject_invalid_own_group(
+        &mut self,
+        hs: &HandshakePacket,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        let answers_group = hs.get_group_extension().is_some();
+        if !answers_group
+            || self
+                .options
+                .group_extension
+                .is_none_or(|group| group.is_valid_for_libsrt())
+        {
+            return Ok(());
+        }
+        Err(self.refuse_peer(
+            SRT_REJ_GROUP,
+            "configured GROUP extension is one libsrt refuses",
+            now,
+        ))
+    }
+
     /// Reject a handshake in which the peer negotiates packet-filter
     /// behaviour this implementation does not provide.
     ///
@@ -3684,6 +3782,20 @@ impl SrtConnection {
         ))
     }
 
+    /// Refuse a CONCLUSION response that does not carry this caller's ISN.
+    /// A libsrt caller fails its connect with `MN_SECURITY` on that
+    /// mismatch (core.cpp:4085-4086), sending nothing to the listener. The
+    /// INDUCTION response is not checked: libsrt takes only its cookie,
+    /// version and type (`processConnectResponse`).
+    fn reject_foreign_response_isn(&mut self, hs: &HandshakePacket) -> Result<(), Error> {
+        if hs.initial_packet_seq == self.initial_seq {
+            return Ok(());
+        }
+        Err(self.fail_caller_handshake(
+            "CONCLUSION response ISN is not the caller's (libsrt MN_SECURITY)",
+        ))
+    }
+
     fn handle_caller_conclusion(
         &mut self,
         hs: HandshakePacket,
@@ -3706,6 +3818,7 @@ impl SrtConnection {
         self.reject_peer_without_rexmit_flag(&hs, now)?;
         self.reject_legacy_gcm_peer(&hs, now)?;
         self.reject_missing_group_response(&hs)?;
+        self.reject_foreign_response_isn(&hs)?;
         self.apply_peer_mss(&hs);
 
         self.peer_socket_id = hs.socket_id;
@@ -3725,7 +3838,10 @@ impl SrtConnection {
         self.handshake_state = HandshakeState::Completed;
         self.handshake_started_at = None;
         self.set_state(ConnectionState::Connected);
-        self.start_time = Some(now);
+        // `start_time` stays the epoch `connect` stamped: the INDUCTION and
+        // CONCLUSION already carried it, and the listener's TSBPD base is
+        // derived from that CONCLUSION timestamp (libsrt stamps its start
+        // time once, when the socket opens).
 
         let tsbpd_time_base = now.as_micros().saturating_sub(hsreq_timestamp as u64);
         self.init_buffers(now, hs.initial_packet_seq, tsbpd_time_base);
@@ -3817,7 +3933,7 @@ impl SrtConnection {
         if self.start_time.is_none() {
             self.start_time = Some(now);
         }
-        self.send_induction_response(now);
+        self.send_induction_response(hs.initial_packet_seq, now);
         self.handshake_state = HandshakeState::InductionReceived;
         self.arm_handshake_timer(now);
         Ok(())
@@ -3847,6 +3963,8 @@ impl SrtConnection {
         self.reject_message_api_mismatch(&hs, now)?;
         self.reject_peer_without_rexmit_flag(&hs, now)?;
         self.reject_legacy_gcm_peer(&hs, now)?;
+        self.reject_unemittable_congestion(now)?;
+        self.reject_invalid_own_group(&hs, now)?;
         self.apply_peer_mss(&hs);
         self.note_peer_flow_window(hs.flow_window);
 
@@ -4070,14 +4188,13 @@ impl SrtConnection {
         // reference (`CUDT::sendCtrl`/`processCtrlAck`, `core.cpp`) also
         // assigns and acknowledges one for its numbered Small ACK (16 bytes)
         // and its 24/32-byte reference-Full variants. `type_specific_info`
-        // is exactly that ACK number, and `validate_control_information`
-        // already requires it to be nonzero for every accepted size except
-        // the unnumbered draft-form Small ACK and the Light ACK (which never
-        // carry one), so checking it directly covers every case without
-        // branching on length again. (Originally found as upstream
+        // is exactly that ACK number. libsrt's 31-bit ACK number rolls
+        // through zero (`CAckNo::incack`), so a 24/28/32-byte ACK numbered 0
+        // is acknowledged too; only the Light ACK and the draft's unnumbered
+        // 16-byte form (number 0) carry none. (Originally found as upstream
         // shiguredo/srt-rs issue 0054, which only pinned the draft's own
         // `>= 28` rule -- not pinned Haivision's wider acknowledged set.)
-        if pkt.type_specific_info != 0 {
+        if ack_names_a_number(&pkt) {
             self.send_ackack(pkt.type_specific_info, now);
         }
 
@@ -4708,6 +4825,7 @@ impl SrtConnection {
         let mut hs = HandshakePacket::new_induction_request(self.options.socket_id);
         hs.initial_packet_seq = self.initial_seq;
         hs.flow_window = self.flight_capacity_packets();
+        hs.peer_ip = self.peer_ip;
         let pkt = hs.encode(self.relative_timestamp(now), 0);
         self.queue_handshake_control_packet(pkt, now);
     }
@@ -4820,7 +4938,10 @@ impl SrtConnection {
         self.negotiated_srt_flags() & srt_flags::PERIODICNAK != 0
     }
 
-    fn send_induction_response(&mut self, now: Timestamp) {
+    /// Answer an INDUCTION request. The response echoes the request's ISN,
+    /// as libsrt answers by rewriting the received handshake in place
+    /// (core.cpp:11768-11811); the listener adopts its ISN at CONCLUSION.
+    fn send_induction_response(&mut self, request_isn: u32, now: Timestamp) {
         let encryption_field = if self.options.passphrase.is_some() {
             self.options.key_length.to_encryption_field()
         } else {
@@ -4832,7 +4953,9 @@ impl SrtConnection {
             self.syn_cookie,
             encryption_field,
         );
+        hs.initial_packet_seq = request_isn;
         hs.flow_window = self.flight_capacity_packets();
+        hs.peer_ip = self.peer_ip;
         let pkt = hs.encode(self.relative_timestamp(now), self.peer_socket_id);
         self.queue_handshake_control_packet(pkt, now);
     }
@@ -4911,8 +5034,13 @@ impl SrtConnection {
             });
         }
 
-        // Add a SID extension if a Stream ID is set.
-        if let Some(ref stream_id) = self.options.stream_id {
+        // Add a SID extension if a non-empty Stream ID is set.
+        if let Some(stream_id) = self
+            .options
+            .stream_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+        {
             hs.add_sid_extension(stream_id);
         }
 
@@ -4921,6 +5049,7 @@ impl SrtConnection {
         }
 
         // A CONCLUSION request is sent with dest_socket_id = 0 (libsrt compatibility).
+        hs.peer_ip = self.peer_ip;
         let pkt = hs.encode(self.relative_timestamp(now), 0);
         self.queue_handshake_control_packet(pkt, now);
         Ok(())
@@ -4964,6 +5093,7 @@ impl SrtConnection {
             hs.add_group_extension(group);
         }
 
+        hs.peer_ip = self.peer_ip;
         let pkt = hs.encode(self.relative_timestamp(now), self.peer_socket_id);
         self.queue_handshake_control_packet(pkt, now);
     }
@@ -4992,6 +5122,7 @@ impl SrtConnection {
         {
             hs.add_group_extension(group);
         }
+        hs.peer_ip = self.peer_ip;
         let packet = hs.encode(self.relative_timestamp(now), self.peer_socket_id);
         self.queue_handshake_control_packet(packet, now);
         self.terminate_handshake();
@@ -5172,9 +5303,10 @@ fn validate_control_information(pkt: &ControlPacket) -> Result<(), Error> {
 /// with ACKACK -- Robotweax pins a regression for exactly this variant.
 /// The reference-Full sizes (24, adding packet rate/capacity; 28, the
 /// draft's own Full ACK, adding the receiving byte rate; and libsrt's
-/// legacy 32-byte form with one extra, unused field) always carry a
-/// nonzero ACK number. Any other aligned length is not a size pinned
-/// Haivision is shown to emit.
+/// legacy 32-byte form with one extra, unused field) always carry an ACK
+/// number, which may be zero: libsrt's 31-bit number rolls 0x7fff_ffff -> 0
+/// (`CAckNo::incack`) and `processCtrlAck` accepts it. Any other aligned
+/// length is not a size pinned Haivision is shown to emit.
 fn validate_ack_shape(ack_number: u32, len: usize) -> Result<(), Error> {
     if !matches!(len, 4 | 16 | 24 | 28 | 32) {
         return Err(Error::invalid_data(format!(
@@ -5186,12 +5318,15 @@ fn validate_ack_shape(ack_number: u32, len: usize) -> Result<(), Error> {
             "Light ACK (4-byte CIF) must not carry an ACK number",
         ));
     }
-    if len >= 24 && ack_number == 0 {
-        return Err(Error::invalid_data(format!(
-            "{len}-byte ACK must carry a nonzero ACK number"
-        )));
-    }
     Ok(())
+}
+
+/// Whether an ACK named an ACK number the peer expects ACKACKed: every
+/// 24/28/32-byte ACK (zero included, after libsrt's 31-bit wrap) and a
+/// numbered 16-byte Small ACK; never a Light ACK or the draft's unnumbered
+/// Small form.
+fn ack_names_a_number(pkt: &ControlPacket) -> bool {
+    pkt.control_info.len() >= 24 || pkt.type_specific_info != 0
 }
 
 /// Parse a loss list (from a NAK packet's control_info).
@@ -5462,13 +5597,280 @@ mod tests {
     fn handshake_option_strings_are_bounded_at_construction() {
         let conn = SrtConnection::new_caller(ConnectionOptions {
             stream_id: Some("あ".repeat(200)),
-            congestion_control: "live-".to_owned() + &"x".repeat(600),
             ..ConnectionOptions::default()
         });
 
         let stream_id = conn.options.stream_id.as_deref().expect("stream id");
         assert_eq!(stream_id.len(), 510);
-        assert!(conn.options.congestion_control.len() <= MAX_HANDSHAKE_OPTION_BYTES);
+    }
+
+    /// An empty Stream ID is not sent: libsrt refuses an empty SID block
+    /// (core.cpp:2950-2960).
+    #[test]
+    fn an_empty_stream_id_is_not_emitted() {
+        for (stream_id, emitted) in [("", None), ("id", Some("id"))] {
+            let mut caller = SrtConnection::new_caller(ConnectionOptions {
+                socket_id: 1,
+                stream_id: Some(stream_id.to_owned()),
+                ..ConnectionOptions::default()
+            });
+            let mut listener = SrtConnection::new_listener(listener_options());
+            caller.connect(Timestamp::default()).unwrap();
+            listener
+                .feed_recv_buf(&next_wire(&mut caller), Timestamp::from_micros(1))
+                .unwrap();
+            caller
+                .feed_recv_buf(&next_wire(&mut listener), Timestamp::from_micros(2))
+                .unwrap();
+            let (conclusion, _) = decode_handshake(&next_wire(&mut caller));
+            assert_eq!(conclusion.get_sid_extension().as_deref(), emitted);
+        }
+    }
+
+    /// Congestion names a libsrt peer refuses (empty, or over 16 bytes:
+    /// `CSrtConfig::MAX_CONG_LENGTH`, core.cpp:3001-3007), paired with
+    /// whether this side may emit them.
+    fn congestion_name_cases() -> [(String, bool); 4] {
+        [
+            (String::new(), false),
+            ("live".to_owned(), true),
+            ("c".repeat(16), true),
+            ("c".repeat(17), false),
+        ]
+    }
+
+    /// `connect` refuses a congestion name libsrt refuses, before sending.
+    #[test]
+    fn caller_refuses_a_congestion_name_outside_libsrt_bounds() {
+        for (name, emittable) in congestion_name_cases() {
+            let mut caller = SrtConnection::new_caller(ConnectionOptions {
+                congestion_control: name.clone(),
+                ..ConnectionOptions::default()
+            });
+            let started = caller.connect(Timestamp::default());
+            assert_eq!(started.is_ok(), emittable, "{name:?}: {started:?}");
+            let sent = drain_outputs(&mut caller)
+                .iter()
+                .any(|output| matches!(output, ConnectionOutput::SendPacket(_)));
+            assert_eq!(sent, emittable, "{name:?}");
+        }
+    }
+
+    /// A listener whose congestion name libsrt refuses answers callers with
+    /// `SRT_REJ_CONGESTION` instead of a CONCLUSION response carrying it.
+    #[test]
+    fn listener_refuses_callers_with_a_congestion_name_outside_libsrt_bounds() {
+        for (name, emittable) in congestion_name_cases() {
+            let mut caller = SrtConnection::new_caller(ConnectionOptions {
+                socket_id: 1,
+                ..ConnectionOptions::default()
+            });
+            let mut listener = SrtConnection::new_listener(ConnectionOptions {
+                congestion_control: name.clone(),
+                ..listener_options()
+            });
+            caller.connect(Timestamp::default()).unwrap();
+            listener
+                .feed_recv_buf(&next_wire(&mut caller), Timestamp::from_micros(1))
+                .unwrap();
+            caller
+                .feed_recv_buf(&next_wire(&mut listener), Timestamp::from_micros(2))
+                .unwrap();
+            let answered =
+                listener.feed_recv_buf(&next_wire(&mut caller), Timestamp::from_micros(3));
+            assert_eq!(answered.is_ok(), emittable, "{name:?}: {answered:?}");
+            let expected = (!emittable).then_some(SRT_REJ_CONGESTION);
+            assert_eq!(rejection_reason(&mut listener), expected, "{name:?}");
+        }
+    }
+
+    /// GROUP extensions paired with whether libsrt accepts them
+    /// (`interpretGroup`, core.cpp:3317-3331).
+    fn group_cases() -> [(GroupExtensionData, bool); 5] {
+        let group = |group_id, group_type| GroupExtensionData {
+            group_id,
+            group_type,
+            flags: 0,
+            weight: 1,
+        };
+        [
+            (group(SRTGROUP_MASK | 42, GroupType::Broadcast), true),
+            (group(SRTGROUP_MASK | 42, GroupType::Backup), true),
+            (group(SRTGROUP_MASK | 42, GroupType::Undefined), true),
+            (group(42, GroupType::Broadcast), false),
+            (group(SRTGROUP_MASK | 42, GroupType::Unknown(3)), false),
+        ]
+    }
+
+    /// An outbound GROUP libsrt would refuse is a configuration error, on
+    /// both setters and at `connect` before anything is sent.
+    #[test]
+    fn outbound_groups_libsrt_refuses_are_configuration_errors() {
+        for (group, valid) in group_cases() {
+            let mut caller = SrtConnection::new_caller(ConnectionOptions {
+                group_extension: Some(group),
+                ..ConnectionOptions::default()
+            });
+            let started = caller.connect(Timestamp::default());
+            assert_eq!(started.is_ok(), valid, "{group:?}: {started:?}");
+            let sent = drain_outputs(&mut caller)
+                .iter()
+                .any(|output| matches!(output, ConnectionOutput::SendPacket(_)));
+            assert_eq!(sent, valid, "{group:?}");
+
+            let mut listener = SrtConnection::new_listener(listener_options());
+            let set = listener.set_group_extension(group);
+            assert_eq!(set.is_ok(), valid, "{group:?}");
+            let mut listener = SrtConnection::new_listener(listener_options());
+            let set = listener.set_listener_group_extension(Some(group));
+            assert_eq!(set.is_ok(), valid, "{group:?}");
+        }
+    }
+
+    /// A listener whose configured GROUP libsrt would refuse answers a
+    /// bonded caller with `SRT_REJ_GROUP` instead of emitting it; a direct
+    /// caller, which gets no GROUP back, is unaffected.
+    #[test]
+    fn listener_refuses_bonded_callers_when_its_own_group_is_invalid() {
+        let (bonded, _) = group_cases()[0];
+        for (caller_group, (group, valid)) in [Some(bonded), None]
+            .into_iter()
+            .flat_map(|caller_group| group_cases().map(|case| (caller_group, case)))
+        {
+            let answers = valid || caller_group.is_none();
+            let mut caller = SrtConnection::new_caller(ConnectionOptions {
+                socket_id: 1,
+                group_extension: caller_group,
+                ..ConnectionOptions::default()
+            });
+            let mut listener = SrtConnection::new_listener(ConnectionOptions {
+                group_extension: Some(group),
+                ..listener_options()
+            });
+            caller.connect(Timestamp::default()).unwrap();
+            listener
+                .feed_recv_buf(&next_wire(&mut caller), Timestamp::from_micros(1))
+                .unwrap();
+            caller
+                .feed_recv_buf(&next_wire(&mut listener), Timestamp::from_micros(2))
+                .unwrap();
+            let answered =
+                listener.feed_recv_buf(&next_wire(&mut caller), Timestamp::from_micros(3));
+            assert_eq!(
+                answered.is_ok(),
+                answers,
+                "{caller_group:?} -> {group:?}: {answered:?}"
+            );
+            let expected = (!answers).then_some(SRT_REJ_GROUP);
+            assert_eq!(rejection_reason(&mut listener), expected, "{group:?}");
+        }
+    }
+
+    /// The first queued control datagram of `control_type`, with its wire.
+    fn take_control(
+        conn: &mut SrtConnection,
+        control_type: ControlType,
+    ) -> Option<(Vec<u8>, ControlPacket)> {
+        drain_outputs(conn).into_iter().find_map(|output| {
+            let ConnectionOutput::SendPacket(wire) = output else {
+                return None;
+            };
+            match SrtPacket::decode(&wire) {
+                Ok(SrtPacket::Control(control)) if control.control_type == control_type => {
+                    Some((wire, control))
+                }
+                _ => None,
+            }
+        })
+    }
+
+    /// A Full ACK numbered 0 is a real ACK: libsrt's 31-bit ACK number
+    /// rolls 0x7fff_ffff -> 0 (`CAckNo::incack`, common.h:728-735) and
+    /// `processCtrlAck` acknowledges it. The peer answers with ACKACK 0 and
+    /// the RTT sample lands.
+    #[test]
+    fn a_full_ack_numbered_zero_gets_its_ackack_and_rtt_sample() {
+        let (mut caller, mut listener) = connected_pair();
+        let start = Timestamp::from_micros(1_000_000);
+        caller.send(b"zero", start).unwrap();
+        listener
+            .feed_recv_buf(&next_wire(&mut caller), start)
+            .unwrap();
+        drain_outputs(&mut listener);
+        listener
+            .receiver
+            .as_mut()
+            .unwrap()
+            .seed_full_acks_sent_for_test(0x7FFF_FFFF);
+
+        let ack_time = start.add_micros(20_000);
+        listener.handle_timer(TimerId::Ack, ack_time).unwrap();
+        let (ack, packet) = take_control(&mut listener, ControlType::Ack).expect("a Full ACK");
+        assert!(packet.control_info.len() >= 24, "a Full ACK");
+        assert_eq!(packet.type_specific_info, 0, "the number after 0x7fff_ffff");
+
+        caller
+            .feed_recv_buf(&ack, ack_time.add_micros(5_000))
+            .expect("a Full ACK numbered 0 is accepted");
+        let (ackack, packet) =
+            take_control(&mut caller, ControlType::AckAck).expect("the ACK is acknowledged");
+        assert_eq!(packet.type_specific_info, 0);
+
+        let rtt_before = listener.receiver.as_ref().unwrap().rtt();
+        listener
+            .feed_recv_buf(&ackack, ack_time.add_micros(10_000))
+            .expect("ACKACK 0 names a sent ACK");
+        assert_ne!(
+            listener.receiver.as_ref().unwrap().rtt(),
+            rtt_before,
+            "RTT sampled"
+        );
+    }
+
+    /// Each handshake carries the peer's IP the transport set, as libsrt's
+    /// do (`core.cpp:3782`, `6011`); a libsrt peer records it as its own
+    /// local address (`core.cpp:4983`, `6055-6057`). A listener requiring a
+    /// passphrase answers the unencrypted caller with a KM failure response.
+    #[test]
+    fn handshakes_carry_the_peer_ip_the_transport_set() {
+        let listener_address: std::net::SocketAddr = "192.0.2.1:9000".parse().unwrap();
+        let caller_address: std::net::SocketAddr = "[2001:db8::2]:5000".parse().unwrap();
+        for passphrase in [None, Some("peer-ip-passphrase".into())] {
+            let mut caller = SrtConnection::new_caller(ConnectionOptions::default());
+            caller.set_peer_address(listener_address);
+            let mut listener = SrtConnection::new_listener(ConnectionOptions {
+                passphrase,
+                ..listener_options()
+            });
+            listener.set_peer_address(caller_address);
+
+            let now = Timestamp::from_micros(1_000);
+            caller.connect(Timestamp::from_micros(0)).unwrap();
+            let induction = next_wire(&mut caller);
+            listener.feed_recv_buf(&induction, now).unwrap();
+            let induction_response = next_wire(&mut listener);
+            caller.feed_recv_buf(&induction_response, now).unwrap();
+            let conclusion = next_wire(&mut caller);
+            // The passphrase listener refuses with its KM failure response.
+            let _ = listener.feed_recv_buf(&conclusion, now);
+            let conclusion_response = next_wire(&mut listener);
+            for (name, wire, ip) in [
+                ("induction", induction, listener_address.ip()),
+                (
+                    "induction response",
+                    induction_response,
+                    caller_address.ip(),
+                ),
+                ("conclusion", conclusion, listener_address.ip()),
+                (
+                    "conclusion response",
+                    conclusion_response,
+                    caller_address.ip(),
+                ),
+            ] {
+                assert_eq!(decode_handshake(&wire).0.peer_ip, ip, "{name}");
+            }
+        }
     }
 
     #[test]
@@ -5705,23 +6107,44 @@ mod tests {
         assert_eq!(caller.peer_socket_id(), 0);
     }
 
+    /// The first datagram `conn` queues.
+    fn next_wire(conn: &mut SrtConnection) -> Vec<u8> {
+        drain_outputs(conn)
+            .into_iter()
+            .find_map(|output| match output {
+                ConnectionOutput::SendPacket(wire) => Some(wire),
+                _ => None,
+            })
+            .expect("one protocol datagram")
+    }
+
+    fn decode_handshake(wire: &[u8]) -> (HandshakePacket, u32) {
+        let SrtPacket::Control(packet) = SrtPacket::decode(wire).unwrap() else {
+            panic!("handshake control packet");
+        };
+        (HandshakePacket::decode(&packet).unwrap(), packet.timestamp)
+    }
+
+    fn handshake_sequence(wire: &[u8]) -> u32 {
+        decode_handshake(wire).0.initial_packet_seq
+    }
+
+    fn isn_pair(initial: u32) -> (SrtConnection, SrtConnection) {
+        let caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 1,
+            initial_seq: Some(initial),
+            ..Default::default()
+        });
+        let listener = SrtConnection::new_listener(ConnectionOptions {
+            socket_id: 2,
+            syn_cookie: Some(7),
+            ..Default::default()
+        });
+        (caller, listener)
+    }
+
     #[test]
     fn handshake_and_first_data_keep_the_same_initial_sequence() {
-        let next_wire = |conn: &mut SrtConnection| {
-            drain_outputs(conn)
-                .into_iter()
-                .find_map(|output| match output {
-                    ConnectionOutput::SendPacket(wire) => Some(wire),
-                    _ => None,
-                })
-                .expect("one protocol datagram")
-        };
-        let handshake_sequence = |wire: &[u8]| {
-            let SrtPacket::Control(packet) = SrtPacket::decode(wire).unwrap() else {
-                panic!("handshake control packet");
-            };
-            HandshakePacket::decode(&packet).unwrap().initial_packet_seq
-        };
         for initial in [17, 0x7fff_fffe] {
             let mut caller = SrtConnection::new_caller(ConnectionOptions {
                 socket_id: 1,
@@ -5765,6 +6188,64 @@ mod tests {
             );
             assert_eq!(first.sequence_number, initial);
         }
+    }
+
+    /// A listener's INDUCTION response echoes the request's ISN: libsrt
+    /// answers by rewriting the received handshake (core.cpp:11768-11811).
+    #[test]
+    fn listener_induction_response_echoes_the_request_isn() {
+        for initial in [17, 0x7fff_fffe] {
+            let (mut caller, mut listener) = isn_pair(initial);
+            caller.connect(Timestamp::default()).unwrap();
+            listener
+                .feed_recv_buf(&next_wire(&mut caller), Timestamp::from_micros(1))
+                .unwrap();
+            let response = next_wire(&mut listener);
+            assert_eq!(handshake_sequence(&response), initial);
+        }
+    }
+
+    /// A caller refuses a CONCLUSION response carrying another ISN, as a
+    /// libsrt caller's connect fails with `MN_SECURITY` (core.cpp:4085).
+    #[test]
+    fn caller_refuses_a_conclusion_response_with_another_isn() {
+        for (response_isn, connects) in [(17, true), (18, false), (0, false)] {
+            let (mut caller, mut listener) = isn_pair(17);
+            caller.connect(Timestamp::default()).unwrap();
+            listener
+                .feed_recv_buf(&next_wire(&mut caller), Timestamp::from_micros(1))
+                .unwrap();
+            caller
+                .feed_recv_buf(&next_wire(&mut listener), Timestamp::from_micros(2))
+                .unwrap();
+            listener
+                .feed_recv_buf(&next_wire(&mut caller), Timestamp::from_micros(3))
+                .unwrap();
+            let (mut response, timestamp) = decode_handshake(&next_wire(&mut listener));
+            response.initial_packet_seq = response_isn;
+            let result =
+                caller.handle_handshake_caller(response, timestamp, Timestamp::from_micros(4));
+            assert_eq!(
+                result.is_ok(),
+                connects,
+                "response ISN {response_isn}: {result:?}"
+            );
+            let expected = if connects {
+                ConnectionState::Connected
+            } else {
+                ConnectionState::Disconnected
+            };
+            assert_eq!(caller.state(), expected, "response ISN {response_isn}");
+        }
+    }
+
+    /// Only the low 31 bits of a configured ISN are used, so the
+    /// CONCLUSION response's echo of the wire ISN is the caller's own.
+    #[test]
+    fn a_configured_isn_above_31_bits_uses_its_wire_value() {
+        let (mut caller, mut listener) = isn_pair(0x8000_0011);
+        drive_handshake_to_connected(&mut caller, &mut listener);
+        assert_eq!(caller.initial_seq, 0x11);
     }
 
     /// Drive a full caller/listener handshake to `Connected` on both ends,
@@ -7894,17 +8375,17 @@ mod tests {
             );
         }
 
-        // A Light ACK must never carry an ACK number, and every
-        // reference-Full size must always carry one.
+        // A Light ACK must never carry an ACK number. A reference-Full size
+        // numbered 0 is libsrt's 31-bit ACK number after its wrap and is
+        // accepted (`CAckNo::incack`, `processCtrlAck`).
         let ack_seq = caller.sender.as_ref().unwrap().oldest_unacked_sequence();
         let error = caller
             .feed_recv_buf(&ack_datagram_with_shape(socket_id, ack_seq, 4, 1), now)
             .expect_err("a Light ACK must not carry an ACK number");
         assert_eq!(error.kind, crate::error::ErrorKind::InvalidData);
-        let error = caller
+        caller
             .feed_recv_buf(&ack_datagram_with_shape(socket_id, ack_seq, 24, 0), now)
-            .expect_err("a 24-byte ACK must carry a nonzero ACK number");
-        assert_eq!(error.kind, crate::error::ErrorKind::InvalidData);
+            .expect("a 24-byte ACK numbered 0 is accepted");
     }
 
     /// Haivision's deployed numbered Small ACK (16 bytes, nonzero ACK
@@ -9717,10 +10198,18 @@ mod tests {
         );
     }
 
+    /// A documentation-range peer address on `family`'s path.
+    fn path_address(family: IpFamily) -> std::net::SocketAddr {
+        match family {
+            IpFamily::V4 => "192.0.2.1:9000".parse().unwrap(),
+            IpFamily::V6 => "[2001:db8::1]:9000".parse().unwrap(),
+        }
+    }
+
     /// One handshake attempt in which the caller and the listener advertise
     /// `caller_mss` and `listener_mss` instead of their constructor defaults,
     /// and both connections are told their path is `family`, as a transport
-    /// does from its socket address (`SrtConnection::set_ip_family`).
+    /// does from its socket address (`SrtConnection::set_peer_address`).
     struct MssHandshake {
         caller: SrtConnection,
         listener: SrtConnection,
@@ -9899,8 +10388,8 @@ mod tests {
     ) -> MssHandshake {
         let mut caller = SrtConnection::new_caller(caller_options);
         let mut listener = SrtConnection::new_listener(listener_options);
-        caller.set_ip_family(caller_rewrite.family);
-        listener.set_ip_family(listener_rewrite.family);
+        caller.set_peer_address(path_address(caller_rewrite.family));
+        listener.set_peer_address(path_address(listener_rewrite.family));
         caller
             .connect(Timestamp::from_micros(0))
             .expect("caller starts");
@@ -10263,7 +10752,7 @@ mod tests {
                 socket_id: 1,
                 ..ConnectionOptions::default()
             });
-            caller.set_ip_family(v4);
+            caller.set_peer_address(path_address(v4));
             caller
                 .connect(Timestamp::from_micros(0))
                 .expect("caller starts");
@@ -10272,7 +10761,7 @@ mod tests {
             malformed.flow_window = Some(flow_window);
             let invalid_request = rewrite_handshake(&request, &malformed);
             let mut listener = SrtConnection::new_listener(listener_options());
-            listener.set_ip_family(v4);
+            listener.set_peer_address(path_address(v4));
             let error = listener
                 .feed_recv_buf(&invalid_request, Timestamp::from_micros(1_000))
                 .expect_err("unusable signed flow window is rejected");
@@ -10298,13 +10787,13 @@ mod tests {
             socket_id: 1,
             ..ConnectionOptions::default()
         });
-        caller.set_ip_family(v4);
+        caller.set_peer_address(path_address(v4));
         caller
             .connect(Timestamp::from_micros(0))
             .expect("caller starts");
         let request = take_one_rewritten_handshake(&mut caller, &plain);
         let mut listener = SrtConnection::new_listener(listener_options());
-        listener.set_ip_family(v4);
+        listener.set_peer_address(path_address(v4));
         listener
             .feed_recv_buf(&request, Timestamp::from_micros(1_000))
             .expect("listener accepts induction");
@@ -10382,13 +10871,13 @@ mod tests {
             socket_id: 1,
             ..ConnectionOptions::default()
         });
-        caller.set_ip_family(v4);
+        caller.set_peer_address(path_address(v4));
         caller
             .connect(Timestamp::from_micros(0))
             .expect("caller starts");
         let request = take_one_rewritten_handshake(&mut caller, &plain);
         let mut listener = SrtConnection::new_listener(listener_options());
-        listener.set_ip_family(v4);
+        listener.set_peer_address(path_address(v4));
         listener
             .feed_recv_buf(&request, Timestamp::from_micros(1_000))
             .expect("listener accepts induction");
@@ -10406,13 +10895,13 @@ mod tests {
             socket_id: 1,
             ..ConnectionOptions::default()
         });
-        caller.set_ip_family(v4);
+        caller.set_peer_address(path_address(v4));
         caller
             .connect(Timestamp::from_micros(0))
             .expect("caller starts");
         let request = take_one_rewritten_handshake(&mut caller, &plain);
         let mut listener = SrtConnection::new_listener(listener_options());
-        listener.set_ip_family(v4);
+        listener.set_peer_address(path_address(v4));
         listener
             .feed_recv_buf(&request, Timestamp::from_micros(1_000))
             .expect("listener accepts induction");

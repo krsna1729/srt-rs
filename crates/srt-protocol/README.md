@@ -198,6 +198,45 @@ HSv5 negotiation follows libsrt 1.5.7:
   `connect` refuses a local `srt_version` of 1.5.3 or older with GCM.
   `SrtConnection::peer_srt_version` reports the peer's advertised version.
 
+### Wire emission
+
+Packets carry what libsrt 1.5.7 emits:
+
+- A caller stamps one timestamp epoch at `connect` and keeps it for its
+  handshake, DATA and control packets. The listener's TSBPD base comes from
+  the CONCLUSION timestamp, so DATA is held for its latency however long the
+  handshake took.
+- DATA message numbers roll `0x03ff_ffff` -> 1, never 0 (libsrt reserves
+  0 for packet-filter control packets).
+- A listener's INDUCTION response echoes the caller's ISN. A caller refuses
+  a CONCLUSION response that carries another ISN (libsrt `MN_SECURITY`);
+  the INDUCTION response's ISN is not checked, as in libsrt.
+- An empty `stream_id` is not sent. `congestion_control` must be 1 to 16
+  bytes, the names libsrt accepts: `connect` refuses another, and a listener
+  configured with one refuses callers with `SRT_REJ_CONGESTION`. Received
+  handshakes with an empty SID, or an empty or over-16-byte congestion
+  block, fail to decode, as libsrt refuses them.
+- An outbound GROUP extension must carry an `SRTGROUP_MASK` ID and a group
+  type libsrt defines (undefined, broadcast, backup):
+  `GroupExtensionData::is_valid_for_libsrt`. `connect`,
+  `set_group_extension` (now returning `Result`) and
+  `set_listener_group_extension` refuse another; a listener configured with
+  one through `ConnectionOptions` refuses bonded callers with
+  `SRT_REJ_GROUP`. Received GROUP values are still decoded raw for policy.
+- Full ACK numbers are 31-bit like libsrt's (`CAckNo`): they start at 1 and
+  roll 0x7fff_ffff -> 0. A 24/28/32-byte ACK numbered 0 is accepted and
+  acknowledged with ACKACK 0, whose RTT sample is taken.
+- In live (TSBPD) mode `send_message` still fragments a payload over one
+  packet. This is an srt-rs extension: libsrt's sender refuses such a
+  message (`MN_XSIZE`). A libsrt receiver reassembles it, but its
+  application must read with a buffer that holds the whole message, or the
+  message arrives truncated. See VENDOR.md, "Message reassembly and DROPREQ".
+- The handshake peer-IP field carries the peer's IP, as libsrt's does; a
+  libsrt peer reports it as its own local address. Transports set it with
+  `SrtConnection::set_peer_address(SocketAddr)`, which replaces
+  `set_ip_family` and also sets the path family. The field uses libsrt's
+  layout: each 4-byte group of the address byte-reversed.
+
 ## Testing
 
 ```sh
