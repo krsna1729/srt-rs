@@ -644,7 +644,8 @@ receiver paths walk the same structure without it: TLPKTDROP
 `ReceiverBuffer::drop_too_late` runs on every ACK tick, and
 `advance_expected_sequence` runs from bonded sequence alignment; both are
 position-scale and both allocating. Both are listed as open in this file's
-per-entry work audit section.
+per-entry work audit section. (Superseded: see "Receive-side work is
+independent of the window" below.)
 
 Evidence. `one_loss_entry_walks_at_most_one_bitmap_word_per_64_positions` drives
 the real receive path: a peer one full window ahead exposes 65,535 positions and
@@ -669,3 +670,45 @@ remains inside. One packet can therefore amplify to at most one window of
 positions, at the measured cost of a single packet-sized operation. The run scan
 used for periodic NAK generation shares the word size but is served by the
 resumable periodic-NAK cursor with its own per-visit caps.
+
+## Receive-side work is independent of the window (PR #188)
+
+Every receive-side entry point -- a DATA arrival, a DROPREQ, a TLPKTDROP
+tick, a bonded member's forced advance, a group poll -- now does work
+bounded by a constant (or by what it reports) at every receive window, up to
+65,536 packets. Each site below was position-scale before.
+
+- Loss classification (F11). The loss list is a three-level lazy bitset
+  (`RangeBitset`: data words, per-block nonzero/full masks with populations,
+  top-level block masks). Classifying a wide gap or clearing a range costs
+  at most two partial words, two partial blocks and the block masks: 13 data
+  plus summary words at 8,192 and 65,536, against 257 and 2,049 before. The
+  bitmap is 8,592 bytes at the maximum window and 1,088 at the default.
+- Periodic NAK runs (F09) are found with `next_one`/`next_zero`, so the words
+  read scale with the runs reported (at most 24 per run), not with the window.
+- The expected sequence (F12, F04) is always the first loss, or the frontier
+  plus one: libsrt's ACK rule (`core.cpp` 8318-8358). Filling the head hole
+  and a forced advance no longer step through the retained packets or
+  enumerate the loss list.
+- TLPKTDROP (F01) inspects only the head gap, as libsrt's TSBPD loop does
+  (`core.cpp` 5673-5703): one successor lookup and one deadline per gap, at
+  most `MAX_EXPIRED_GAPS_PER_VISIT` (64) gaps per visit, and the connection
+  continues a capped visit on the zero-delay `DeliveryContinue` timer.
+  `drop_too_late` returns the gaps as `LossRange`s.
+- DROPREQ (F10) retires the covered packets at once. The packet window
+  marks whole pages, and whole 64-page blocks, retired; it removes only the
+  two partial end pages value by value. The retired storage is released
+  later, at most `MAX_RETIRED_RELEASED_PER_VISIT` (256) work units per visit,
+  on each DATA, drop, forced advance and ACK tick. The window's idle
+  directory grows by two mask words per 64 pages (2,096 bytes at the
+  default window).
+- Group receive (F13) finds the oldest pending payload with two ordered map
+  lookups and clears a delivered message's interior fragments by key range.
+
+Evidence. `WorkCounters` (unit tests only; benches and release builds run
+uncounted code) counts loop work at every site. One test per finding
+compares W = 32 / 8,192 / 65,536 against explicit limits. The property test
+`receive_entry_points_do_window_independent_work` replays random action
+streams at all three windows: wrap, non-monotone timestamps, duplicates,
+wide gaps, DROPREQs, ticks, forced advances, releases and deliveries.
+Before/after counts and mutations are in each commit message.
