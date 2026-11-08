@@ -67,7 +67,9 @@
 //! [`HIGH_FANIN_ACK_INTERVAL_MICROS`] / [`HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS`].
 //! Do not change the global defaults to those values.
 
-use crate::adaptive_receiver_packet_window::AdaptiveReceiverPacketWindow;
+use crate::adaptive_receiver_packet_window::{
+    AdaptiveReceiverPacketWindow, MAX_RETIRED_RELEASED_PER_VISIT,
+};
 use crate::range_bitset::RangeBitset;
 use bytes::Bytes;
 
@@ -972,7 +974,7 @@ impl ReceiverBuffer {
     /// Only used after the owning connection has relinquished protocol authority.
     pub(crate) fn reclaim_terminal(&mut self, max_packets: usize) -> (usize, bool) {
         let released = self.packets.clear_bounded(max_packets);
-        (released, self.packets.is_empty())
+        (released, self.packets.is_released())
     }
 
     /// Create a new receive buffer.
@@ -1238,6 +1240,7 @@ impl ReceiverBuffer {
 
         let recovered_loss = self.loss_list.remove(seq);
         self.advance_expected_seq(was_expected, recovered_loss);
+        self.release_retired_packets();
 
         new_loss_range
     }
@@ -1976,6 +1979,11 @@ impl ReceiverBuffer {
     ///
     /// The inclusive range must fit within the negotiated receive window so
     /// this method cannot be used to force unbounded iteration or allocation.
+    /// The receive state moves by the range's endpoints: packets and losses
+    /// leave in one range clear each and the expected sequence is re-derived,
+    /// so the call costs the same at every range width. The dropped packets'
+    /// storage is released at most one visit's budget at a time; see
+    /// [`Self::release_retired_packets`].
     pub fn drop_range(&mut self, first_seq: u32, last_seq: u32) -> Result<DropRangeSummary, Error> {
         let distance = self.validate_drop_range(first_seq, last_seq)?;
         let sequence_count = distance + 1;
@@ -1985,16 +1993,14 @@ impl ReceiverBuffer {
         // dropped and must never be rediscovered by a later packet.
         self.advance_drop_frontier(first_seq, last_seq);
 
-        // Remove only packet keys that lie in the requested numeric interval.
-        // A circular range has at most two such intervals. Repeating a range
-        // successor lookup after each removal is O(k log n), where k is the
-        // number of requested sequence positions (bounded by the negotiated
-        // receive window), independent of unrelated retained TSBPD packets.
+        // Remove only packets in the requested circular interval. Those
+        // become unreachable at once; their storage is released in bounded
+        // visits, independent of the interval width.
         let packets_removed = self.remove_drop_packets(first_seq, last_seq);
         let losses_removed = self.remove_drop_losses(first_seq, sequence_count);
 
         self.total_dropped = self.total_dropped.saturating_add(u64::from(sequence_count));
-        self.advance_expected_after_drop(first_seq, distance);
+        self.advance_expected_after_drop();
         Ok(DropRangeSummary {
             sequence_count,
             packets_removed,
@@ -2016,7 +2022,10 @@ impl ReceiverBuffer {
         let oldest_was_dropped = self
             .oldest_retained_seq
             .is_some_and(|oldest| sequence_in_range(first_seq, distance, oldest));
-        let packets_removed = self.packets.remove_range(first_seq, last_seq).unwrap_or(0) as u32;
+        let packets_removed = self
+            .clip_to_live_span(first_seq, last_seq)
+            .and_then(|(first, last)| self.packets.remove_range(first, last))
+            .unwrap_or(0) as u32;
         if oldest_was_dropped {
             let next = self.next_sequence_after(last_seq);
             self.oldest_retained_seq = next;
@@ -2024,18 +2033,48 @@ impl ReceiverBuffer {
         packets_removed
     }
 
+    /// The part of `first_seq..=last_seq` inside the live packet span. Every
+    /// retained packet lies in that span, and the span maps one-to-one onto
+    /// the packet window's slots, so a range clear there cannot reach a
+    /// retained packet whose slot merely aliases a position outside it.
+    fn clip_to_live_span(&self, first_seq: u32, last_seq: u32) -> Option<(u32, u32)> {
+        let base = self.packet_window_base();
+        let distance = last_seq.wrapping_sub(first_seq) & SEQUENCE_MASK;
+        let first_offset = first_seq.wrapping_sub(base) & SEQUENCE_MASK;
+        let (start, end) = if first_offset < self.max_buffer_size {
+            (first_offset, first_offset + distance)
+        } else {
+            let lead = base.wrapping_sub(first_seq) & SEQUENCE_MASK;
+            if lead > distance {
+                return None;
+            }
+            (0, distance - lead)
+        };
+        let end = end.min(self.max_buffer_size - 1);
+        Some((
+            base.wrapping_add(start) & SEQUENCE_MASK,
+            base.wrapping_add(end) & SEQUENCE_MASK,
+        ))
+    }
+
     fn remove_drop_losses(&mut self, first_seq: u32, sequence_count: u32) -> u32 {
         self.loss_list.remove_range(first_seq, sequence_count)
     }
 
-    fn advance_expected_after_drop(&mut self, first_seq: u32, distance: u32) {
-        while self.packets.contains_key(self.expected_seq)
-            || sequence_in_range(first_seq, distance, self.expected_seq)
-        {
-            count_work!(FrontierSteps);
-            self.expected_seq = self.expected_seq.wrapping_add(1) & SEQUENCE_MASK;
-        }
+    fn advance_expected_after_drop(&mut self) {
+        self.expected_seq = self.first_unresolved_seq();
         self.loss_list.set_base(self.expected_seq);
+    }
+
+    /// Release packets a DROPREQ or a forced advance removed, at most one
+    /// visit's budget (`MAX_RETIRED_RELEASED_PER_VISIT` work units). Every
+    /// receive, drop and advance runs one, and the owning connection runs one
+    /// per ACK tick, so a window-sized removal is released over bounded
+    /// visits rather than in the call that made it. Returns whether retired
+    /// packets remain.
+    pub fn release_retired_packets(&mut self) -> bool {
+        self.packets.release_retired(MAX_RETIRED_RELEASED_PER_VISIT);
+        self.packets.has_retired()
     }
 
     /// Get the current ACK sequence number (libsrt's 31-bit domain).
@@ -2562,6 +2601,120 @@ mod tests {
 
     /// Bitmap words a tick may read to find and inspect the head gap.
     const EXPIRY_TICK_BITMAP_WORD_LIMIT: u64 = 16;
+
+    /// Packet-window probes plus released payloads one DROPREQ may cost:
+    /// the retirement budget of one visit plus a constant.
+    const DROP_VISIT_SLOT_LIMIT: u64 = 2 * 256 + 16;
+
+    /// Bitmap words one DROPREQ may read or write: two range clears and the
+    /// frontier lookup.
+    const DROP_BITMAP_WORD_LIMIT: u64 = 96;
+
+    /// A DROPREQ reaching back before the retained span drops only what is
+    /// in its range, even where a range position shares a packet-window slot
+    /// with a retained packet further on.
+    #[test]
+    fn a_dropreq_behind_the_span_spares_packets_sharing_its_slots() {
+        let now = Timestamp::from_micros(1);
+        let window = DEFAULT_FLOW_WINDOW;
+        let mut buf = ReceiverBuffer::with_buffer_size(0, 120, Timestamp::default(), 0, window);
+        for seq in (0..=50).chain([window - 42]) {
+            buf.receive(make_packet(seq, 100_000_000), now);
+        }
+        let behind = 0u32.wrapping_sub(100) & SEQUENCE_MASK;
+        let summary = buf.drop_range(behind, 50).expect("valid drop");
+        assert_eq!(summary.packets_removed, 51);
+        assert!(
+            buf.packets.contains_key(window - 42),
+            "slot alias was dropped"
+        );
+        assert_eq!(buf.packets.len(), 1);
+    }
+
+    /// Arriving DATA also releases a visit's worth of dropped packets, so a
+    /// busy receiver does not wait for ACK ticks to free them.
+    #[test]
+    fn arriving_data_releases_dropped_packets() {
+        let now = Timestamp::from_micros(1);
+        let window = DEFAULT_FLOW_WINDOW;
+        let mut buf = ReceiverBuffer::with_buffer_size(0, 120, Timestamp::default(), 0, window);
+        for seq in 0..window {
+            buf.receive(make_packet(seq, 100_000_000), now);
+        }
+        buf.drop_range(0, window - 1).expect("valid drop");
+        let mut arrivals = 0;
+        while buf.packets.has_retired() {
+            assert!(arrivals < 40, "arrivals stopped releasing");
+            buf.receive(make_packet(window + arrivals, 100_000_000), now);
+            arrivals += 1;
+        }
+        assert_eq!(buf.packets.len(), arrivals as usize);
+    }
+
+    /// F10: a window-wide DROPREQ advances the receive state by the range's
+    /// endpoints and retires the packets it covers within a fixed per-visit
+    /// budget -- over a retained full window, and over an empty interval
+    /// starting at the expected sequence.
+    #[test]
+    fn wide_dropreq_work_per_visit_is_window_independent() {
+        let now = Timestamp::from_micros(1);
+        let mut results = Vec::new();
+        for window in WORK_BOUND_WINDOWS {
+            let mut full =
+                ReceiverBuffer::with_buffer_size(0, 120, Timestamp::default(), 0, window);
+            for seq in 0..window {
+                full.receive(make_packet(seq, 100_000_000), now);
+            }
+            let (summary, work) = WorkCounters::measure(|| full.drop_range(0, window - 1));
+            assert_eq!(summary.expect("valid drop").packets_removed, window);
+            assert_eq!(full.expected_sequence(), window);
+            assert!(
+                full.is_delivery_drained(),
+                "dropped packets are gone at once"
+            );
+            results.push((window, "retained", work));
+            // Their storage goes in bounded visits until none is left.
+            let mut visits = 0;
+            loop {
+                let (more, work) = WorkCounters::measure(|| full.release_retired_packets());
+                visits += 1;
+                results.push((window, "release visit", work));
+                if !more {
+                    break;
+                }
+            }
+            assert!(full.packets.is_released());
+            assert_eq!(full.sparse_pages() + full.dense_pages(), 0);
+            assert!(visits <= window as usize / 192 + 1, "{visits} visits");
+
+            let mut empty =
+                ReceiverBuffer::with_buffer_size(0, 120, Timestamp::default(), 0, window);
+            let (summary, work) = WorkCounters::measure(|| empty.drop_range(0, window - 1));
+            assert_eq!(summary.expect("valid drop").sequence_count, window);
+            assert_eq!(empty.expected_sequence(), window);
+            results.push((window, "empty", work));
+        }
+        for (window, case, work) in results
+            .iter()
+            .filter(|(_, case, _)| *case != "release visit")
+        {
+            eprintln!(
+                "window {window} {case}: slots {} released {} bitmap words {} frontier steps {}",
+                work.packet_slot_probes,
+                work.released_chunks,
+                work.bitmap_words(),
+                work.frontier_steps
+            );
+        }
+        for (window, case, work) in results {
+            assert!(
+                work.packet_slot_probes + work.released_chunks <= DROP_VISIT_SLOT_LIMIT
+                    && work.bitmap_words() <= DROP_BITMAP_WORD_LIMIT
+                    && work.frontier_steps == 0,
+                "window {window} {case}: {work:?}"
+            );
+        }
+    }
 
     /// A periodic NAK walks a wrapped window oldest first, resumes inside
     /// either side of the wrap, reports a straddled run from the resume

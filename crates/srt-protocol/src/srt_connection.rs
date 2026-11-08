@@ -2339,6 +2339,11 @@ impl SrtConnection {
         if self.state != ConnectionState::Connected {
             return;
         }
+        // Packets a DROPREQ or forced advance removed are released one
+        // bounded visit per tick even when no DATA arrives to do it.
+        if let Some(receiver) = self.receiver.as_mut() {
+            receiver.release_retired_packets();
+        }
         self.service_receive_deadlines(now);
         // An unacknowledged key rotation is serviced here rather than by a
         // timer of its own: this tick is already the connection's periodic
@@ -8142,6 +8147,53 @@ mod tests {
         }
         let cap = MAX_DELIVERY_PER_VISIT as u32;
         assert_eq!(delivered, [cap, 2 * cap, 3 * cap, READY]);
+    }
+
+    /// Packets a DROPREQ removed are released by ACK ticks alone: an idle
+    /// receiver still frees their storage, one bounded visit per tick.
+    #[test]
+    fn ack_ticks_release_packets_a_dropreq_removed() {
+        const WINDOW: u32 = 1024;
+        let mut conn = SrtConnection::new_listener(ConnectionOptions {
+            tsbpd_delay: 120,
+            flow_window_packets: WINDOW,
+            receive_buffer_packets: WINDOW,
+            delivery_queue_packets: WINDOW,
+            ..ConnectionOptions::default()
+        });
+        conn.peer_srt_flags = Some(srt_flags::TSBPDSND);
+        conn.set_state(ConnectionState::Connected);
+        let _ = conn.poll_event();
+        conn.init_buffers(Timestamp::from_micros(0), 0, 0);
+        let now = Timestamp::from_micros(0);
+        for sequence_number in 0..1_000 {
+            conn.handle_data_packet(
+                DataPacket::new(sequence_number, 0, 0, 0, vec![1].into()),
+                now,
+            )
+            .expect("in-window data is accepted");
+        }
+        while conn.poll_output().unwrap().is_some() {}
+        let pages = |conn: &SrtConnection| {
+            let receiver = conn.receiver.as_ref().unwrap();
+            receiver.sparse_pages() + receiver.dense_pages()
+        };
+        let summary = conn
+            .receiver
+            .as_mut()
+            .unwrap()
+            .drop_range(0, 999)
+            .expect("valid drop");
+        assert_eq!(summary.packets_removed, 1_000);
+        assert!(pages(&conn) > 0, "the drop visit releases only its budget");
+        let mut ticks = 0;
+        while pages(&conn) > 0 {
+            ticks += 1;
+            assert!(ticks <= 4, "release stalled");
+            conn.handle_timer(TimerId::Ack, Timestamp::from_micros(ticks * 10_000))
+                .expect("ACK tick");
+        }
+        assert_eq!(conn.receiver.as_ref().unwrap().expected_sequence(), 1_000);
     }
 
     /// A TLPKTDROP tick that stops at its gap budget continues on the

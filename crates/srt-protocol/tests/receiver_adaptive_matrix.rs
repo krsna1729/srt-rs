@@ -477,7 +477,7 @@ fn exercise_adversarial_sparse_phase(
         assert_eq!(r.promotions(), 0);
     }
     let heap: usize = receivers.iter().map(|r| r.packet_window_heap_bytes()).sum();
-    assert_eq!(heap, connections * 68_624);
+    assert_eq!(heap, connections * 68_656);
     (report, heap, rss_bytes())
 }
 
@@ -559,6 +559,13 @@ fn exercise_full_drain_phase(
     let ((), report) = measure_allocations(|| {
         for r in receivers.iter_mut() {
             let _ = r.drop_range(0, 8191);
+            // The dropped packets' storage goes in bounded visits: the
+            // 512 packets in 128 pages take three.
+            let mut visits = 0;
+            while r.release_retired_packets() {
+                visits += 1;
+            }
+            assert!(visits <= 3, "{visits} release visits");
         }
     });
     for r in receivers.iter() {

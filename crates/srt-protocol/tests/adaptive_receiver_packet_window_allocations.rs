@@ -335,5 +335,5 @@ fn isolated_adaptive_1000_lifecycle_records_rss() {
         "[1,000 Adaptive isolated DSA] RSS: idle={idle_rss:?}, sparse={sparse_rss:?}, dense={dense_rss:?}, settle={settle_rss:?}, drain={drain_rss:?} | Heap: sparse={sparse_heap}, dense={dense_heap}, settle={settle_heap}, drain={drain_heap}"
     );
     assert_eq!(settle_heap, sparse_heap);
-    assert_eq!(drain_heap, CONNECTIONS * 2_064);
+    assert_eq!(drain_heap, CONNECTIONS * 2_096);
 }
