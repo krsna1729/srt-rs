@@ -317,6 +317,7 @@ impl LossBitmap {
         self.base_seq = base_seq;
     }
 
+    #[cfg(test)]
     fn iter(&self) -> impl Iterator<Item = u32> + '_ {
         let base_seq = self.base_seq;
         let window_size = self.window_size;
@@ -1168,20 +1169,15 @@ impl ReceiverBuffer {
             }
         }
         self.refresh_retained_hints();
-        let stale_losses: Vec<u32> = self
-            .loss_list
-            .iter()
-            .filter(|&seq| sequence_less_than(seq, sequence_number))
-            .collect();
-        for seq in stale_losses {
-            self.loss_list.remove(seq);
-        }
-        self.expected_seq = sequence_number;
-        while self.packets.contains_key(self.expected_seq) {
-            count_work!(FrontierSteps);
-            self.expected_seq = self.expected_seq.wrapping_add(1) & 0x7FFF_FFFF;
-        }
+        // Every loss lies at or after the expected sequence: the skipped
+        // ones go in one range clear, and the expected sequence becomes the
+        // first loss left or the position after the frontier, at least
+        // `sequence_number` either way.
+        let skipped = sequence_number.wrapping_sub(self.expected_seq) & SEQUENCE_MASK;
+        self.loss_list.remove_range(self.expected_seq, skipped);
+        self.expected_seq = self.first_unresolved_seq();
         self.loss_list.set_base(self.expected_seq);
+        self.release_retired_packets();
     }
 
     /// Receive a packet.
@@ -2649,6 +2645,54 @@ mod tests {
             arrivals += 1;
         }
         assert_eq!(buf.packets.len(), arrivals as usize);
+    }
+
+    /// Bitmap words one forced advance may read or write.
+    const FORCED_ADVANCE_BITMAP_WORD_LIMIT: u64 = 32;
+
+    /// F04: a group member lagging behind a wide gap is advanced one
+    /// delivered packet at a time; each advance clears the losses it passes
+    /// as a range and re-derives the expected sequence, so it costs the same
+    /// at every window.
+    #[test]
+    fn forced_advance_work_is_window_independent() {
+        let now = Timestamp::from_micros(1);
+        let mut results = Vec::new();
+        for window in WORK_BOUND_WINDOWS {
+            let mut laggard =
+                ReceiverBuffer::with_buffer_size(0, 120, Timestamp::default(), 0, window);
+            laggard.receive(make_packet(window - 1, 100_000_000), now);
+            let mut worst = WorkCounters::default();
+            for target in 1..=8 {
+                let ((), work) =
+                    WorkCounters::measure(|| laggard.advance_expected_sequence(target));
+                assert_eq!(laggard.expected_sequence(), target);
+                if work.loss_entries_visited + work.bitmap_words() + work.frontier_steps
+                    > worst.loss_entries_visited + worst.bitmap_words() + worst.frontier_steps
+                {
+                    worst = work;
+                }
+            }
+            assert_eq!(laggard.stats().packets_in_loss_list, window - 1 - 8);
+            results.push((window, worst));
+        }
+        for (window, work) in &results {
+            eprintln!(
+                "window {window}: loss entries {} bitmap words {} frontier steps {} slots {}",
+                work.loss_entries_visited,
+                work.bitmap_words(),
+                work.frontier_steps,
+                work.packet_slot_probes
+            );
+        }
+        for (window, work) in results {
+            assert!(
+                work.loss_entries_visited == 0
+                    && work.frontier_steps == 0
+                    && work.bitmap_words() <= FORCED_ADVANCE_BITMAP_WORD_LIMIT,
+                "window {window}: {work:?}"
+            );
+        }
     }
 
     /// F10: a window-wide DROPREQ advances the receive state by the range's
