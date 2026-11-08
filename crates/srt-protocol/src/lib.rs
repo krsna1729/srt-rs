@@ -23,6 +23,7 @@ mod buf;
 mod crypto_impl;
 mod error;
 mod message_assembler;
+mod range_bitset;
 mod received_payload;
 mod sender_rto;
 mod srt_connection;

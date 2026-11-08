@@ -68,6 +68,7 @@
 //! Do not change the global defaults to those values.
 
 use crate::adaptive_receiver_packet_window::AdaptiveReceiverPacketWindow;
+use crate::range_bitset::RangeBitset;
 use bytes::Bytes;
 use rustc_hash::FxHashSet;
 
@@ -211,60 +212,35 @@ fn emit_sorted_runs(
     emit(start, end)
 }
 
-/// Worst-case work of one loss entry: the bitmap walks one 64-bit data word
-/// per 64 sequence positions and updates one summary word for each, so a single
-/// received packet can touch at most this many data words, even at the largest
-/// negotiated receive window. 1,024 words at the 65,536-packet limit, plus one
-/// because an unaligned start splits the run across a partial word at each end
-/// while the walk stays circular. A single position clear reads one further
-/// data word.
-const MAX_LOSS_WORDS_PER_ENTRY: usize = MAX_FLOW_WINDOW as usize / 64 + 1;
-
 /// Circular loss membership for one negotiated receive window.
 ///
-/// Storage is allocated on the first loss. Data words are followed by a
-/// summary bitmap whose set bits identify nonzero data words.
+/// Positions map onto a [`RangeBitset`] of the window rounded up to a power
+/// of two (at least 64), allocated on the first loss. A range of losses is
+/// one range assignment, so classifying or clearing a gap costs the same at
+/// every window size.
 #[derive(Debug)]
 struct LossBitmap {
-    storage: Vec<u64>,
-    word_count: u32,
+    bits: RangeBitset,
     window_size: u32,
     base_seq: u32,
-    len: u32,
 }
 
 impl LossBitmap {
     fn new(base_seq: u32, window_size: u32) -> Self {
-        Self {
-            storage: Vec::new(),
-            word_count: 0,
-            window_size,
-            base_seq,
-            len: 0,
-        }
-    }
-
-    fn ensure_storage(&mut self) {
-        if !self.storage.is_empty() {
-            return;
-        }
-        let capacity = self
-            .window_size
+        let capacity = window_size
             .max(64)
             .checked_next_power_of_two()
             .expect("receive window must fit the 31-bit sequence comparison domain")
             as usize;
-        self.word_count = (capacity / 64) as u32;
-        let word_count = self.word_count as usize;
-        debug_assert!(
-            word_count <= MAX_LOSS_WORDS_PER_ENTRY,
-            "one window cannot exceed the per-entry word budget"
-        );
-        self.storage.resize(word_count + word_count.div_ceil(64), 0);
+        Self {
+            bits: RangeBitset::new(capacity),
+            window_size,
+            base_seq,
+        }
     }
 
-    fn capacity_mask(&self) -> usize {
-        self.word_count as usize * 64 - 1
+    fn capacity(&self) -> usize {
+        self.bits.capacity()
     }
 
     fn offset(&self, seq: u32) -> Option<u32> {
@@ -273,67 +249,35 @@ impl LossBitmap {
     }
 
     fn bit_index(&self, seq: u32) -> usize {
-        seq as usize & self.capacity_mask()
+        seq as usize & (self.capacity() - 1)
+    }
+
+    /// The at most two linear bit ranges holding `count <= capacity`
+    /// positions from `first_seq`.
+    fn index_ranges(&self, first_seq: u32, count: u32) -> [(usize, usize); 2] {
+        let start = self.bit_index(first_seq);
+        let end = start + count as usize;
+        let capacity = self.capacity();
+        if end <= capacity {
+            [(start, end), (0, 0)]
+        } else {
+            [(start, capacity), (0, end - capacity)]
+        }
+    }
+
+    fn assign_range(&mut self, first_seq: u32, count: u32, value: bool) -> u32 {
+        self.index_ranges(first_seq, count)
+            .into_iter()
+            .map(|(start, end)| self.bits.assign(start, end, value))
+            .sum()
     }
 
     fn remove(&mut self, seq: u32) -> bool {
-        if self.storage.is_empty() || self.offset(seq).is_none() {
+        if self.offset(seq).is_none() {
             return false;
         }
         let index = self.bit_index(seq);
-        let word_index = index / 64;
-        let bit = 1u64 << (index % 64);
-        count_work!(BitmapDataWords);
-        let old = self.storage[word_index];
-        if old & bit == 0 {
-            return false;
-        }
-        let new = old & !bit;
-        self.storage[word_index] = new;
-        if new == 0 {
-            count_work!(BitmapSummaryWords);
-            self.storage[self.word_count as usize + word_index / 64] &=
-                !(1u64 << (word_index % 64));
-        }
-        self.len -= 1;
-        true
-    }
-
-    fn mutate_contiguous_range(&mut self, mut seq: u32, mut count: u32, insert: bool) -> u32 {
-        let mut changed = 0;
-        while count != 0 {
-            let index = self.bit_index(seq);
-            let word_index = index / 64;
-            let bit_offset = index % 64;
-            let chunk = count.min((64 - bit_offset) as u32);
-            let mask = (u64::MAX >> (64 - chunk)) << bit_offset;
-            count_work!(BitmapDataWords);
-            let old = self.storage[word_index];
-            let new = if insert { old | mask } else { old & !mask };
-            changed += if insert {
-                (!old & mask).count_ones()
-            } else {
-                (old & mask).count_ones()
-            };
-            self.storage[word_index] = new;
-            let summary = self.word_count as usize + word_index / 64;
-            let summary_bit = 1u64 << (word_index % 64);
-            if old == 0 && new != 0 {
-                count_work!(BitmapSummaryWords);
-                self.storage[summary] |= summary_bit;
-            } else if old != 0 && new == 0 {
-                count_work!(BitmapSummaryWords);
-                self.storage[summary] &= !summary_bit;
-            }
-            seq = seq.wrapping_add(chunk) & SEQUENCE_MASK;
-            count -= chunk;
-        }
-        if insert {
-            self.len += changed;
-        } else {
-            self.len -= changed;
-        }
-        changed
+        self.bits.set(index, false)
     }
 
     fn insert_range(&mut self, first_seq: u32, count: u32) -> u32 {
@@ -346,8 +290,7 @@ impl LossBitmap {
         if count > self.window_size - offset {
             return 0;
         }
-        self.ensure_storage();
-        self.mutate_contiguous_range(first_seq, count, true)
+        self.assign_range(first_seq, count, true)
     }
 
     #[cfg(test)]
@@ -356,23 +299,19 @@ impl LossBitmap {
     }
 
     fn remove_range(&mut self, first_seq: u32, count: u32) -> u32 {
-        if count == 0 || self.storage.is_empty() {
+        if count == 0 || self.is_empty() {
             return 0;
         }
         let offset = first_seq.wrapping_sub(self.base_seq) & SEQUENCE_MASK;
         if offset < self.window_size {
-            return self.mutate_contiguous_range(
-                first_seq,
-                count.min(self.window_size - offset),
-                false,
-            );
+            return self.assign_range(first_seq, count.min(self.window_size - offset), false);
         }
 
         let until_base = SEQUENCE_MASK - offset + 1;
         if count <= until_base {
             return 0;
         }
-        self.mutate_contiguous_range(
+        self.assign_range(
             self.base_seq,
             (count - until_base).min(self.window_size),
             false,
@@ -380,20 +319,15 @@ impl LossBitmap {
     }
 
     fn contains(&self, seq: u32) -> bool {
-        if self.storage.is_empty() || self.offset(seq).is_none() {
-            return false;
-        }
-        let index = self.bit_index(seq);
-        count_work!(BitmapDataWords);
-        self.storage[index / 64] & (1u64 << (index % 64)) != 0
+        self.offset(seq).is_some() && self.bits.get(self.bit_index(seq))
     }
 
     fn is_empty(&self) -> bool {
-        self.len == 0
+        self.bits.len() == 0
     }
 
-    fn len(&self) -> usize {
-        self.len as usize
+    fn len(&self) -> u32 {
+        self.bits.len()
     }
 
     fn set_base(&mut self, base_seq: u32) {
@@ -403,27 +337,22 @@ impl LossBitmap {
     fn iter(&self) -> impl Iterator<Item = u32> + '_ {
         let base_seq = self.base_seq;
         let window_size = self.window_size;
-        let word_count = self.word_count as usize;
-        let mask = word_count.saturating_mul(64).saturating_sub(1);
+        let mask = self.capacity() - 1;
         let base_index = base_seq as usize & mask;
-        self.storage[..word_count]
-            .iter()
-            .copied()
-            .enumerate()
-            .flat_map(move |(word_index, word)| {
-                count_work!(BitmapDataWords);
-                std::iter::successors((word != 0).then_some(word), |word| {
-                    let next = *word & (*word - 1);
-                    (next != 0).then_some(next)
-                })
-                .map(move |word| word_index * 64 + word.trailing_zeros() as usize)
+        (0..self.capacity() / 64).flat_map(move |word_index| {
+            let word = self.bits.word(word_index);
+            std::iter::successors((word != 0).then_some(word), |word| {
+                let next = *word & (*word - 1);
+                (next != 0).then_some(next)
             })
-            .filter_map(move |index| {
+            .filter_map(move |word| {
                 count_work!(LossEntriesVisited);
+                let index = word_index * 64 + word.trailing_zeros() as usize;
                 let offset = index.wrapping_sub(base_index) & mask;
                 (offset < window_size as usize)
                     .then_some(base_seq.wrapping_add(offset as u32) & SEQUENCE_MASK)
             })
+        })
     }
 
     fn for_each_numeric_run(&self, mut emit: impl FnMut(u32, u32)) {
@@ -432,9 +361,9 @@ impl LossBitmap {
         }
         // A fixed stack sort preserves the measured sparse-loss fast path;
         // word-native run extraction wins once there are more than eight bits.
-        if self.len <= 8 {
+        if self.len() <= 8 {
             let mut losses = [0; 8];
-            let len = self.len();
+            let len = self.len() as usize;
             for (slot, loss) in losses.iter_mut().zip(self.iter()) {
                 *slot = loss;
             }
@@ -484,7 +413,7 @@ impl LossBitmap {
             .map(offset_of)
             .filter(|&offset| offset < self.window_size)
             .unwrap_or(0);
-        if self.len <= 8 {
+        if self.len() <= 8 {
             let mut losses = [0; 8];
             let mut len = 0;
             for loss in self.iter().filter(|&loss| offset_of(loss) >= start) {
@@ -523,8 +452,7 @@ impl LossBitmap {
             let bit_offset = index % 64;
             let chunk = count.min((64 - bit_offset) as u32);
             let chunk_mask = (u64::MAX >> (64 - chunk)) << bit_offset;
-            count_work!(BitmapDataWords);
-            let mut bits = self.storage[word_index] & chunk_mask;
+            let mut bits = self.bits.word(word_index) & chunk_mask;
             while bits != 0 {
                 let run_bit = bits.trailing_zeros();
                 let run_len = (!(bits >> run_bit)).trailing_zeros();
@@ -552,53 +480,14 @@ impl LossBitmap {
         }
     }
 
-    fn next_nonzero_word(&self, start: usize, end: usize) -> Option<usize> {
-        if start >= end || self.storage.is_empty() {
-            return None;
-        }
-        let word_count = self.word_count as usize;
-        let summaries = &self.storage[word_count..];
-        let first_summary = start / 64;
-        for (summary_index, &summary) in summaries.iter().enumerate().skip(first_summary) {
-            if summary_index * 64 >= end {
-                break;
-            }
-            count_work!(BitmapSummaryWords);
-            let bits = if summary_index == first_summary {
-                summary & (u64::MAX << (start % 64))
-            } else {
-                summary
-            };
-            if bits != 0 {
-                let word_index = summary_index * 64 + bits.trailing_zeros() as usize;
-                return (word_index < end).then_some(word_index);
-            }
-        }
-        None
-    }
-
+    /// The oldest loss in sequence order from the window base.
     fn first(&self) -> Option<u32> {
-        if self.is_empty() {
-            return None;
-        }
-        let mask = self.capacity_mask();
+        let mask = self.capacity() - 1;
         let start = self.base_seq as usize & mask;
-        let start_word = start / 64;
-        let start_bit = start % 64;
-        count_work!(BitmapDataWords);
-        let suffix = self.storage[start_word] & (u64::MAX << start_bit);
-        let index = if suffix != 0 {
-            start_word * 64 + suffix.trailing_zeros() as usize
-        } else if let Some(word) = self.next_nonzero_word(start_word + 1, self.word_count as usize)
-        {
-            word * 64 + self.storage[word].trailing_zeros() as usize
-        } else if let Some(word) = self.next_nonzero_word(0, start_word) {
-            word * 64 + self.storage[word].trailing_zeros() as usize
-        } else {
-            let prefix_mask = (1u64 << start_bit).wrapping_sub(1);
-            let prefix = self.storage[start_word] & prefix_mask;
-            start_word * 64 + prefix.trailing_zeros() as usize
-        };
+        let index = self
+            .bits
+            .next_one(start, self.capacity())
+            .or_else(|| self.bits.next_one(0, start))?;
         let offset = index.wrapping_sub(start) & mask;
         Some(self.base_seq.wrapping_add(offset as u32) & SEQUENCE_MASK)
     }
@@ -1464,7 +1353,7 @@ impl ReceiverBuffer {
     }
 
     fn protocol_occupancy(&self) -> u32 {
-        (self.packets.len() as u32).saturating_add(self.loss_list.len)
+        (self.packets.len() as u32).saturating_add(self.loss_list.len())
     }
 
     fn receive_occupancy(&self) -> u32 {
@@ -1869,7 +1758,7 @@ impl ReceiverBuffer {
     fn available_buffer_packets(&self) -> u32 {
         self.max_buffer_size
             .saturating_sub(self.packets.len() as u32)
-            .saturating_sub(self.loss_list.len)
+            .saturating_sub(self.loss_list.len())
             .saturating_sub(self.application_backlog_packets)
     }
 
@@ -2237,7 +2126,7 @@ impl ReceiverBuffer {
         ReceiverStats {
             packets_in_buffer: self.packets.len() as u32,
             payload_bytes_in_buffer,
-            packets_in_loss_list: self.loss_list.len() as u32,
+            packets_in_loss_list: self.loss_list.len(),
             available_buffer_packets: self.available_buffer_packets(),
             available_buffer_bytes: None,
             max_buffer_packets: self.max_buffer_size,
@@ -2377,7 +2266,7 @@ mod tests {
     #[test]
     fn loss_bitmap_allocates_lazily_and_tracks_first_loss() {
         let mut losses = LossBitmap::new(100, 128);
-        assert!(losses.storage.is_empty());
+        assert!(!losses.bits.is_allocated());
         assert_eq!(losses.first(), None);
 
         assert!(losses.insert(102));
@@ -2398,9 +2287,9 @@ mod tests {
     #[test]
     fn default_loss_bitmap_heap_footprint_stays_bounded() {
         let mut losses = LossBitmap::new(0, DEFAULT_FLOW_WINDOW);
-        assert_eq!(losses.storage.capacity(), 0);
+        assert_eq!(losses.bits.allocated_bytes(), 0);
         assert!(losses.insert(0));
-        let bytes = losses.storage.capacity() * std::mem::size_of::<u64>();
+        let bytes = losses.bits.allocated_bytes();
         eprintln!("default LossBitmap heap footprint: {bytes} bytes");
         assert!(
             bytes <= 1_100,
@@ -2408,13 +2297,14 @@ mod tests {
         );
     }
 
+    /// 1,024 data words, three 16-word block levels and two top-level masks.
     #[test]
     fn maximum_loss_bitmap_heap_footprint_stays_bounded() {
         let mut losses = LossBitmap::new(0, MAX_FLOW_WINDOW);
         assert!(losses.insert(0));
-        let logical_bytes = losses.storage.len() * std::mem::size_of::<u64>();
-        eprintln!("maximum LossBitmap logical heap footprint: {logical_bytes} bytes");
-        assert_eq!(logical_bytes, 8_320);
+        let bytes = losses.bits.allocated_bytes();
+        eprintln!("maximum LossBitmap heap footprint: {bytes} bytes");
+        assert_eq!(bytes, 8_592);
     }
 
     #[test]
@@ -2440,48 +2330,45 @@ mod tests {
         assert_eq!(losses.len(), 89);
     }
 
-    /// One loss-list range operation walks one 64-bit data word per 64
-    /// positions, so the worst single packet the bitmap can be handed -- a peer
-    /// a full window ahead -- is bounded by `MAX_LOSS_WORDS_PER_ENTRY`, and
-    /// ordinary in-order traffic walks none. The production ISN is random, so
-    /// the unaligned case below is the common one: it touches one word more
-    /// than the aligned case because the run starts inside a word. The
-    /// receive also reads one word to check whether the packet recovered a
-    /// loss.
+    /// Bitmap words one DATA arrival may read or write, whatever gap it
+    /// classifies and whatever the window: a constant, not words per 64
+    /// positions.
+    const RECEIVE_BITMAP_WORD_LIMIT: u64 = 32;
+
+    /// The windows every work-bound test compares.
+    const WORK_BOUND_WINDOWS: [u32; 3] = [32, DEFAULT_FLOW_WINDOW, MAX_FLOW_WINDOW];
+
+    /// F11: classifying the gap a far-ahead DATA exposes is one range
+    /// assignment, so its cost does not grow with the gap. The production
+    /// ISN is random, so both an aligned and an unaligned start are covered.
     #[test]
-    fn one_loss_entry_walks_at_most_one_bitmap_word_per_64_positions() {
+    fn wide_gap_classification_work_is_window_independent() {
         let now = Timestamp::from_micros(1_000);
-
-        let mut buf =
-            ReceiverBuffer::with_buffer_size(0, 120, Timestamp::from_micros(0), 0, MAX_FLOW_WINDOW);
-        buf.set_tsbpd_enabled(false);
-        let (_, work) =
-            WorkCounters::measure(|| buf.receive(make_packet(MAX_FLOW_WINDOW - 1, 1), now));
-        assert_eq!(buf.total_lost, u64::from(MAX_FLOW_WINDOW - 1));
-        assert_eq!(
-            work.bitmap_data_words,
-            MAX_FLOW_WINDOW as u64 / 64 + 1,
-            "a full-window gap from an aligned start walks every data word once"
-        );
-
-        // The same gap from an ISN of 40 starts 40 bits into the first word,
-        // so the walk touches 1,025 words: the bound is the aligned count plus
-        // one, never more.
-        let mut buf = ReceiverBuffer::with_buffer_size(
-            40,
-            120,
-            Timestamp::from_micros(0),
-            0,
-            MAX_FLOW_WINDOW,
-        );
-        buf.set_tsbpd_enabled(false);
-        let (_, work) =
-            WorkCounters::measure(|| buf.receive(make_packet(40 + MAX_FLOW_WINDOW - 1, 1), now));
-        assert_eq!(buf.total_lost, u64::from(MAX_FLOW_WINDOW - 1));
-        assert_eq!(
-            work.bitmap_data_words,
-            MAX_LOSS_WORDS_PER_ENTRY as u64 + 1,
-            "an unaligned start splits the run across one partial word at each end"
+        let mut words = Vec::new();
+        for window in WORK_BOUND_WINDOWS {
+            for isn in [0, 40] {
+                let mut buf = ReceiverBuffer::with_buffer_size(
+                    isn,
+                    120,
+                    Timestamp::from_micros(0),
+                    0,
+                    window,
+                );
+                buf.set_tsbpd_enabled(false);
+                let far = isn + window - 1;
+                let (losses, work) =
+                    WorkCounters::measure(|| buf.receive(make_packet(far, 1), now));
+                assert_eq!(losses, Some(loss_range(isn, far - 1)));
+                assert_eq!(buf.total_lost, u64::from(window - 1));
+                words.push((window, isn, work.bitmap_words()));
+            }
+        }
+        eprintln!("(window, isn, bitmap words): {words:?}");
+        assert!(
+            words
+                .iter()
+                .all(|&(_, _, words)| words <= RECEIVE_BITMAP_WORD_LIMIT),
+            "a gap's classification must not walk the window"
         );
 
         let mut buf =
@@ -2496,19 +2383,6 @@ mod tests {
                 "an in-order packet exposes no new position"
             );
         }
-
-        let mut buf =
-            ReceiverBuffer::with_buffer_size(0, 120, Timestamp::from_micros(0), 0, MAX_FLOW_WINDOW);
-        buf.set_tsbpd_enabled(false);
-        let _ = buf.receive(make_packet(MAX_FLOW_WINDOW - 1, 1), now);
-        let (removed, work) =
-            WorkCounters::measure(|| buf.loss_list.remove_range(0, MAX_FLOW_WINDOW));
-        assert_eq!(removed, MAX_FLOW_WINDOW - 1);
-        assert_eq!(
-            work.bitmap_data_words,
-            MAX_FLOW_WINDOW as u64 / 64,
-            "a full-window drop range from an aligned start walks every data word once"
-        );
     }
 
     /// A periodic NAK walks a wrapped window oldest first, resumes inside
@@ -2768,7 +2642,7 @@ mod tests {
             Some(loss_range(0, WINDOW - 2))
         );
         assert_eq!(buf.packets.len(), 1);
-        assert_eq!(buf.loss_list.len, WINDOW - 1);
+        assert_eq!(buf.loss_list.len(), WINDOW - 1);
         assert_eq!(buf.receive_occupancy(), WINDOW);
         assert_eq!(buf.available_buffer_packets(), 0);
 
@@ -2778,7 +2652,7 @@ mod tests {
         assert!(buf.packets.contains_key(0));
         assert!(!buf.loss_list.contains(0));
         assert_eq!(buf.packets.len(), 2);
-        assert_eq!(buf.loss_list.len, WINDOW - 2);
+        assert_eq!(buf.loss_list.len(), WINDOW - 2);
         assert_eq!(buf.receive_occupancy(), WINDOW);
         assert_eq!(buf.available_buffer_packets(), 0);
     }
@@ -2845,7 +2719,7 @@ mod tests {
         buf.set_application_backlog_packets(WINDOW - 2);
         buf.drop_range(2, 2)
             .expect("two reservations exactly fill the receive capacity");
-        assert_eq!(buf.loss_list.len, 2);
+        assert_eq!(buf.loss_list.len(), 2);
         assert_eq!(buf.receive_occupancy(), WINDOW);
         assert_eq!(buf.available_buffer_packets(), 0);
     }
@@ -4813,7 +4687,7 @@ mod tests {
         let mut buf = ReceiverBuffer::new(0, 120, Timestamp::from_micros(0), 0);
         buf.set_tsbpd_enabled(false);
         buf.receive(make_packet(DEFAULT_FLOW_WINDOW - 1, 1), now);
-        assert_eq!(buf.loss_list.len(), (DEFAULT_FLOW_WINDOW - 1) as usize);
+        assert_eq!(buf.loss_list.len(), DEFAULT_FLOW_WINDOW - 1);
 
         let summary = buf
             .drop_range(0, DEFAULT_FLOW_WINDOW - 1)
