@@ -1040,6 +1040,9 @@ impl PeerSlotTarget {
 pub struct PeerTable {
     slots: DenseSlotArena<PeerSlotTarget>,
     half_open_by_caller: HashMap<(std::net::SocketAddr, u32), usize>,
+    /// Address, caller-ID and cookie indexes of every occupied slot, so a
+    /// handshake that names no slot routes without walking the arena.
+    routes: crate::route_index::RouteIndex,
     logical_peers: HashMap<LogicalPeerId, LogicalPeerTarget>,
     next_logical_peer: u64,
     source_counts: HashMap<std::net::IpAddr, usize>,
@@ -1054,7 +1057,7 @@ pub struct PeerTable {
     /// quarantine, so its length cannot exceed the quarantined population and
     /// there is no capacity to overflow: a quarantined peer's retirement token
     /// is always discoverable.
-    protocol_failure_index: VecDeque<PeerFailureKey>,
+    protocol_failure_index: crate::keyed_queue::KeyedQueue<PeerFailureKey>,
     /// Reusable per-pass scratch for records produced by the peer drain paths
     /// before they are stored on the peer/leg they belong to.
     protocol_failure_scratch: Vec<ProtocolOutputFailure>,
@@ -1062,17 +1065,14 @@ pub struct PeerTable {
     /// When the key-derivation budget is next fully replenished, in
     /// microseconds (GCRA theoretical arrival time), for the table and for
     /// each source IP that has spent part of its share. A source whose
-    /// share has refilled carries no information and is pruned.
+    /// share has refilled carries no information and is pruned. The
+    /// per-source times live in an exact expiry heap, so pruning retires
+    /// the earliest expired entries a few at a time instead of scanning.
     key_derivations_due_micros: u64,
-    key_derivations_due_by_source: HashMap<std::net::IpAddr, u64>,
-    /// Size at which `key_derivations_due_by_source` is next pruned: twice
-    /// the table rate, or twice what survived the last prune, so pruning
-    /// stays amortized O(1) per derivation however many sources are live.
-    key_derivations_prune_at: usize,
+    key_derivations_due_by_source: DueIndex<std::net::IpAddr>,
     idle_deadlines: DueIndex<PhysicalPeerKey>,
     deadlines: DenseDueIndex,
     group_deadlines: DueIndex<GroupDeadlineKey>,
-    group_deadline_values: HashMap<GroupDeadlineKey, u64>,
     ready: VecDeque<PeerSlotId>,
     event_ready: VecDeque<PeerSlotId>,
     group_ready: VecDeque<GroupReadyKey>,
@@ -1243,6 +1243,7 @@ impl PeerTable {
         Self {
             slots: DenseSlotArena::with_partition(config.max_peers, index, count),
             half_open_by_caller: HashMap::new(),
+            routes: crate::route_index::RouteIndex::default(),
             logical_peers: HashMap::new(),
             next_logical_peer: 1,
             source_counts: HashMap::new(),
@@ -1250,16 +1251,14 @@ impl PeerTable {
             established_peers: 0,
             window_memory_bytes: 0,
             retired_protocols: crate::retirement::RetiredProtocols::new(config.max_peers),
-            protocol_failure_index: VecDeque::new(),
+            protocol_failure_index: crate::keyed_queue::KeyedQueue::default(),
             protocol_failure_scratch: Vec::new(),
             half_open_deadlines: DueIndex::default(),
             key_derivations_due_micros: 0,
-            key_derivations_due_by_source: HashMap::new(),
-            key_derivations_prune_at: 2 * config.max_key_derivations_per_second as usize,
+            key_derivations_due_by_source: DueIndex::default(),
             idle_deadlines: DueIndex::default(),
             deadlines: DenseDueIndex::default(),
             group_deadlines: DueIndex::default(),
-            group_deadline_values: HashMap::new(),
             ready: VecDeque::new(),
             event_ready: VecDeque::new(),
             group_ready: VecDeque::new(),
@@ -1433,25 +1432,13 @@ impl PeerTable {
         let new_deadline = group
             .legs
             .get(&member_id)
-            .and_then(|leg| leg.timers.next_deadline())
-            .map(|deadline| deadline.as_micros());
-        let old_deadline = self.group_deadline_values.get(&deadline_key).copied();
-        if old_deadline == new_deadline {
+            .and_then(|leg| leg.timers.next_deadline());
+        if self.group_deadlines.get(&deadline_key) == new_deadline {
             return;
         }
-        if old_deadline.is_some() {
-            self.group_deadlines.remove(&deadline_key);
-        }
         match new_deadline {
-            Some(deadline) => {
-                self.group_deadline_values
-                    .insert(deadline_key.clone(), deadline);
-                self.group_deadlines
-                    .set(deadline_key, Timestamp::from_micros(deadline));
-            }
-            None => {
-                self.group_deadline_values.remove(&deadline_key);
-            }
+            Some(deadline) => self.group_deadlines.set(deadline_key, deadline),
+            None => self.group_deadlines.remove(&deadline_key),
         }
     }
 
@@ -1464,14 +1451,18 @@ impl PeerTable {
             })
             .map(|entry| entry.last_datagram_at);
         match last_datagram {
-            Some(last_datagram) => self.idle_deadlines.set(peer, last_datagram),
+            // Refreshed on every accepted datagram, so only ever moved
+            // earlier here: a later activity stamp leaves the entry where it
+            // is, and the idle prune re-indexes it from the peer's real stamp
+            // when it surfaces. No per-datagram heap work.
+            Some(last_datagram) => self.idle_deadlines.set_no_later(peer, last_datagram),
             None => self.idle_deadlines.remove(&peer),
         }
     }
 
     fn detach_peer_for_group(&mut self, peer: &PhysicalPeerKey) -> Option<AdmissionPeer> {
         let slot_idx = self.slot_index_for_key(peer)?;
-        self.deadlines.remove(slot_idx, &mut self.slots);
+        self.deadlines.remove(slot_idx);
         self.half_open_deadlines.remove(peer);
         self.idle_deadlines.remove(peer);
         self.slots.clear_ready(slot_idx);
@@ -1479,6 +1470,45 @@ impl PeerTable {
         let slot = self.slots.get_by_slot_mut(slot_idx)?;
         let prev = std::mem::replace(slot.value, PeerSlotTarget::Detached);
         prev.extract_direct()
+    }
+
+    /// Re-index `slot_idx`'s routing keys from its current contents. Called
+    /// wherever they can change: a slot filled, emptied or changing kind, and
+    /// after handshake input (which sets a listener's peer socket ID and SYN
+    /// cookie). Completed handshakes never change either, so the established
+    /// data path needs no call.
+    fn sync_route(&mut self, slot_idx: usize) {
+        let keys = self.slots.get_by_slot(slot_idx).map(|slot| {
+            let (caller_socket_id, syn_cookie) = match slot.value {
+                PeerSlotTarget::Direct(entry) => (
+                    Some(entry.conn.peer_socket_id()),
+                    Some(entry.conn.syn_cookie()),
+                ),
+                PeerSlotTarget::GroupLeg(handle) => (
+                    self.groups
+                        .get(&handle.key)
+                        .and_then(|group| group.group.member(handle.member_id))
+                        .map(|member| member.connection().peer_socket_id()),
+                    None,
+                ),
+                PeerSlotTarget::Detached => (None, None),
+            };
+            crate::route_index::RouteKeys {
+                address: slot.address,
+                caller_socket_id,
+                syn_cookie,
+            }
+        });
+        self.routes.sync(slot_idx as u32, keys);
+    }
+
+    /// The physical key of the peer occupying `slot_idx`.
+    fn physical_at_slot(&self, slot_idx: u32) -> Option<PhysicalPeerKey> {
+        let slot = self.slots.get_by_slot(slot_idx as usize)?;
+        Some(PhysicalPeerKey {
+            address: slot.address,
+            local_socket_id: slot.socket_id,
+        })
     }
 
     fn allocate_listener_socket_id(&mut self, preferred: u32) -> u32 {
@@ -1500,29 +1530,10 @@ impl PeerTable {
             return physical;
         }
         let identity = conclusion?;
-        self.slots
-            .iter()
-            .find_map(|slot| {
-                let entry = slot.value.direct()?;
-                (slot.address == peer && entry.conn.syn_cookie() == identity.syn_cookie).then_some(
-                    PhysicalPeerKey {
-                        address: slot.address,
-                        local_socket_id: slot.socket_id,
-                    },
-                )
-            })
-            .or_else(|| {
-                let mut candidates = self.slots.iter().filter(|slot| slot.address == peer);
-                let first = candidates.next()?;
-                if candidates.next().is_none() {
-                    Some(PhysicalPeerKey {
-                        address: first.address,
-                        local_socket_id: first.socket_id,
-                    })
-                } else {
-                    None
-                }
-            })
+        self.routes
+            .first_for_cookie(peer, identity.syn_cookie)
+            .or_else(|| self.routes.sole_at(peer))
+            .and_then(|slot| self.physical_at_slot(slot))
     }
 
     fn stale_conclusion(
@@ -1613,40 +1624,17 @@ impl PeerTable {
                 local_socket_id: slot.socket_id,
             });
         }
-        self.slots.iter().find_map(|slot| {
-            if slot.address != address {
-                return None;
-            }
-            match &slot.value {
-                PeerSlotTarget::Direct(entry) => (entry.conn.peer_socket_id() == caller_socket_id)
-                    .then_some(PhysicalPeerKey {
-                        address: slot.address,
-                        local_socket_id: slot.socket_id,
-                    }),
-                PeerSlotTarget::GroupLeg(handle) => {
-                    let member = self
-                        .groups
-                        .get(&handle.key)
-                        .and_then(|group| group.group.member(handle.member_id))?;
-                    (member.connection().peer_socket_id() == caller_socket_id).then_some(
-                        PhysicalPeerKey {
-                            address: slot.address,
-                            local_socket_id: slot.socket_id,
-                        },
-                    )
-                }
-                PeerSlotTarget::Detached => None,
-            }
-        })
+        self.routes
+            .first_for_caller(address, caller_socket_id)
+            .and_then(|slot| self.physical_at_slot(slot))
     }
+
+    /// The lowest-slot peer at `address`; an address alone does not tell
+    /// apart several SRT legs sharing it.
     pub fn physical_for_address(&self, address: std::net::SocketAddr) -> Option<PhysicalPeerKey> {
-        self.slots
-            .iter()
-            .find(|slot| slot.address == address)
-            .map(|slot| PhysicalPeerKey {
-                address: slot.address,
-                local_socket_id: slot.socket_id,
-            })
+        self.routes
+            .first_at(address)
+            .and_then(|slot| self.physical_at_slot(slot))
     }
 
     fn group_admission_allowed(
@@ -1869,8 +1857,7 @@ impl PeerTable {
         let source_due = self
             .key_derivations_due_by_source
             .get(&source)
-            .copied()
-            .unwrap_or(0);
+            .map_or(0, |due| due.as_micros());
         let Some(source_due) = gcra_take(
             source_due,
             now,
@@ -1886,19 +1873,20 @@ impl PeerTable {
             return false;
         };
         self.key_derivations_due_micros = table_due;
-        // Each source still refilling spent a table token within the last
-        // second, so at most about twice the table rate of them are live,
-        // and at most twice that survive into the next threshold: the map
-        // holds at most about four times the table rate between prunes.
-        if self.key_derivations_due_by_source.len() >= self.key_derivations_prune_at {
-            self.key_derivations_due_by_source
-                .retain(|_, due| *due > now);
-            self.key_derivations_prune_at = (2 * self.config.max_key_derivations_per_second
-                as usize)
-                .max(2 * self.key_derivations_due_by_source.len());
-        }
+        // An expired entry (its share refilled) is the same as none. Each
+        // derivation adds at most one entry and retires up to two expired
+        // ones, earliest first, so the map only grows while every entry is
+        // live, and drains back after a burst. A live source spent a table
+        // token within the last second, and the table grants at most twice
+        // its rate per second (burst plus refill): the map holds at most
+        // twice the table rate plus one.
+        let expired = self
+            .key_derivations_due_by_source
+            .discard_due(Timestamp::from_micros(now), 2);
+        debug_assert!(expired <= 2, "a derivation retires at most two entries");
+        count_work!(LimiterEntriesVisited, expired);
         self.key_derivations_due_by_source
-            .insert(source, source_due);
+            .set(source, Timestamp::from_micros(source_due));
         true
     }
 
@@ -2008,6 +1996,7 @@ impl PeerTable {
         if became_terminal {
             entry.rejected = true;
         }
+        self.sync_route(entry_slot);
         self.index_idle_peer(physical);
         AdmissionFeedResult {
             fed,
@@ -2221,6 +2210,7 @@ impl PeerTable {
             .source_counts
             .entry(source_key(address.ip()))
             .or_default() += 1;
+        self.sync_route(slot_idx);
         self.index_idle_peer(physical);
         self.adopt_bonded_peer(physical);
         self.mark_ready_physical(physical);
@@ -2364,6 +2354,7 @@ impl PeerTable {
                 member_id,
             });
         }
+        self.sync_route(slot_idx);
         self.mark_group_leg_ready(&key, member_id);
         self.sync_group_leg_deadline(&key, member_id);
     }
@@ -2907,7 +2898,7 @@ impl PeerTable {
     /// can only over-report, which the next bounded prune clears.
     #[must_use]
     pub fn has_idle_due(&self, now: Timestamp, idle_timeout: Duration) -> bool {
-        self.idle_deadlines.earliest_hint().is_some_and(|last| {
+        self.idle_deadlines.earliest().is_some_and(|last| {
             last.as_micros()
                 .saturating_add(duration_micros_saturating(idle_timeout))
                 <= now.as_micros()
@@ -3150,7 +3141,7 @@ impl PeerTable {
         let mut due = Vec::new();
         let (visited, due_remaining) =
             self.deadlines
-                .pop_due_bounded(now, &mut self.slots, max_work, &mut due);
+                .pop_due_bounded(now, &self.slots, max_work, &mut due);
         for slot_id in due {
             let slot_idx = slot_id.slot_idx as usize;
             if self.peer_slot_output_quarantined(slot_idx) {
@@ -3275,13 +3266,13 @@ impl PeerTable {
             if entry.output_faulted {
                 // Quarantined: leaving a live deadline would keep the table
                 // reporting due work it will never act on.
-                self.deadlines.remove(slot_idx, &mut self.slots);
+                self.deadlines.remove(slot_idx);
                 return;
             }
             if let Some(deadline) = entry.timers.next_deadline() {
-                self.deadlines.set(slot_idx, deadline, &mut self.slots);
+                self.deadlines.set(slot_idx, deadline, &self.slots);
             } else {
-                self.deadlines.remove(slot_idx, &mut self.slots);
+                self.deadlines.remove(slot_idx);
             }
         }
     }
@@ -3538,7 +3529,6 @@ impl PeerTable {
             .group_deadlines
             .pop_due_bounded(now, max_work, &mut due);
         for deadline_key in due {
-            self.group_deadline_values.remove(&deadline_key);
             self.mark_group_leg_ready(&deadline_key.group.key, deadline_key.member_id);
         }
         result
@@ -3854,7 +3844,7 @@ impl PeerTable {
         idle_timeout: Duration,
         default_us: u64,
     ) -> u64 {
-        let Some(deadline) = self.idle_deadlines.peek_min_deadline() else {
+        let Some(deadline) = self.idle_deadlines.earliest() else {
             return default_us;
         };
         let cutoff_micros = deadline
@@ -3895,12 +3885,12 @@ impl PeerTable {
     /// earlier direct-peer deadline whenever the group had any deadline).
     pub fn time_until_next_deadline(&mut self, now: Timestamp, default_us: u64) -> u64 {
         self.last_now = now;
-        let peer_deadline = self.deadlines.peek_min_deadline(&self.slots);
-        // `group_deadlines` is a `DueIndex` kept in sync with every leg's
-        // own timer (see its insert/remove call sites), so this is an
-        // O(log n) peek, not the O(groups × legs) full scan this used to
-        // be before that index existed (Opus review finding 6).
-        let group_deadline = self.group_deadlines.peek_min_deadline();
+        let peer_deadline = self.deadlines.earliest();
+        // Both indexes are exact indexed heaps kept in sync with every
+        // peer's and leg's own timers, so these are O(1) root reads: no
+        // stale-head cleanup and no O(groups × legs) scan, whatever the
+        // population (Opus review finding 6; F05).
+        let group_deadline = self.group_deadlines.earliest();
         match (peer_deadline, group_deadline) {
             (Some(a), Some(b)) => a.min(b).saturating_sub(now),
             (Some(deadline), None) | (None, Some(deadline)) => deadline.saturating_sub(now),
@@ -4271,11 +4261,14 @@ impl PeerTable {
         let slot_idx = self.slot_index_for_key(&peer)?;
         // A retired peer takes its undrained failure record with it, so the
         // index entry must go too: otherwise churn (fault, retire, repeat)
-        // accumulates keys for peers that no longer exist.
-        self.protocol_failure_index.retain(|key| match key {
-            PeerFailureKey::Direct(slot_id) => slot_id.slot_idx as usize != slot_idx,
-            PeerFailureKey::Group { .. } => true,
-        });
+        // accumulates keys for peers that no longer exist. The key is exact
+        // (slot and current generation), so this is one keyed removal, not
+        // a pass over every other peer's record.
+        self.protocol_failure_index
+            .remove(&PeerFailureKey::Direct(PeerSlotId {
+                slot_idx: slot_idx as u32,
+                generation: self.slots.slot_generation(slot_idx),
+            }));
         self.purge_physical_indexes(peer);
         let slot = if relocating {
             self.slots.lend_by_slot(slot_idx)?
@@ -4314,15 +4307,23 @@ impl PeerTable {
     }
 
     fn detach_group(&mut self, key: srt_lifecycle::LogicalGroupKey) -> Option<InboundGroup> {
-        // Purge this group's index entries with the group itself; see
-        // `remove_direct`.
-        self.protocol_failure_index.retain(|entry| match entry {
-            PeerFailureKey::Group { key: ready, .. } => ready.key != key,
-            PeerFailureKey::Direct(_) => true,
-        });
         let group = self.groups.remove(&key)?;
         self.logical_peers.remove(&group.logical_peer);
+        let token = GroupReadyKey {
+            key,
+            generation: group.generation,
+        };
         for (member_id, leg) in &group.legs {
+            // Purge each leg's failure record with the group itself, by its
+            // exact key; see `detach_direct`.
+            self.protocol_failure_index.remove(&PeerFailureKey::Group {
+                key: token.clone(),
+                member: *member_id,
+            });
+            self.group_deadlines.remove(&GroupDeadlineKey {
+                group: token.clone(),
+                member_id: *member_id,
+            });
             let connection = group
                 .group
                 .member(*member_id)
@@ -4365,10 +4366,12 @@ impl PeerTable {
 
     /// Fold one relinquished connection's SRT receiver counters into this
     /// table's retired ledger. Called on every retirement path, before the
-    /// connection leaves the table.
+    /// connection leaves the table. Reads the protocol's scalar counters,
+    /// not its buffer-walking statistics, so a retirement costs the same
+    /// whatever the connection's receive window holds.
     fn add_receiver_totals(&mut self, connection: &SrtConnection) {
         self.retired_rcv
-            .observe(connection.receiver_stats().as_ref());
+            .observe_counters(connection.receiver_loss_counters());
     }
 
     /// SRT-level receive totals across this table: the retired ledger plus a
@@ -4411,6 +4414,73 @@ impl PeerTable {
         self.physical_for_address(*peer).is_some()
     }
 
+    /// Test-only: every live logical peer.
+    #[cfg(test)]
+    pub(crate) fn logical_peer_ids_for_test(&self) -> Vec<LogicalPeerId> {
+        self.logical_peers.keys().copied().collect()
+    }
+
+    /// Test-only: assert the route indexes answer, for every occupied slot's
+    /// address, caller socket ID and cookie, exactly what the ascending
+    /// arena walk they replaced found.
+    #[cfg(test)]
+    pub(crate) fn assert_routes_match_arena_walk(&self) {
+        let caller_of =
+            |slot: &crate::dense_slot_arena::SlotRef<'_, PeerSlotTarget>| match slot.value {
+                PeerSlotTarget::Direct(entry) => Some(entry.conn.peer_socket_id()),
+                PeerSlotTarget::GroupLeg(handle) => self
+                    .groups
+                    .get(&handle.key)
+                    .and_then(|group| group.group.member(handle.member_id))
+                    .map(|member| member.connection().peer_socket_id()),
+                PeerSlotTarget::Detached => None,
+            };
+        let cookie_of = |slot: &crate::dense_slot_arena::SlotRef<'_, PeerSlotTarget>| {
+            slot.value.direct().map(|entry| entry.conn.syn_cookie())
+        };
+        let walk =
+            |matches: &dyn Fn(&crate::dense_slot_arena::SlotRef<'_, PeerSlotTarget>) -> bool| {
+                self.slots
+                    .iter()
+                    .filter(|slot| matches(slot))
+                    .map(|slot| self.slots.slot_index_for_socket_id(slot.socket_id) as u32)
+                    .collect::<Vec<_>>()
+            };
+        let callers = self.slots.iter().filter(|slot| caller_of(slot).is_some());
+        let cookies = self.slots.iter().filter(|slot| cookie_of(slot).is_some());
+        assert_eq!(
+            self.routes.sizes(),
+            (self.slots.len(), callers.count(), cookies.count()),
+            "one entry per occupied slot and key"
+        );
+        for slot in self.slots.iter() {
+            let address = slot.address;
+            let at = walk(&|other| other.address == address);
+            assert_eq!(self.routes.first_at(address), at.first().copied());
+            assert_eq!(self.routes.sole_at(address), (at.len() == 1).then(|| at[0]));
+            let caller = caller_of(&slot).unwrap_or(0);
+            for probe in [caller, caller.wrapping_add(1)] {
+                let found =
+                    walk(&|other| other.address == address && caller_of(other) == Some(probe));
+                assert_eq!(
+                    self.routes.first_for_caller(address, probe),
+                    found.first().copied(),
+                    "caller {probe:#x} at {address}"
+                );
+            }
+            let cookie = cookie_of(&slot).unwrap_or(0);
+            for probe in [cookie, cookie.wrapping_add(1)] {
+                let found =
+                    walk(&|other| other.address == address && cookie_of(other) == Some(probe));
+                assert_eq!(
+                    self.routes.first_for_cookie(address, probe),
+                    found.first().copied(),
+                    "cookie {probe:#x} at {address}"
+                );
+            }
+        }
+    }
+
     /// Test-only: the arena slot index holding a direct peer's address.
     #[cfg(test)]
     pub(crate) fn peer_slot_index_for_test(&self, peer: std::net::SocketAddr) -> Option<usize> {
@@ -4448,7 +4518,8 @@ impl PeerTable {
         self.half_open_deadlines.remove(&peer);
         self.idle_deadlines.remove(&peer);
         if let Some(slot_idx) = self.slot_index_for_key(&peer) {
-            self.deadlines.remove(slot_idx, &mut self.slots);
+            self.routes.sync(slot_idx as u32, None);
+            self.deadlines.remove(slot_idx);
             self.slots.clear_ready(slot_idx);
             self.slots.clear_event_ready(slot_idx);
         }
@@ -4734,7 +4805,7 @@ fn within_output_budget(report: &OutputDrainReport, budget: OutputDrainBudget) -
 /// budget (distinct from the action count, which the caller already
 /// tracks against `self.ready`/due-remaining state directly).
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use proptest::prelude::*;
 
@@ -5055,6 +5126,212 @@ mod tests {
         (admit, conclusion)
     }
 
+    /// `peers` established callers on one table, each through a full
+    /// handshake from its own IPv4 address.
+    pub(crate) fn established_callers(
+        table: &mut PeerTable,
+        peers: usize,
+        options: &AdmissionOptions,
+        telemetry: &IngressTelemetry,
+    ) -> Vec<(std::net::SocketAddr, SrtConnection)> {
+        (0..peers)
+            .map(|i| {
+                let peer = std::net::SocketAddr::from(([10, 1, (i >> 8) as u8, i as u8], 9000));
+                let (mut caller, conclusion) =
+                    admit_up_to_conclusion(table, peer, 0x100 + i as u32, options, telemetry);
+                admit_conclusion(table, peer, &mut caller, &conclusion, options, telemetry);
+                (peer, caller)
+            })
+            .collect()
+    }
+
+    /// F05: established DATA refreshes the idle index on every datagram, and
+    /// the Owner's report finalization asks for the next idle and protocol
+    /// deadline outside any action budget. Neither may cost work that grows
+    /// with the peer population: no heap rebuild on the datagram that
+    /// crosses a stale-amplification threshold, no stale-head cleanup on the
+    /// finalization after churn. Bound: logarithmic per call.
+    #[test]
+    fn listener_deadline_indexes_do_bounded_work_per_call() {
+        let options = AdmissionOptions::basic(0x3335, 0, false);
+        let telemetry = IngressTelemetry::new();
+        for peers in [64usize, 512, 4_096] {
+            let mut table = PeerTable::with_config(PeerTableConfig {
+                max_peers: peers,
+                max_half_open_peers: peers,
+                max_established_peers: peers,
+                ..PeerTableConfig::default()
+            });
+            let mut callers = established_callers(&mut table, peers, &options, &telemetry);
+            let limit = 4 * u64::from(peers.ilog2()) + 8;
+            let mut worst_datagram = crate::work::WorkCounters::default();
+            let mut out = Vec::new();
+            for round in 0..8u64 {
+                let now = Timestamp::from_micros(10_000 + round * 1_000);
+                for (peer, caller) in &mut callers {
+                    caller.send(b"refresh", now).expect("caller sends DATA");
+                    let datagram = next_packet(caller);
+                    let (admit, work) = crate::work::WorkCounters::measure(|| {
+                        table.admit(*peer, &datagram, now, &options, 0, 1, &telemetry)
+                    });
+                    assert_eq!(admit, Admit::Fed);
+                    if work.heap_entries_visited + work.heap_entries_cloned
+                        > worst_datagram.heap_entries_visited + worst_datagram.heap_entries_cloned
+                    {
+                        worst_datagram = work;
+                    }
+                }
+                // A service visit reschedules every touched peer's protocol
+                // deadline; its own work is budgeted and not measured here.
+                table.poll_outbound(now, &mut out);
+            }
+            // Finalization with a zero service budget: nothing pruned or
+            // popped since the churn, then both deadline queries.
+            let now = Timestamp::from_micros(20_000);
+            let (_, finalize) = crate::work::WorkCounters::measure(|| {
+                table.time_until_next_deadline(now, 100_000)
+                    + table.time_until_idle_deadline(now, Duration::from_secs(5), 100_000)
+            });
+            for (what, work) in [("datagram", worst_datagram), ("finalization", finalize)] {
+                assert!(
+                    work.heap_entries_visited + work.heap_entries_cloned <= limit,
+                    "{what} at {peers} peers: {work:?} (limit {limit})"
+                );
+            }
+        }
+    }
+
+    /// F06: a handshake that names no slot -- an INDUCTION from a caller
+    /// the table has not seen, a CONCLUSION with a cookie it never issued --
+    /// is routed before capacity rejection, so any source can repeat it per
+    /// datagram. Routing must not walk the arena's slot domain: the work is
+    /// a few index probes whatever the capacity, while the arena holds one
+    /// peer.
+    #[test]
+    fn unknown_handshakes_route_without_walking_the_arena() {
+        let telemetry = IngressTelemetry::new();
+        let options = default_options();
+        let now = Timestamp::from_micros(1_000);
+        for max_peers in [64usize, 4_096, MAX_DENSE_SLOTS] {
+            let mut table = PeerTable::with_config(PeerTableConfig {
+                max_peers,
+                max_half_open_peers: max_peers,
+                max_established_peers: max_peers,
+                max_peers_per_ip: 1,
+                half_open_timeout: Duration::from_secs(60),
+                ..PeerTableConfig::default()
+            });
+            let established: std::net::SocketAddr = "10.0.0.1:5000".parse().unwrap();
+            let (admit, _) = conclude_as(&mut table, established, None, &options, &telemetry, now);
+            assert_eq!(admit, Admit::Fed);
+
+            // An INDUCTION from a new caller on the same IP misses every
+            // index, then meets the per-source cap.
+            let (admit, induction) = crate::work::WorkCounters::measure(|| {
+                table.admit(
+                    "10.0.0.1:5001".parse().unwrap(),
+                    &induction_packet(77),
+                    now,
+                    &options,
+                    0,
+                    1,
+                    &telemetry,
+                )
+            });
+            assert_eq!(admit, Admit::Dropped(AdmissionDropReason::SourceCapacity));
+
+            // A CONCLUSION carrying another table's cookie, from an address
+            // this table has never seen.
+            let stranger: std::net::SocketAddr = "10.0.0.2:6000".parse().unwrap();
+            let mut other = PeerTable::new();
+            let conclusion = induct(&mut other, stranger, None, &options, &telemetry, now);
+            let (admit, stale) = crate::work::WorkCounters::measure(|| {
+                table.admit(stranger, &conclusion, now, &options, 0, 1, &telemetry)
+            });
+            assert_eq!(admit, Admit::Dropped(AdmissionDropReason::StaleConclusion));
+
+            for (what, work) in [("induction", induction), ("conclusion", stale)] {
+                assert_eq!(
+                    work.arena_slot_probes, 0,
+                    "{what} miss at capacity {max_peers}: {work:?}"
+                );
+                assert!(
+                    work.route_index_probes <= 2,
+                    "{what} miss at capacity {max_peers}: {work:?}"
+                );
+            }
+        }
+    }
+
+    proptest! {
+        /// F06: under admission, completion, expiry and retirement churn the
+        /// route indexes answer exactly what the arena walk they replace did.
+        #[test]
+        fn route_indexes_track_the_arena_walk(
+            ops in proptest::collection::vec((0..4u8, 0..3u16, 0..4u32), 1..40),
+        ) {
+            let mut table = PeerTable::with_config(PeerTableConfig {
+                max_peers: 64,
+                max_half_open_peers: 64,
+                max_established_peers: 64,
+                max_peers_per_ip: 64,
+                half_open_timeout: Duration::from_secs(1),
+                ..PeerTableConfig::default()
+            });
+            let telemetry = IngressTelemetry::new();
+            let options = default_options();
+            let addresses: Vec<std::net::SocketAddr> = (0..3u16)
+                .map(|port| std::net::SocketAddr::from(([10, 0, 0, 1], 7000 + port)))
+                .collect();
+            let mut now = 1_000u64;
+            for (op, port, caller) in ops {
+                now += 100_000;
+                let at = Timestamp::from_micros(now);
+                let peer = addresses[usize::from(port)];
+                match op {
+                    0 => {
+                        let _ = table.admit(peer, &induction_packet(caller), at, &options, 0, 1, &telemetry);
+                    }
+                    1 => {
+                        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+                            socket_id: 1 + caller,
+                            ..ConnectionOptions::default()
+                        });
+                        caller.connect(at).expect("start caller");
+                        let induction = next_packet(&mut caller);
+                        let _ = table.admit(peer, &induction, at, &options, 0, 1, &telemetry);
+                        let mut outbound = Vec::new();
+                        table.poll_outbound(at, &mut outbound);
+                        for (outbound_peer, packet) in outbound {
+                            if outbound_peer == peer {
+                                let _ = caller.feed_recv_buf(&packet, at);
+                            }
+                        }
+                        while let Ok(Some(output)) = caller.poll_output() {
+                            if let ConnectionOutput::SendPacket(conclusion) = output {
+                                let _ = table.admit(peer, &conclusion, at, &options, 0, 1, &telemetry);
+                                break;
+                            }
+                        }
+                    }
+                    2 => {
+                        if let Some(id) = table
+                            .physical_for_address(peer)
+                            .and_then(|physical| table.get_peer(&physical))
+                            .map(|entry| entry.logical_peer)
+                        {
+                            drop(table.remove(id));
+                        }
+                    }
+                    _ => {
+                        let _ = table.prune_half_open(at);
+                    }
+                }
+                table.assert_routes_match_arena_walk();
+            }
+        }
+    }
+
     fn encrypted_listener_options() -> AdmissionOptions {
         AdmissionOptions {
             connection_template: Some(ConnectionOptions {
@@ -5333,8 +5610,7 @@ mod tests {
 
     /// Per-source key-derivation state lives only while a source's share is
     /// refilling: however many sources come and go, the table keeps at most
-    /// four times its rate of them (twice the live ones, which are at most
-    /// twice its rate).
+    /// twice its rate of them (the live ones) plus one.
     #[test]
     fn per_source_key_derivation_state_stays_bounded() {
         const RATE: u32 = 4;
@@ -5350,8 +5626,54 @@ mod tests {
                 let source = std::net::IpAddr::from(std::net::Ipv4Addr::from(0x0A00_0000 + host));
                 let now = Timestamp::from_micros(second * 1_000_000 + step * 250_000);
                 assert!(table.take_key_derivation(source, now));
-                assert!(table.key_derivations_due_by_source.len() <= 4 * RATE as usize);
+                assert!(table.key_derivations_due_by_source.len() <= 2 * RATE as usize + 1);
             }
+        }
+    }
+
+    /// F18: the derivation that finds the source map full of expired entries
+    /// retires at most two of them, earliest first, through the expiry heap,
+    /// rather than scanning the whole map. Two seconds of derivations at
+    /// rate 64 / 512 / 4,096 fill it with 2 x rate sources, all expired by
+    /// the third.
+    #[test]
+    fn key_derivation_pruning_does_bounded_work_per_admission() {
+        for rate in [64u32, 512, 4096] {
+            let mut table = PeerTable::with_config(PeerTableConfig {
+                max_key_derivations_per_second: rate,
+                max_key_derivations_per_source_per_second: 1,
+                ..PeerTableConfig::default()
+            });
+            let mut host = 0u32;
+            let mut next_source = || {
+                host += 1;
+                std::net::IpAddr::from(std::net::Ipv4Addr::from(0x0A00_0000 + host))
+            };
+            for second in 0..2u64 {
+                let now = Timestamp::from_micros(second * 1_000_000);
+                for _ in 0..rate {
+                    assert!(table.take_key_derivation(next_source(), now));
+                }
+            }
+            let late = Timestamp::from_micros(3_000_000);
+            let source = next_source();
+            let (taken, work) =
+                crate::work::WorkCounters::measure(|| table.take_key_derivation(source, late));
+            assert!(taken);
+            // Two removals and one insertion, each a sift of at most the
+            // heap's depth.
+            let depth = u64::from(u32::BITS - (2 * rate).leading_zeros());
+            assert!(
+                work.limiter_entries_visited <= 2 && work.heap_entries_visited <= 3 * (depth + 1),
+                "rate {rate}: {work:?}"
+            );
+            // Retiring two per derivation, not one, drains the map after a
+            // burst: the rate entries of second 1 are now rate - 1.
+            assert_eq!(
+                table.key_derivations_due_by_source.len(),
+                rate as usize - 1,
+                "rate {rate}"
+            );
         }
     }
 
@@ -5471,6 +5793,7 @@ mod tests {
         table
             .slots
             .insert_at_slot(slot_idx, actual_id, addr, PeerSlotTarget::Direct(entry));
+        table.sync_route(slot_idx);
         table.established_peers += 1;
         (physical, slot_idx)
     }
@@ -5630,6 +5953,7 @@ mod tests {
                 member_id: 1,
             });
         }
+        table.sync_route(slot_idx);
 
         // 1. Mark ready enqueues slot
         table.mark_ready_physical(peer);
@@ -5739,7 +6063,7 @@ mod tests {
         table.deadlines.set(
             slot_idx,
             Timestamp::from_micros(now.as_micros() + 10),
-            &mut table.slots,
+            &table.slots,
         );
         arm_group_leg_deadline(&mut table, now, 20);
         assert_eq!(table.time_until_next_deadline(now, 999), 10);
@@ -5750,7 +6074,7 @@ mod tests {
         table.deadlines.set(
             slot_idx,
             Timestamp::from_micros(now.as_micros() + 20),
-            &mut table.slots,
+            &table.slots,
         );
         arm_group_leg_deadline(&mut table, now, 10);
         assert_eq!(table.time_until_next_deadline(now, 999), 10);
@@ -5761,7 +6085,7 @@ mod tests {
         table.deadlines.set(
             slot_idx,
             Timestamp::from_micros(now.as_micros() + 15),
-            &mut table.slots,
+            &table.slots,
         );
         assert_eq!(table.time_until_next_deadline(now, 999), 15);
 
@@ -5782,13 +6106,13 @@ mod tests {
         table.deadlines.set(
             slot_idx,
             Timestamp::from_micros(now.as_micros() - 5),
-            &mut table.slots,
+            &table.slots,
         );
         arm_group_leg_deadline(&mut table, now, 30);
         assert_eq!(table.time_until_next_deadline(now, 999), 0);
     }
 
-    fn next_packet(conn: &mut SrtConnection) -> Vec<u8> {
+    pub(crate) fn next_packet(conn: &mut SrtConnection) -> Vec<u8> {
         loop {
             match conn
                 .poll_output()
@@ -6753,6 +7077,193 @@ mod tests {
         }
     }
 
+    /// `population` established peers, each quarantined with an undrained
+    /// failure record.
+    fn quarantined_peers(table: &mut PeerTable, population: u16, telemetry: &IngressTelemetry) {
+        let options = AdmissionOptions::basic(0x9600, 20, false);
+        for i in 0..population {
+            let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 30_000 + i));
+            established_peer_with_queued_output(
+                table,
+                peer,
+                0x9600 + u32::from(i),
+                &options,
+                telemetry,
+            );
+        }
+        let mut short = ShortPeerSink {
+            committed: Vec::new(),
+            attributions: Vec::new(),
+            short_by: 8,
+            failing: None,
+        };
+        let budget = OutputDrainBudget::new(1 << 16, 1 << 16, 1 << 28);
+        let _ =
+            table.poll_outbound_bounded_to(Timestamp::from_micros(3_000_000), budget, &mut short);
+        assert_eq!(table.output_failures_pending(), usize::from(population));
+    }
+
+    /// One established peer holding `window` DATA packets in its receive
+    /// buffer: the caller's first packet never arrives, so every later one
+    /// waits behind the gap.
+    fn peer_buffering(
+        table: &mut PeerTable,
+        peer: std::net::SocketAddr,
+        window: usize,
+        telemetry: &IngressTelemetry,
+    ) -> LogicalPeerId {
+        let options = AdmissionOptions::basic(0x9700, 120, false);
+        let (mut caller, conclusion) =
+            admit_up_to_conclusion(table, peer, 0x9701, &options, telemetry);
+        admit_conclusion(table, peer, &mut caller, &conclusion, &options, telemetry);
+        let now = Timestamp::from_micros(4);
+        let mut data = Vec::new();
+        for _ in 0..=window {
+            caller.send(b"buffered", now).expect("caller sends");
+            while let Some(output) = caller.poll_output().expect("output materializes") {
+                if let ConnectionOutput::SendPacket(packet) = output
+                    && packet[0] & 0x80 == 0
+                {
+                    data.push(packet);
+                }
+            }
+        }
+        for packet in &data[1..] {
+            let admitted = table.admit(peer, packet, now, &options, 0, 1, telemetry);
+            assert_eq!(admitted, Admit::Fed);
+        }
+        let slot_idx = table.peer_slot_index_for_test(peer).expect("peer slot");
+        let entry = table
+            .direct_peer_mut_for_test(slot_idx)
+            .expect("direct peer");
+        let buffered = entry
+            .conn
+            .receiver_stats()
+            .expect("receiver")
+            .packets_in_buffer;
+        assert_eq!(buffered as usize, window, "packets held behind the gap");
+        entry.logical_peer
+    }
+
+    /// F15: retiring one peer forgets its failure record and routes by the
+    /// keys it is known by and folds its receive counters from scalars, so
+    /// the work is the same whether 8 or 512 other peers hold failure
+    /// records and whether the retiring peer buffers 4 or 512 packets.
+    #[test]
+    fn retiring_a_peer_does_work_independent_of_population_and_window() {
+        for (population, window) in [(8, 4), (64, 64), (512, 512)] {
+            let telemetry = IngressTelemetry::new();
+            let mut table = PeerTable::new();
+            quarantined_peers(&mut table, population, &telemetry);
+            let peer = std::net::SocketAddr::from(([127, 0, 0, 2], 40_000));
+            let logical = peer_buffering(&mut table, peer, window, &telemetry);
+            let before = table.receiver_totals();
+
+            let (removed, work) = crate::work::WorkCounters::measure(|| table.remove(logical));
+            assert!(removed.is_some(), "the peer is retired");
+            assert_eq!(
+                (work.retirement_probes, work.receiver_stat_entries),
+                (1, 0),
+                "population {population}, window {window}: one keyed removal, no buffer walk"
+            );
+            assert_eq!(
+                table.receiver_totals(),
+                before,
+                "its counters stay in the ledger"
+            );
+            assert_eq!(table.output_failures_pending(), usize::from(population));
+        }
+    }
+
+    /// A one-leg bonded group whose leg is quarantined with its failure key
+    /// indexed, as the group drain leaves it.
+    fn quarantined_group(table: &mut PeerTable) -> srt_lifecycle::LogicalGroupKey {
+        let address: std::net::SocketAddr = "127.0.0.3:9300".parse().expect("address");
+        let (physical, slot_idx) = insert_test_peer(table, address, 0);
+        let key = srt_lifecycle::LogicalGroupKey {
+            group_id: 3,
+            stream_id: None,
+        };
+        let mut group = srt_proto::SrtGroup::new(
+            srt_proto::handshake::SRTGROUP_MASK | 3,
+            srt_proto::GroupMode::Broadcast,
+        )
+        .expect("valid group");
+        let connection = SrtConnection::new_listener(ConnectionOptions::default());
+        table.window_memory_bytes += connection.window_memory_bound_bytes();
+        group.add_member(1, 1, connection).expect("member added");
+        if let Some(slot) = table.slots.get_by_slot_mut(slot_idx) {
+            *slot.value = PeerSlotTarget::GroupLeg(GroupMemberHandle {
+                key: key.clone(),
+                member_id: 1,
+            });
+        }
+        table.sync_route(slot_idx);
+        let leg = InboundGroupLeg {
+            output_faulted: true,
+            output_failure: None,
+            physical,
+            timers: ManualTimerStore::new(),
+            pending_outputs: VecDeque::new(),
+        };
+        let logical_peer = table.allocate_logical_peer(LogicalPeerTarget::Group(key.clone()));
+        let generation = table.allocate_group_generation();
+        table.groups.insert(
+            key.clone(),
+            InboundGroup {
+                group,
+                legs: HashMap::from([(1, leg)]),
+                leg_order: vec![1],
+                ready_legs: VecDeque::new(),
+                ready_legs_queued: HashSet::new(),
+                representative_peer: address,
+                logical_peer,
+                generation,
+                connected: true,
+                stream_deadline: None,
+                ever_connected: true,
+                data_events: 0,
+                last_data_at: Instant::now(),
+                torn_down: false,
+                logical_payloads_received: 0,
+                logical_payload_bytes_received: 0,
+                logical_payloads_sent: 0,
+                logical_payload_bytes_sent: 0,
+            },
+        );
+        table
+            .protocol_failure_index
+            .push_back(PeerFailureKey::Group {
+                key: GroupReadyKey {
+                    key: key.clone(),
+                    generation,
+                },
+                member: 1,
+            });
+        key
+    }
+
+    /// F15, bonded: retiring a group removes each leg's failure key by its
+    /// exact key, whatever the number of other quarantined peers.
+    #[test]
+    fn retiring_a_group_removes_its_failure_keys_without_a_population_pass() {
+        for population in [8, 64, 512] {
+            let telemetry = IngressTelemetry::new();
+            let mut table = PeerTable::new();
+            quarantined_peers(&mut table, population, &telemetry);
+            let key = quarantined_group(&mut table);
+            assert_eq!(table.output_failures_pending(), usize::from(population) + 1);
+
+            let (removed, work) = crate::work::WorkCounters::measure(|| table.remove_group(key));
+            assert!(removed.is_some(), "the group is retired");
+            assert_eq!(
+                work.retirement_probes, 1,
+                "population {population}: one per leg"
+            );
+            assert_eq!(table.output_failures_pending(), usize::from(population));
+        }
+    }
+
     #[test]
     fn prune_idle_closes_a_quiet_established_peer_but_leaves_an_active_one_alone() {
         let quiet_peer = "127.0.0.1:11010".parse().expect("address");
@@ -6850,6 +7361,59 @@ mod tests {
                 .expect("entry present")
                 .connected,
             "the active peer must remain connected"
+        );
+    }
+
+    /// F05: an accepted datagram only ever moves a peer's idle entry
+    /// earlier, so an active peer's entry can surface before its real idle
+    /// deadline. The prune must re-index it from the real activity stamp:
+    /// the peer is left alone then, closed once it really goes quiet, and
+    /// the idle wait is exact again afterwards.
+    #[test]
+    fn a_refreshed_peer_surfacing_early_is_reindexed_and_closed_when_quiet() {
+        let peer = "127.0.0.1:11012".parse().expect("address");
+        let options = AdmissionOptions::basic(0x9999, 20, false);
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        let (mut caller, conclusion) =
+            admit_up_to_conclusion(&mut table, peer, 0xCCCC, &options, &telemetry);
+        admit_conclusion(
+            &mut table,
+            peer,
+            &mut caller,
+            &conclusion,
+            &options,
+            &telemetry,
+        );
+        let mut events = Vec::new();
+        table.poll_events(&mut events);
+
+        let refreshed_at = Timestamp::from_micros(1_500_000);
+        caller.send(b"still here", refreshed_at).expect("send");
+        let refresh = next_packet(&mut caller);
+        assert_eq!(
+            table.admit(peer, &refresh, refreshed_at, &options, 0, 1, &telemetry),
+            Admit::Fed
+        );
+
+        let idle_timeout = Duration::from_micros(1_000_000);
+        let early = Timestamp::from_micros(2_000_000);
+        assert!(
+            table.has_idle_due(early, idle_timeout),
+            "conservative entry"
+        );
+        assert_eq!(table.prune_idle(early, idle_timeout), 0, "still active");
+        assert_eq!(
+            table.time_until_idle_deadline(early, idle_timeout, u64::MAX),
+            500_000,
+            "re-indexed at the real activity stamp"
+        );
+        assert!(!table.has_idle_due(early, idle_timeout));
+        let quiet = Timestamp::from_micros(2_500_000);
+        assert_eq!(
+            table.prune_idle(quiet, idle_timeout),
+            1,
+            "closed once quiet"
         );
     }
 

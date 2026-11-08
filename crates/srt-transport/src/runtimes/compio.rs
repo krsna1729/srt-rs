@@ -1447,17 +1447,32 @@ pub struct ListenerSide {
 struct PromotedSocket {
     sock: compio::net::UdpSocket,
     poll_fd: compio::runtime::fd::PollFd<std::net::UdpSocket>,
-    /// Readiness reported and not yet drained to `WouldBlock`.
+    /// Readiness reported and not yet drained to `WouldBlock`; such a slot
+    /// is in the ready queue.
     ready: bool,
+    /// Polls this socket's readiness, naming its slot when it completes.
+    waker: std::task::Waker,
 }
 
 /// Connected sockets of this listener's promoted sessions. Empty unless the
 /// listener's plan relocates.
+///
+/// Finding receive work costs O(sockets whose state changed), never
+/// O(sockets) or O(the high-water mark): readable sockets wait in `ready`,
+/// sockets that need their readiness (re)polled wait in `unarmed` or were
+/// named by their own waker, and the rest cost nothing until the kernel
+/// reports them. A removed socket may leave its slot in these lists; such a
+/// stale entry is skipped once when reached, so each removal adds at most
+/// one probe per list.
 #[derive(Default)]
 struct PromotedSockets {
     slots: Vec<Option<PromotedSocket>>,
     free: Vec<usize>,
     by_peer: std::collections::HashMap<SocketAddr, usize>,
+    ready: VecDeque<usize>,
+    /// Slots to poll for readiness: drained sockets, then those woken.
+    unarmed: Vec<usize>,
+    wakeups: crate::slot_wakeups::SlotWakeups,
 }
 
 impl PromotedSockets {
@@ -1470,22 +1485,18 @@ impl PromotedSockets {
         socket.set_nonblocking(true)?;
         let sock = compio::net::UdpSocket::from_std(socket)?;
         let poll_fd = make_poll_fd(&sock)?;
-        let entry = PromotedSocket {
+        let slot = self.free.pop().unwrap_or_else(|| {
+            self.slots.push(None);
+            self.slots.len() - 1
+        });
+        self.slots[slot] = Some(PromotedSocket {
             sock,
             poll_fd,
             // Datagrams may have queued between bind and registration.
             ready: true,
-        };
-        let slot = match self.free.pop() {
-            Some(slot) => {
-                self.slots[slot] = Some(entry);
-                slot
-            }
-            None => {
-                self.slots.push(Some(entry));
-                self.slots.len() - 1
-            }
-        };
+            waker: self.wakeups.waker(slot),
+        });
+        self.ready.push_back(slot);
         self.by_peer.insert(peer, slot);
         Ok(())
     }
@@ -1497,37 +1508,66 @@ impl PromotedSockets {
         }
     }
 
+    /// Whether a socket is known readable (or a stale entry is queued).
+    /// Sockets still to (re)poll are covered by [`Self::poll_ready`].
     fn any_ready(&self) -> bool {
-        self.slots.iter().flatten().any(|entry| entry.ready)
+        !self.ready.is_empty()
     }
 
-    /// The raw fd of promoted socket `slot` while it has receive readiness.
-    fn ready_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
+    /// The next readable socket's slot and raw fd, leaving it queued.
+    fn next_ready(&mut self) -> Option<(usize, std::os::fd::RawFd)> {
         use std::os::fd::AsRawFd;
-        let entry = self.slots.get(slot)?.as_ref()?;
-        entry
-            .ready
-            .then(|| compio::net::UdpSocket::as_raw_fd(&entry.sock))
-    }
-
-    /// Promoted socket `slot` would block: wait for its next readiness.
-    fn set_drained(&mut self, slot: usize) {
-        if let Some(entry) = self.slots.get_mut(slot).and_then(Option::as_mut) {
-            entry.ready = false;
-        }
-    }
-
-    /// Record readiness of every promoted socket, registering the waker for
-    /// the rest. Whether any socket has receive work.
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> bool {
-        let mut any = false;
-        for entry in self.slots.iter_mut().flatten() {
-            if !entry.ready && entry.poll_fd.poll_read_ready(cx).is_ready() {
-                entry.ready = true;
+        while let Some(&slot) = self.ready.front() {
+            count_work!(PromotedSlotProbes);
+            match self.slots[slot].as_ref() {
+                Some(entry) if entry.ready => {
+                    return Some((slot, compio::net::UdpSocket::as_raw_fd(&entry.sock)));
+                }
+                _ => {
+                    self.ready.pop_front();
+                }
             }
-            any |= entry.ready;
         }
-        any
+        None
+    }
+
+    /// Promoted socket `slot`, the head of the ready queue, would block:
+    /// poll for its next readiness.
+    fn set_drained(&mut self, slot: usize) {
+        debug_assert_eq!(self.ready.front(), Some(&slot));
+        self.ready.pop_front();
+        if let Some(entry) = self.slots[slot].as_mut() {
+            entry.ready = false;
+            self.unarmed.push(slot);
+        }
+    }
+
+    /// Poll the readiness of every socket drained or woken since the last
+    /// call, each with its own waker, queueing those already readable.
+    fn arm(&mut self) {
+        self.wakeups.take_woken(&mut self.unarmed);
+        for slot in self.unarmed.drain(..) {
+            count_work!(PromotedSlotProbes);
+            let Some(entry) = self.slots[slot].as_mut() else {
+                continue;
+            };
+            if entry.ready {
+                continue;
+            }
+            let mut slot_cx = Context::from_waker(&entry.waker);
+            if entry.poll_fd.poll_read_ready(&mut slot_cx).is_ready() {
+                entry.ready = true;
+                self.ready.push_back(slot);
+            }
+        }
+    }
+
+    /// Whether any socket has receive work, waking this task when one's
+    /// readiness changes later.
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> bool {
+        self.wakeups.register_task(cx.waker());
+        self.arm();
+        !self.ready.is_empty()
     }
 }
 
@@ -5386,52 +5426,55 @@ impl Owner {
     }
 
     /// Drain each ready promoted socket in `recvmmsg` batches until it would
-    /// block or the visit budget runs out (it then stays ready).
+    /// block or the visit budget runs out (it then stays ready, first in
+    /// line). Only queued sockets are visited.
     fn drain_promoted_rx(
         listener: &mut ListenerSide,
         now: Timestamp,
         budget: &OwnerServiceBudget,
         report: &mut OwnerServiceReport,
     ) {
-        for slot in 0..listener.promoted.slots.len() {
-            while let Some(raw_fd) = listener.promoted.ready_fd(slot) {
-                let requested = Self::rx_batch_request(listener, budget, report);
-                if requested == 0 {
-                    return;
-                }
-                match listener.rx_batch.recv(raw_fd, requested) {
-                    Ok(received) => {
-                        let ListenerSide {
-                            rx_batch,
+        listener.promoted.arm();
+        loop {
+            let requested = Self::rx_batch_request(listener, budget, report);
+            if requested == 0 {
+                return;
+            }
+            let Some((slot, raw_fd)) = listener.promoted.next_ready() else {
+                return;
+            };
+            match listener.rx_batch.recv(raw_fd, requested) {
+                Ok(received) => {
+                    let ListenerSide {
+                        rx_batch,
+                        table,
+                        resolver,
+                        options,
+                        telemetry,
+                        routing,
+                        ..
+                    } = listener;
+                    Self::charge_rx_batch(rx_batch, received, report, |peer, datagram| {
+                        admit_listener_datagram(
                             table,
-                            resolver,
+                            resolver.as_ref(),
                             options,
                             telemetry,
+                            peer,
+                            datagram,
+                            now,
                             routing,
-                            ..
-                        } = listener;
-                        Self::charge_rx_batch(rx_batch, received, report, |peer, datagram| {
-                            admit_listener_datagram(
-                                table,
-                                resolver.as_ref(),
-                                options,
-                                telemetry,
-                                peer,
-                                datagram,
-                                now,
-                                routing,
-                            );
-                        });
-                        if received < requested {
-                            listener.promoted.set_drained(slot);
-                        }
+                        );
+                    });
+                    if received < requested {
+                        listener.promoted.set_drained(slot);
                     }
-                    // ICMP port-unreachable on a connected socket is this
-                    // session's condition (its SRT timers handle it); data
-                    // may still follow.
-                    Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
-                    Err(_) => listener.promoted.set_drained(slot),
                 }
+                // ICMP port-unreachable on a connected socket is this
+                // session's condition (its SRT timers handle it); data
+                // may still follow.
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+                Err(_) => listener.promoted.set_drained(slot),
             }
         }
     }
@@ -6564,6 +6607,132 @@ mod tests {
             bg_handle.join().unwrap();
         });
     }
+
+    /// F05: every service visit's report finalization reads the listener's
+    /// next idle and protocol deadlines outside any budget. After deadline
+    /// churn across many peers, a visit with a zero budget -- no RX, no
+    /// maintenance, no TX -- still costs O(log n) heap work at most.
+    #[test]
+    fn zero_budget_visit_finalizes_without_heap_cleanup() {
+        use crate::admission::tests::{established_callers, next_packet};
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            for peers in [64usize, 512, 4_096] {
+                let l_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind listener");
+                let l_addr = l_std.local_addr().expect("listener addr");
+                let l_sock = compio::net::UdpSocket::from_std(l_std).expect("adopt listener");
+                let l_cfg = crate::ListenerConfig::builder(l_addr)
+                    .build()
+                    .expect("listener config");
+                let listener = ListenerSide::new(l_sock, &l_cfg).expect("listener side");
+                let mut owner = Owner::new(16).with_listener(listener);
+                let options = crate::AdmissionOptions::basic(0x3335, 0, false);
+                let telemetry = IngressTelemetry::new();
+                let table = &mut owner.listener.as_mut().expect("listener").table;
+                let mut callers = established_callers(table, peers, &options, &telemetry);
+                let mut out = Vec::new();
+                for round in 0..8u64 {
+                    let now = Timestamp::from_micros(10_000 + round * 1_000);
+                    for (peer, caller) in &mut callers {
+                        caller.send(b"refresh", now).expect("caller sends DATA");
+                        let datagram = next_packet(caller);
+                        table.admit(*peer, &datagram, now, &options, 0, 1, &telemetry);
+                    }
+                    table.poll_outbound(now, &mut out);
+                }
+                let zero = OwnerServiceBudget {
+                    max_completions: 0,
+                    max_rx_packets: 0,
+                    max_rx_bytes: 0,
+                    max_actions: 0,
+                    max_maintenance_actions: 0,
+                    max_tx_packets: 0,
+                    max_tx_bytes: 0,
+                };
+                let before = crate::work::WorkCounters::snapshot();
+                let report = owner.service(Timestamp::from_micros(20_000), zero).await;
+                let work = crate::work::WorkCounters::since(before);
+                assert!(report.next_deadline_us.is_some());
+                let limit = 4 * u64::from(peers.ilog2()) + 8;
+                assert!(
+                    work.heap_entries_visited + work.heap_entries_cloned <= limit,
+                    "zero-budget visit at {peers} peers: {work:?} (limit {limit})"
+                );
+            }
+        });
+    }
+
+    /// F14: finding promoted receive work costs O(sockets that became
+    /// ready), not O(the promoted high-water mark). After a peak of
+    /// promoted sessions all but one retire. The survivor's first datagram
+    /// is found and received by one wait and one RX-budget-1 visit that pay
+    /// at most one probe per retired socket (its stale queue entry, once);
+    /// every later datagram costs a constant number of slot probes.
+    #[test]
+    fn promoted_rx_examines_only_ready_sockets_after_a_peak() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+        runtime.block_on(async {
+            for peak in [8usize, 64, 512] {
+                let l_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind listener");
+                let l_addr = l_std.local_addr().expect("listener addr");
+                let l_sock = compio::net::UdpSocket::from_std(l_std).expect("adopt listener");
+                let l_cfg = crate::ListenerConfig::builder(l_addr)
+                    .build()
+                    .expect("listener config");
+                let listener = ListenerSide::new(l_sock, &l_cfg).expect("listener side");
+                let mut owner = Owner::new(16).with_listener(listener);
+                let side = owner.listener.as_mut().expect("listener");
+                let mut remotes = Vec::with_capacity(peak);
+                for _ in 0..peak {
+                    let remote = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind remote");
+                    let local = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind promoted");
+                    local
+                        .connect(remote.local_addr().expect("addr"))
+                        .expect("connect");
+                    remote
+                        .connect(local.local_addr().expect("addr"))
+                        .expect("connect");
+                    side.promoted
+                        .insert(remote.local_addr().expect("addr"), local)
+                        .expect("promote");
+                    remotes.push(remote);
+                }
+                let now = Timestamp::from_micros(1_000);
+                // Every new socket starts ready: one visit drains them all.
+                let mut report = OwnerServiceReport::default();
+                Owner::drain_promoted_rx(side, now, &OwnerServiceBudget::default(), &mut report);
+                for remote in &remotes[..peak - 1] {
+                    side.promoted.remove(remote.local_addr().expect("addr"));
+                }
+                let one_rx = OwnerServiceBudget {
+                    max_rx_packets: 1,
+                    ..OwnerServiceBudget::default()
+                };
+                let survivor = &remotes[peak - 1];
+                let mut cycles = Vec::new();
+                for _ in 0..2 {
+                    survivor.send(b"not srt").expect("send");
+                    let before = crate::work::WorkCounters::snapshot();
+                    let waited = std::time::Instant::now();
+                    owner
+                        .wait_for_activity(std::time::Duration::from_secs(5))
+                        .await;
+                    assert!(
+                        waited.elapsed() < std::time::Duration::from_secs(2),
+                        "the survivor's readiness wakes the Owner"
+                    );
+                    let report = owner.service(now, one_rx).await;
+                    let work = crate::work::WorkCounters::since(before);
+                    assert_eq!(report.rx_packets, 1, "the survivor's datagram is received");
+                    cycles.push(work.promoted_slot_probes);
+                }
+                let retired = peak as u64 - 1;
+                assert!(cycles[0] <= 4 + retired, "peak {peak}: {cycles:?}");
+                assert!(cycles[1] <= 4, "peak {peak}: {cycles:?}");
+            }
+        });
+    }
+
     #[test]
     fn staged_pending_rx_obeys_rx_budget_and_signals_continuation() {
         let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");

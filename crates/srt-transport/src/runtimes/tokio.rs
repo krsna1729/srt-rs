@@ -1102,16 +1102,31 @@ fn side_needs_immediate_work(
 /// Connected sockets of this listener's promoted sessions (promoted here or
 /// relocated here). Receive-only: the kernel delivers each session's 4-tuple
 /// to its socket, while replies leave through the listener socket, whose
-/// address is the same. Empty unless the listener's plan relocates. Tokio
-/// readiness flags make a visit to a socket that is not ready free of
-/// syscalls, so a visit costs one flag check per promoted socket.
+/// address is the same. Empty unless the listener's plan relocates.
+///
+/// Finding receive work costs O(sockets whose state changed), never
+/// O(sockets) or O(the high-water mark): readable sockets wait in `ready`,
+/// sockets that need their readiness (re)polled wait in `unarmed` or were
+/// named by their own waker, and the rest cost nothing until the reactor
+/// reports them. A removed socket may leave its slot in these lists; such a
+/// stale entry is skipped once when reached.
 #[derive(Default)]
 struct PromotedSockets {
-    slots: Vec<Option<UdpSocket>>,
+    slots: Vec<Option<PromotedSocket>>,
     free: Vec<usize>,
     by_peer: std::collections::HashMap<SocketAddr, usize>,
-    /// Receive drain stopped on budget, not on `WouldBlock`.
-    recv_pending: bool,
+    ready: VecDeque<usize>,
+    /// Slots to poll for readiness: drained sockets, then those woken.
+    unarmed: Vec<usize>,
+    wakeups: crate::slot_wakeups::SlotWakeups,
+}
+
+struct PromotedSocket {
+    socket: UdpSocket,
+    /// Queued in `ready`: readable, or not yet drained to `WouldBlock`.
+    ready: bool,
+    /// Polls this socket's readiness, naming its slot when it completes.
+    waker: std::task::Waker,
 }
 
 impl PromotedSockets {
@@ -1119,19 +1134,18 @@ impl PromotedSockets {
         self.remove(peer);
         socket.set_nonblocking(true)?;
         let socket = UdpSocket::from_std(socket)?;
-        let slot = match self.free.pop() {
-            Some(slot) => {
-                self.slots[slot] = Some(socket);
-                slot
-            }
-            None => {
-                self.slots.push(Some(socket));
-                self.slots.len() - 1
-            }
-        };
+        let slot = self.free.pop().unwrap_or_else(|| {
+            self.slots.push(None);
+            self.slots.len() - 1
+        });
+        self.slots[slot] = Some(PromotedSocket {
+            socket,
+            // Datagrams may have queued between bind and registration.
+            ready: true,
+            waker: self.wakeups.waker(slot),
+        });
+        self.ready.push_back(slot);
         self.by_peer.insert(peer, slot);
-        // Datagrams may have queued between bind and registration.
-        self.recv_pending = true;
         Ok(())
     }
 
@@ -1146,14 +1160,39 @@ impl PromotedSockets {
         self.by_peer.is_empty()
     }
 
-    /// Ready when any promoted socket is readable.
-    fn poll_ready(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
-        for socket in self.slots.iter().flatten() {
-            if let std::task::Poll::Ready(result) = socket.poll_recv_ready(cx) {
-                return std::task::Poll::Ready(result);
+    /// Receive work is queued: the next visit must not wait for readiness.
+    fn recv_pending(&self) -> bool {
+        !self.ready.is_empty()
+    }
+
+    /// Poll the readiness of every socket drained or woken since the last
+    /// call, each with its own waker, queueing those already readable.
+    fn arm(&mut self) {
+        self.wakeups.take_woken(&mut self.unarmed);
+        for slot in self.unarmed.drain(..) {
+            count_work!(PromotedSlotProbes);
+            let Some(entry) = self.slots[slot].as_mut() else {
+                continue;
+            };
+            if entry.ready {
+                continue;
+            }
+            let mut slot_cx = std::task::Context::from_waker(&entry.waker);
+            if entry.socket.poll_recv_ready(&mut slot_cx).is_ready() {
+                entry.ready = true;
+                self.ready.push_back(slot);
             }
         }
-        std::task::Poll::Pending
+    }
+
+    /// Ready when a socket's readiness changed since the last [`Self::arm`].
+    fn poll_ready(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        self.wakeups.register_task(cx.waker());
+        if self.wakeups.has_woken() {
+            std::task::Poll::Ready(Ok(()))
+        } else {
+            std::task::Poll::Pending
+        }
     }
 }
 
@@ -1217,24 +1256,32 @@ impl OwnerListenerSide {
         self.telemetry.record_promotion_failures(failed);
     }
 
-    /// Drain every promoted socket through the listener's admission path
-    /// (the table demultiplexes by socket ID).
+    /// Drain every readable promoted socket through the listener's
+    /// admission path (the table demultiplexes by socket ID), then poll the
+    /// drained ones' readiness so their next datagram wakes this Owner.
     fn drain_promoted(&mut self, now: Timestamp) -> io::Result<()> {
-        if self.promoted.is_empty() {
-            return Ok(());
-        }
-        let (peers, admission, telemetry, resolver, routing) = (
+        let (peers, admission, telemetry, resolver, routing, promoted) = (
             &mut self.peers,
             &self.admission,
             &self.telemetry,
             self.resolver.as_ref(),
             &mut self.routing,
+            &mut self.promoted,
         );
-        let mut recv_pending = false;
+        promoted.arm();
         let mut first_error = None;
-        for socket in self.promoted.slots.iter().flatten() {
-            match drain_readable_bytes(
-                socket,
+        // One pass over the sockets queued now; one that stays readable
+        // goes to the back for the next visit.
+        for _ in 0..promoted.ready.len() {
+            let Some(slot) = promoted.ready.pop_front() else {
+                break;
+            };
+            count_work!(PromotedSlotProbes);
+            let Some(entry) = promoted.slots[slot].as_mut().filter(|entry| entry.ready) else {
+                continue;
+            };
+            let drained = match drain_readable_bytes(
+                &entry.socket,
                 &mut self.recv_batch,
                 self.transport.recv_budget,
                 now,
@@ -1243,21 +1290,24 @@ impl OwnerListenerSide {
                     routing.admit_bytes(peers, resolver, peer, data, at, admission, telemetry);
                 },
             ) {
-                Ok(report) => {
-                    recv_pending |= receive_continuation(report, self.transport.recv_budget);
-                }
+                Ok(report) => !receive_continuation(report, self.transport.recv_budget),
                 // A connected socket reports an ICMP port-unreachable as
                 // ECONNREFUSED once; it is this session's condition, which
                 // its SRT timers already handle. Drain again next visit.
-                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
-                    recv_pending = true;
-                }
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => false,
                 Err(error) => {
                     first_error.get_or_insert(error);
+                    true
                 }
+            };
+            if drained {
+                entry.ready = false;
+                promoted.unarmed.push(slot);
+            } else {
+                promoted.ready.push_back(slot);
             }
         }
-        self.promoted.recv_pending = recv_pending;
+        promoted.arm();
         first_error.map_or(Ok(()), Err)
     }
 }
@@ -1602,7 +1652,7 @@ impl Owner {
                 side.output_pending,
                 side.write_blocked,
                 side.outbound.is_empty(),
-            ) || side.promoted.recv_pending
+            ) || side.promoted.recv_pending()
         }) || self.caller.as_ref().is_some_and(|side| {
             side_needs_immediate_work(
                 side.recv_pending,
@@ -3894,6 +3944,87 @@ mod owner_tests {
             }
         }
         false
+    }
+
+    /// F14: finding promoted receive work costs O(sockets that became
+    /// ready), not O(the promoted high-water mark). After a peak of
+    /// promoted sessions all but one retire. The survivor's first datagram
+    /// pays at most one probe per retired socket (its stale queue entry,
+    /// once); every later datagram costs a constant number of slot probes.
+    #[test]
+    fn promoted_rx_examines_only_ready_sockets_after_a_peak() {
+        test_runtime().block_on(async {
+            let start = std::time::Instant::now();
+            for peak in [8usize, 64, 512] {
+                let mut owner = Owner::new();
+                owner.listen(&listener_config()).expect("listen");
+                let side = owner.listener.as_mut().expect("listener");
+                let mut remotes = Vec::with_capacity(peak);
+                for _ in 0..peak {
+                    let remote = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind remote");
+                    let local = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind promoted");
+                    local
+                        .connect(remote.local_addr().expect("addr"))
+                        .expect("connect");
+                    remote
+                        .connect(local.local_addr().expect("addr"))
+                        .expect("connect");
+                    side.promoted
+                        .insert(remote.local_addr().expect("addr"), local)
+                        .expect("promote");
+                    remotes.push(remote);
+                }
+                // Every new socket starts ready: one visit drains them all.
+                owner
+                    .run_once(
+                        Duration::ZERO,
+                        || now_ts(start),
+                        OutputDrainBudget::default(),
+                    )
+                    .await
+                    .expect("run_once");
+                let side = owner.listener.as_mut().expect("listener");
+                for remote in &remotes[..peak - 1] {
+                    side.promoted.remove(remote.local_addr().expect("addr"));
+                }
+                let survivor = &remotes[peak - 1];
+                let mut cycles = Vec::new();
+                for _ in 0..2 {
+                    let invalid = owner
+                        .listener_telemetry()
+                        .expect("listener")
+                        .invalid_datagrams;
+                    survivor.send(b"not srt").expect("send");
+                    let before = crate::work::WorkCounters::snapshot();
+                    let waited = std::time::Instant::now();
+                    owner
+                        .run_once(
+                            Duration::from_secs(5),
+                            || now_ts(start),
+                            OutputDrainBudget::default(),
+                        )
+                        .await
+                        .expect("run_once");
+                    let work = crate::work::WorkCounters::since(before);
+                    assert!(
+                        waited.elapsed() < Duration::from_secs(2),
+                        "the survivor's readiness wakes the Owner"
+                    );
+                    assert_eq!(
+                        owner
+                            .listener_telemetry()
+                            .expect("listener")
+                            .invalid_datagrams,
+                        invalid + 1,
+                        "the survivor's datagram is received"
+                    );
+                    cycles.push(work.promoted_slot_probes);
+                }
+                let retired = peak as u64 - 1;
+                assert!(cycles[0] <= 4 + retired, "peak {peak}: {cycles:?}");
+                assert!(cycles[1] <= 4, "peak {peak}: {cycles:?}");
+            }
+        });
     }
 
     /// A05: the Tokio-native `Owner` must connect, exchange a known

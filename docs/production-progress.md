@@ -749,3 +749,53 @@ Evidence. One test per finding compares W = 32 / 8,192 / 65,536 with
 `WorkCounters`; `send_entry_points_do_window_independent_work` replays
 random send-side streams at all three windows. Before/after counts and
 mutations are in each commit message.
+
+## Transport work is independent of the peer population
+
+Each transport path below could be driven by remote traffic, once per
+datagram or per Owner service visit, into work proportional to the peer
+population or the arena size. Each is now bounded per call.
+
+- Unknown handshakes (F06). INDUCTION and CONCLUSION misses resolve through
+  exact route indexes kept beside the slot arena (address, address + caller
+  socket ID, address + SYN cookie), updated where handshake state changes.
+  A miss used to walk the whole arena, empty slots included, once or twice.
+- Listener deadlines (F05). The protocol, group-leg and idle deadline indexes
+  are exact indexed binary heaps: O(log n) per set, move or removal, and the
+  next deadline is the root. The lazy heaps they replace cloned every live key
+  on the datagram that crossed the stale threshold and popped stale heads
+  during report finalization, outside every budget. The idle index only moves
+  a peer's entry earlier, so the per-datagram activity refresh does no heap
+  work; the bounded idle prune re-indexes a peer that surfaces early.
+- Promoted sockets (F14). compio and Tokio find promoted receive work through
+  a ready queue filled by per-socket wakers instead of walking every promoted
+  slot each wait and visit. A retired socket leaves at most one stale entry,
+  skipped once.
+- Retirement (F15). Detaching a listener peer, a bonded group or a caller
+  session removes its failure, fault and resolution entries and its caller
+  routes by their exact keys, a constant number per leg: the failure, fault
+  and resolution indexes are keyed FIFOs (O(log n) removal), and routes are
+  removed by each leg's own socket ID. The retired-counter ledger reads the
+  protocol's scalar loss and duplicate counters, not `receiver_stats`, which
+  walks the receive buffer. These used to be a `retain` over every other
+  session's entries plus an O(window) buffer walk. The caller table's stale
+  ready-queue compaction stays amortized: it runs only once stale entries
+  outnumber live sessions three to one, so it is O(1) per push or detach, and
+  a keyed queue there would tax every `enqueue_ready` on the data path.
+- Admission limiter and preferred slots (F18). The key-derivation limiter
+  keeps each source's refill time in an exact expiry heap; every derivation
+  retires at most two expired sources, earliest first, so the map stays
+  within twice the table rate plus one and drains after a burst. It used to
+  `retain` the whole map (up to twice the table rate, and the rate goes up to
+  1,000,000) on the derivation that crossed its threshold. Honoring a
+  preferred socket ID still searches the free list linearly, but only for a
+  slot that has never been used, and that allocation uses it: at most one
+  search per slot in the arena's life. The preferred ID is the listener's
+  configured `AdmissionOptions::socket_id`, not a value a datagram carries,
+  so in practice the search runs once per table.
+
+Evidence. `WorkCounters` (unit tests only) count arena slot probes, route
+index probes, heap entries visited or cloned, promoted slot probes,
+retirement index probes, receiver-stat entries walked, limiter entries
+visited and free-slot probes. Each finding has a test at three sizes;
+before/after counts and mutations are in each commit message.

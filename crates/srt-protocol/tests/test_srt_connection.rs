@@ -974,6 +974,38 @@ fn test_receiver_stats() {
     assert_eq!(stats.total_received, 1);
 }
 
+/// The O(1) loss counters read the same totals the buffer-walking
+/// statistics report, after both a gap and a duplicate.
+#[test]
+fn receiver_loss_counters_match_receiver_stats() {
+    let mut caller = SrtConnection::new_caller(test_options());
+    let mut listener = SrtConnection::new_listener(test_options());
+    assert_eq!(listener.receiver_loss_counters(), None);
+    establish_connection(&mut caller, &mut listener).expect("connection should be established");
+
+    let now = ts(100_000);
+    let mut data = Vec::new();
+    for payload in [&b"one"[..], b"two", b"three"] {
+        caller.send(payload, now).expect("send should succeed");
+        while let Some(output) = caller.poll_output().unwrap() {
+            if let ConnectionOutput::SendPacket(packet) = output {
+                data.push(packet);
+            }
+        }
+    }
+    // The first twice (a duplicate), the second never (a gap).
+    for packet in [&data[0], &data[0], &data[2]] {
+        listener.feed_recv_buf(packet, now).expect("DATA accepted");
+    }
+
+    let stats = listener.receiver_stats().expect("receiver stats");
+    let counters = listener.receiver_loss_counters().expect("loss counters");
+    assert_eq!(stats.total_duplicates, 1);
+    assert!(stats.total_lost >= 1, "the gap counts as lost");
+    assert_eq!(counters.total_lost, stats.total_lost);
+    assert_eq!(counters.total_duplicates, stats.total_duplicates);
+}
+
 #[test]
 #[expect(clippy::cognitive_complexity)]
 fn connection_stats_cover_restream_quality_inputs() {

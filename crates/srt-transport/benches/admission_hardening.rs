@@ -675,7 +675,7 @@ fn bench_dense_due_index_scaling(c: &mut Criterion) {
                         ));
                         let (s, id) = arena.allocate_socket_id(0).unwrap();
                         arena.insert_at_slot(s, id, addr, i);
-                        index.set(s, Timestamp::from_micros(1000), &mut arena);
+                        index.set(s, Timestamp::from_micros(1000), &arena);
                         slots.push(s);
                     }
                     (arena, slots, index)
@@ -690,7 +690,7 @@ fn bench_dense_due_index_scaling(c: &mut Criterion) {
             );
         });
 
-        // 3. Peek min deadline with stale heads present
+        // 3. Peek min deadline after every deadline was replaced
         group.bench_function(format!("peek_min_stale/{size}"), |b| {
             b.iter_batched_ref(
                 || {
@@ -704,20 +704,20 @@ fn bench_dense_due_index_scaling(c: &mut Criterion) {
                         let (s, id) = arena.allocate_socket_id(0).unwrap();
                         arena.insert_at_slot(s, id, addr, i);
                         // Stale early deadline + live later deadline
-                        index.set(s, Timestamp::from_micros(500), &mut arena);
-                        index.set(s, Timestamp::from_micros(1000 + i as u64), &mut arena);
+                        index.set(s, Timestamp::from_micros(500), &arena);
+                        index.set(s, Timestamp::from_micros(1000 + i as u64), &arena);
                     }
                     (arena, index)
                 },
                 |state| {
-                    let (arena, index) = state;
-                    black_box(index.peek_min_deadline(arena));
+                    let (_arena, index) = state;
+                    black_box(index.earliest());
                 },
                 BatchSize::SmallInput,
             );
         });
 
-        // 4. Pop due with stale predecessors
+        // 4. Pop due after every deadline was replaced twice
         group.bench_function(format!("pop_due_stale/{size}"), |b| {
             b.iter_batched_ref(
                 || {
@@ -731,9 +731,9 @@ fn bench_dense_due_index_scaling(c: &mut Criterion) {
                         let (s, id) = arena.allocate_socket_id(0).unwrap();
                         arena.insert_at_slot(s, id, addr, i);
                         // 2 reschedules before due timestamp
-                        index.set(s, Timestamp::from_micros(100), &mut arena);
-                        index.set(s, Timestamp::from_micros(200), &mut arena);
-                        index.set(s, Timestamp::from_micros(300), &mut arena);
+                        index.set(s, Timestamp::from_micros(100), &arena);
+                        index.set(s, Timestamp::from_micros(200), &arena);
+                        index.set(s, Timestamp::from_micros(300), &arena);
                     }
                     let due = Vec::with_capacity(size);
                     (arena, index, due)
@@ -761,7 +761,7 @@ fn bench_dense_due_index_scaling(c: &mut Criterion) {
                         ));
                         let (s, id) = arena.allocate_socket_id(0).unwrap();
                         arena.insert_at_slot(s, id, addr, i);
-                        index.set(s, Timestamp::from_micros(500), &mut arena);
+                        index.set(s, Timestamp::from_micros(500), &arena);
                         slots.push((s, id, addr));
                     }
                     (arena, index, slots)
@@ -769,53 +769,12 @@ fn bench_dense_due_index_scaling(c: &mut Criterion) {
                 |state| {
                     let (arena, index, slots) = state;
                     for &(s, _, addr) in slots.iter() {
-                        index.remove(s, arena);
+                        index.remove(s);
                         arena.remove_by_slot(s);
                         let (new_s, new_id) = arena.allocate_socket_id(0).unwrap();
                         arena.insert_at_slot(new_s, new_id, addr, 999);
                         index.set(new_s, Timestamp::from_micros(1000), arena);
                     }
-                },
-                BatchSize::SmallInput,
-            );
-        });
-    }
-
-    // 6. Rebuild threshold policy sweep at 1,000 peers with 8x churn
-    for ratio in [0, 2, 4, 8] {
-        let label = if ratio == 0 {
-            "no_rebuild".to_string()
-        } else {
-            format!("{ratio}x_ratio")
-        };
-        group.bench_function(format!("rebuild_policy/{label}"), |b| {
-            b.iter_batched_ref(
-                || {
-                    let mut arena = DenseSlotArena::<usize>::new(1000);
-                    let mut slots = Vec::with_capacity(1000);
-                    let index = DenseDueIndex::new(64, ratio);
-                    for i in 0..1000 {
-                        let addr = SocketAddr::from((
-                            [10, (i / 65536) as u8, (i / 256) as u8, (i % 256) as u8],
-                            5000,
-                        ));
-                        let (s, id) = arena.allocate_socket_id(0).unwrap();
-                        arena.insert_at_slot(s, id, addr, i);
-                        slots.push(s);
-                    }
-                    (arena, slots, index)
-                },
-                |state| {
-                    let (arena, slots, index) = state;
-                    for &slot in slots.iter() {
-                        index.set(slot, Timestamp::from_micros(1000), arena);
-                    }
-                    for round in 1..=7 {
-                        for &slot in slots.iter() {
-                            index.set(slot, Timestamp::from_micros(1000 + round * 100), arena);
-                        }
-                    }
-                    black_box(index.heap_len());
                 },
                 BatchSize::SmallInput,
             );
@@ -873,7 +832,7 @@ fn bench_generic_due_index_scaling(c: &mut Criterion) {
             );
         });
 
-        // 3. Peek min deadline with stale heads present
+        // 3. Peek min deadline after every deadline was replaced
         group.bench_function(format!("peek_min_stale/{size}"), |b| {
             b.iter_batched_ref(
                 || {
@@ -885,13 +844,13 @@ fn bench_generic_due_index_scaling(c: &mut Criterion) {
                     index
                 },
                 |index| {
-                    black_box(index.peek_min_deadline());
+                    black_box(index.earliest());
                 },
                 BatchSize::SmallInput,
             );
         });
 
-        // 4. Pop due with stale predecessors
+        // 4. Pop due after every deadline was replaced twice
         group.bench_function(format!("pop_due_stale/{size}"), |b| {
             b.iter_batched_ref(
                 || {
@@ -940,90 +899,6 @@ fn bench_generic_due_index_scaling(c: &mut Criterion) {
     group.finish();
 }
 
-/// Bounded rebuild versus the historical unbounded lazy heap. These rows
-/// separately price the normal mutation/read paths and the churn that
-/// actually triggers maintenance.
-fn bench_generic_due_index_rebuild_policy(c: &mut Criterion) {
-    let mut group = c.benchmark_group("generic_due_index_rebuild_policy");
-    let keys: Vec<u32> = (0..1_000).collect();
-
-    for (policy, ratio) in [("bounded", 4), ("unbounded", 0)] {
-        group.bench_function(format!("set_unique/{policy}"), |b| {
-            b.iter_batched(
-                || DueIndex::with_rebuild_policy(64, ratio),
-                |mut index| {
-                    for &key in &keys {
-                        index.set(key, Timestamp::from_micros(u64::from(key)));
-                    }
-                    black_box(index.heap_len());
-                },
-                BatchSize::SmallInput,
-            );
-        });
-
-        group.bench_function(format!("reschedule_normal/{policy}"), |b| {
-            b.iter_batched(
-                || {
-                    let mut index = DueIndex::with_rebuild_policy(64, ratio);
-                    for &key in &keys {
-                        index.set(key, Timestamp::from_micros(1_000));
-                    }
-                    index
-                },
-                |mut index| {
-                    for &key in &keys {
-                        index.set(key, Timestamp::from_micros(2_000));
-                    }
-                    black_box(index.heap_len());
-                },
-                BatchSize::SmallInput,
-            );
-        });
-
-        for operation in ["peek", "pop_due"] {
-            group.bench_function(format!("{operation}_after_churn/{policy}"), |b| {
-                b.iter_batched(
-                    || {
-                        let mut index = DueIndex::with_rebuild_policy(64, ratio);
-                        for round in 0..6_u64 {
-                            for &key in &keys {
-                                index.set(key, Timestamp::from_micros(1_000 + round));
-                            }
-                        }
-                        index
-                    },
-                    |mut index| {
-                        if operation == "peek" {
-                            black_box(index.peek_min_deadline());
-                        } else {
-                            let mut due = Vec::new();
-                            index.pop_due(Timestamp::from_micros(2_000), &mut due);
-                            black_box(due);
-                        }
-                    },
-                    BatchSize::SmallInput,
-                );
-            });
-        }
-
-        group.bench_function(format!("churn_rebuild/{policy}"), |b| {
-            b.iter_batched(
-                || DueIndex::with_rebuild_policy(64, ratio),
-                |mut index| {
-                    for round in 0..10_u64 {
-                        for &key in &keys {
-                            index.set(key, Timestamp::from_micros(round));
-                        }
-                    }
-                    black_box((index.heap_len(), index.rebuild_count()));
-                },
-                BatchSize::SmallInput,
-            );
-        });
-    }
-    group.finish();
-}
-
 criterion_group!(
     benches,
     bench_invalid_admission,
@@ -1037,7 +912,6 @@ criterion_group!(
     bench_established_data_progression,
     bench_ready_queue_scaling,
     bench_dense_due_index_scaling,
-    bench_generic_due_index_scaling,
-    bench_generic_due_index_rebuild_policy
+    bench_generic_due_index_scaling
 );
 criterion_main!(benches);

@@ -92,6 +92,17 @@ found through an exact per-caller resolution index and release their permit
 promptly, and expiry visits only deadlines that are actually due, earliest
 first.
 
+Work outside the budget axes is bounded per call, independent of the peer
+population. Report finalization reads the listener's next protocol, group and
+idle deadlines from exact indexed heaps (the root of each), so even an
+all-zero-budget visit does no heap cleanup; there is no stale history and no
+rebuild. Finding promoted-socket receive work visits only sockets whose
+readiness changed: each socket polls readiness with its own waker into a ready
+queue, so neither `wait_for_activity` nor a visit walks the promoted
+high-water mark. Retiring a session costs a constant number of keyed index
+removals per leg and reads its receive counters without walking its receive
+buffer, whatever the number of other sessions or the window size.
+
 The returned `OwnerServiceReport` describes *that visit only*. Cumulative values
 are separate, and callers accumulate deltas themselves.
 

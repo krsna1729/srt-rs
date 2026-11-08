@@ -23,6 +23,11 @@ SRT listener admission is a two-packet handshake:
 5. Only after that result is applied does `SrtConnection::feed_recv_buf`
    interpret CONCLUSION and process KM.
 
+Routing a handshake that matches no live peer (a new caller's INDUCTION, a
+stale or foreign CONCLUSION) costs a constant number of ordered-index lookups
+(by address, by address and caller socket ID, by address and SYN cookie), not
+a walk of the slot arena, so rejection stays cheap at any table capacity.
+
 This is the same timing boundary as Haivision SRT's
 [`srt_listen_callback`](https://github.com/Haivision/srt/blob/fcae57145c000a9e7b72aa777adb8f85c2463242/docs/API/API-functions.md#srt_listen_callback):
 CONCLUSION has arrived but has not yet been interpreted, so a passphrase chosen
@@ -303,11 +308,13 @@ undefined, broadcast or backup).
   process- or host-global limiter exists. Exhaustion drops the CONCLUSION before
   policy runs and sends no rejection, so the caller retransmits;
   `key_derivation_drops` counts table and source refusals without separating
-  them. The budget covers key derivation only: decoding, routing, INDUCTION
-  handling and unencrypted CONCLUSION policy work are limited per visit by the
-  owner service budget, not by this rate. Callers derive a KEK once per connect
-  attempt through `CryptoContext::new_sender` and caller tables have no derivation
-  bucket, so a listener that keeps rejecting bounds that work only by the
+  them. Per-source state lives only while a source's share refills and
+  expires through a heap, at most two sources per derivation, so the limiter
+  itself never scans its sources. The budget covers key derivation only:
+  decoding, routing, INDUCTION handling and unencrypted CONCLUSION policy
+  work are limited per visit by the owner service budget, not by this rate.
+  Callers derive a KEK once per connect attempt through
+  `CryptoContext::new_sender` and caller tables have no derivation bucket, so a listener that keeps rejecting bounds that work only by the
   application's reconnect cadence.
 - Set `max_window_memory_bytes` to bound the payload one table can buffer.
   Each established peer reserves its worst case, `(flow window + receive
