@@ -389,6 +389,11 @@ pub struct SenderBuffer {
     /// tombstones the peer has not yet acknowledged is walked once, not on
     /// every ACK tick.
     expiry_scan_from: u32,
+    /// The messages TLPKTDROP gave up and the cumulative ACK has not yet
+    /// retired, in sequence order, each as its DROPREQ names it. A NAK into
+    /// any fragment of one finds the whole range by binary search here,
+    /// instead of walking the message's tombstones.
+    drop_records: VecDeque<DroppedMessage>,
     /// Peer loss reports larger than one visit's budget, oldest first, each
     /// still validated all-or-none; see [`SenderBuffer::receive_nak`].
     pending_naks: VecDeque<PendingNak>,
@@ -480,6 +485,7 @@ impl SenderBuffer {
             live_submitted_count: 0,
             justified_frontier: initial_seq,
             expiry_scan_from: initial_seq,
+            drop_records: VecDeque::new(),
             pending_naks: VecDeque::new(),
             #[cfg(test)]
             tombstone_range_calls: std::cell::Cell::new(0),
@@ -576,6 +582,7 @@ impl SenderBuffer {
         self.next_seq = sequence_number & 0x7FFF_FFFF;
         self.oldest_unacked = self.next_seq;
         self.expiry_scan_from = self.next_seq;
+        self.drop_records.clear();
         self.retained_tx_even = 0;
         self.retained_tx_odd = 0;
         self.peer_window_end = self.next_seq.wrapping_add(self.negotiated_window) & SEQUENCE_MASK;
@@ -1498,6 +1505,10 @@ impl SenderBuffer {
         }
 
         self.oldest_unacked = ack_seq;
+        // Records the ACK retired entirely leave in one step: they are the
+        // front of the sequence-ordered list.
+        let retired_records = self.drop_records_before(ack_seq);
+        self.drop_records.drain(..retired_records);
         // The frontier must never trail what the peer has just confirmed --
         // the connection layer already rejects any ACK beyond it, so this is
         // a consistency floor rather than a normal advance path (a resync
@@ -1824,12 +1835,8 @@ impl SenderBuffer {
                 let credible = at_arrival
                     && match self.packets.get(sequence) {
                         Some(entry) if entry.dropped => {
-                            known_run = self.record_nak_tombstone(
-                                report,
-                                sequence,
-                                entry.message_number,
-                                &mut left,
-                            );
+                            known_run =
+                                Some(self.record_nak_tombstone(report, sequence, &mut left));
                             true
                         }
                         Some(entry) => {
@@ -1855,24 +1862,21 @@ impl SenderBuffer {
     }
 
     /// Record the tombstone run holding `sequence` for DROPREQ, once per
-    /// run, charging its walk to `budget`; returns the run.
+    /// run, charging its span to `budget` as walking it once cost; returns
+    /// the run.
     fn record_nak_tombstone(
         &self,
         report: &mut PendingNak,
         sequence: u32,
-        message_number: u32,
         budget: &mut u32,
-    ) -> Option<(u32, u32)> {
-        let (first_seq, last_seq) = self.tombstone_range(sequence, message_number)?;
+    ) -> (u32, u32) {
+        let run = self.tombstone_range(sequence);
+        let (first_seq, last_seq) = (run.first_seq, run.last_seq);
         *budget = budget.saturating_sub(last_seq.wrapping_sub(first_seq) & SEQUENCE_MASK);
         if report.seen_starts.insert(first_seq) {
-            report.tombstones.push(DroppedMessage {
-                message_number,
-                first_seq,
-                last_seq,
-            });
+            report.tombstones.push(run);
         }
-        Some((first_seq, last_seq))
+        (first_seq, last_seq)
     }
 
     /// The tombstoned messages one report is answered with: at most
@@ -2020,7 +2024,9 @@ impl SenderBuffer {
                     if elapsed <= threshold {
                         break;
                     }
-                    messages.push(self.drop_expired_message(&mut seq));
+                    let message = self.drop_expired_message(&mut seq);
+                    self.drop_records.push_back(message.clone());
+                    messages.push(message);
                 }
                 None => {
                     seq = seq.wrapping_add(1) & 0x7FFF_FFFF;
@@ -2108,51 +2114,45 @@ impl SenderBuffer {
         }
     }
 
-    /// The inclusive sequence range of the tombstone run containing
-    /// `sequence`, if that sequence is a tombstone of the given message.
+    /// The tombstone run containing `sequence`, a tombstone: its message as
+    /// a DROPREQ names it.
     ///
-    /// A dropped message's fragments stay contiguous in sequence space
-    /// (fragments are assigned consecutively and nothing is renumbered), so
-    /// expanding from the NAKed sequence recovers exactly the range DROPREQ
-    /// must name -- no per-entry range storage, and no way for the range to
-    /// drift from the window's own contents.
-    fn tombstone_range(&self, sequence: u32, message_number: u32) -> Option<(u32, u32)> {
+    /// The run is the retained part of the message's drop record: a
+    /// cumulative ACK into the middle of a dropped message retires its
+    /// front, never its back. Found by binary search over the records, so a
+    /// one-position NAK into a dropped message of any size costs the same.
+    fn tombstone_range(&self, sequence: u32) -> DroppedMessage {
         #[cfg(test)]
         self.tombstone_range_calls
             .set(self.tombstone_range_calls.get().saturating_add(1));
-        if self
-            .packets
-            .get(sequence)
-            .is_none_or(|entry| !entry.dropped || entry.message_number != message_number)
-        {
-            return None;
+        let record = &self.drop_records[self.drop_records_before(sequence)];
+        debug_assert!(!sequence_less_than(sequence, record.first_seq));
+        let first_seq = if sequence_less_than(record.first_seq, self.oldest_unacked) {
+            self.oldest_unacked
+        } else {
+            record.first_seq
+        };
+        DroppedMessage {
+            first_seq,
+            ..record.clone()
         }
-        let mut first = sequence;
-        // Walk outward one sequence at a time, bounded by the retained span.
-        let mut steps = 0u32;
-        while steps < self.packets.window_size() {
-            let candidate = first.wrapping_sub(1) & SEQUENCE_MASK;
-            match self.packets.get(candidate) {
-                Some(entry) if entry.dropped && entry.message_number == message_number => {
-                    first = candidate;
-                }
-                _ => break,
+    }
+
+    /// How many drop records end before `sequence`: the index of the one
+    /// that could contain it. Records are in sequence order and none is
+    /// retired, so their ends are ordered within the retained span.
+    fn drop_records_before(&self, sequence: u32) -> usize {
+        let (mut low, mut high) = (0, self.drop_records.len());
+        while low < high {
+            count_work!(SenderRecordProbes);
+            let middle = low + (high - low) / 2;
+            if sequence_less_than(self.drop_records[middle].last_seq, sequence) {
+                low = middle + 1;
+            } else {
+                high = middle;
             }
-            steps += 1;
         }
-        let mut last = sequence;
-        steps = 0;
-        while steps < self.packets.window_size() {
-            let candidate = last.wrapping_add(1) & SEQUENCE_MASK;
-            match self.packets.get(candidate) {
-                Some(entry) if entry.dropped && entry.message_number == message_number => {
-                    last = candidate;
-                }
-                _ => break,
-            }
-            steps += 1;
-        }
-        Some((first, last))
+        low
     }
 
     #[cfg(test)]
@@ -2375,6 +2375,104 @@ pub struct SenderStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::srt_handshake::DEFAULT_FLOW_WINDOW;
+    use crate::test_support::WorkCounters;
+
+    /// The windows every work-bound test compares.
+    const WORK_BOUND_WINDOWS: [u32; 3] = [32, DEFAULT_FLOW_WINDOW, MAX_FLOW_WINDOW];
+
+    /// Binary-search steps over at most a window of drop records.
+    const RECORD_SEARCH_LIMIT: u64 = 17;
+
+    /// A sender holding one dropped message of `window` fragments, every
+    /// fragment submitted before it expired.
+    fn dropped_whole_window_message(window: u32) -> SenderBuffer {
+        let now = Timestamp::default();
+        let mut buf = SenderBuffer::new(0, window, 10);
+        let pushed = buf.push_message(&vec![0u8; window as usize], 1, 1, 1, now);
+        assert_eq!(pushed.len() as u32, window);
+        for (header, _) in &pushed {
+            buf.note_data_submitted(header.sequence_number);
+        }
+        assert_eq!(
+            buf.drop_expired(Timestamp::from_micros(1_000_001)).len(),
+            1,
+            "one message"
+        );
+        buf
+    }
+
+    /// F02: a one-position NAK into a dropped message is answered from the
+    /// message's drop record, so it costs the same however many fragments
+    /// the message had. The old answer walked every tombstone of the
+    /// message, outside the report's position budget.
+    #[test]
+    fn a_singleton_nak_into_a_dropped_message_does_window_independent_work() {
+        let mut results = Vec::new();
+        for window in WORK_BOUND_WINDOWS {
+            let mut buf = dropped_whole_window_message(window);
+            let middle = window / 2;
+            let (receipt, work) = WorkCounters::measure(|| {
+                buf.receive_nak(one_range(middle, middle), Timestamp::default())
+            });
+            let Ok(NakReceipt::Applied(answer)) = receipt else {
+                panic!("window {window}: {receipt:?}");
+            };
+            assert_eq!(
+                answer
+                    .iter()
+                    .map(|message| (message.first_seq, message.last_seq))
+                    .collect::<Vec<_>>(),
+                [(0, window - 1)],
+                "the whole message is named again"
+            );
+            results.push((window, work));
+        }
+        eprintln!("(window, singleton NAK work): {results:?}");
+        for (window, work) in results {
+            assert!(
+                work.sender_slot_probes == 0 && work.sender_record_probes <= RECORD_SEARCH_LIMIT,
+                "window {window}: {work:?}"
+            );
+        }
+    }
+
+    /// A cumulative ACK into a dropped message retires its front: a later
+    /// NAK names only the retained rest, and the records of messages the ACK
+    /// passed leave with it.
+    #[test]
+    fn a_nak_into_a_partly_acknowledged_dropped_message_names_its_retained_part() {
+        let now = Timestamp::default();
+        let mut buf = SenderBuffer::new(0, 32, 10);
+        buf.push_submitted(vec![1], 1, 1, now).expect("admitted");
+        for (header, _) in buf.push_message(&[0u8; 12], 4, 1, 1, now) {
+            buf.note_data_submitted(header.sequence_number);
+        }
+        assert_eq!(buf.drop_expired(Timestamp::from_micros(1_000_001)).len(), 2);
+        assert_eq!(buf.drop_records.len(), 2);
+
+        buf.handle_ack(2);
+        assert_eq!(
+            buf.drop_records.len(),
+            1,
+            "the single-packet record retired"
+        );
+        let answer = buf
+            .handle_nak_ranges(&[LossRange {
+                first_seq: 3,
+                last_seq: 3,
+            }])
+            .unwrap();
+        assert_eq!(
+            answer
+                .iter()
+                .map(|message| (message.first_seq, message.last_seq))
+                .collect::<Vec<_>>(),
+            [(2, 3)]
+        );
+        buf.handle_ack(4);
+        assert!(buf.drop_records.is_empty());
+    }
 
     /// A complete rate snapshot, as only a 28/32-byte ACK can report.
     fn full_rate_feedback() -> Option<PeerRateFeedback> {
@@ -2825,8 +2923,11 @@ mod tests {
         // deliberate. A seventh added the window's `retired` pages (a
         // `Vec` of acknowledged pages awaiting a bounded release, empty
         // and unallocated until an ACK retires a whole page) -- 24 bytes,
-        // deliberate.
-        assert!(inline_bytes <= 416);
+        // deliberate. An eighth added `drop_records` (a `VecDeque` of the
+        // dropped messages' ranges, unallocated until TLPKTDROP gives one
+        // up) so a NAK into a dropped message is answered by binary search
+        // instead of a walk of its tombstones -- 32 bytes, deliberate.
+        assert!(inline_bytes <= 448);
         assert_eq!(window.heap_bytes(), 8_320);
     }
 

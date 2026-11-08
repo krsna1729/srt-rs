@@ -712,3 +712,18 @@ compares W = 32 / 8,192 / 65,536 against explicit limits. The property test
 streams at all three windows: wrap, non-monotone timestamps, duplicates,
 wide gaps, DROPREQs, ticks, forced advances, releases and deliveries.
 Before/after counts and mutations are in each commit message.
+
+## Send-side work is independent of the window
+
+Every send-side entry point -- a submission, an ACK, a NAK, an ACK tick, an
+output poll -- does work bounded by a constant (or by what it reports) at
+every window, up to 65,536 packets. Each site below was position-scale
+before.
+
+- A NAK into a dropped message (F02). TLPKTDROP keeps a sequence-ordered
+  record of every message it gave up until the cumulative ACK retires it.
+  A NAK naming any fragment finds the message's retained range by binary
+  search over the records; the old answer walked the message's tombstones
+  outward from the named position, outside the report's position budget.
+  The report is still charged the message's span, so when a report defers
+  is unchanged.
