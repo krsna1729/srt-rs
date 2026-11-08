@@ -4172,14 +4172,13 @@ impl SrtConnection {
         // reference (`CUDT::sendCtrl`/`processCtrlAck`, `core.cpp`) also
         // assigns and acknowledges one for its numbered Small ACK (16 bytes)
         // and its 24/32-byte reference-Full variants. `type_specific_info`
-        // is exactly that ACK number, and `validate_control_information`
-        // already requires it to be nonzero for every accepted size except
-        // the unnumbered draft-form Small ACK and the Light ACK (which never
-        // carry one), so checking it directly covers every case without
-        // branching on length again. (Originally found as upstream
+        // is exactly that ACK number. libsrt's 31-bit ACK number rolls
+        // through zero (`CAckNo::incack`), so a 24/28/32-byte ACK numbered 0
+        // is acknowledged too; only the Light ACK and the draft's unnumbered
+        // 16-byte form (number 0) carry none. (Originally found as upstream
         // shiguredo/srt-rs issue 0054, which only pinned the draft's own
         // `>= 28` rule -- not pinned Haivision's wider acknowledged set.)
-        if pkt.type_specific_info != 0 {
+        if ack_names_a_number(&pkt) {
             self.send_ackack(pkt.type_specific_info, now);
         }
 
@@ -5283,9 +5282,10 @@ fn validate_control_information(pkt: &ControlPacket) -> Result<(), Error> {
 /// with ACKACK -- Robotweax pins a regression for exactly this variant.
 /// The reference-Full sizes (24, adding packet rate/capacity; 28, the
 /// draft's own Full ACK, adding the receiving byte rate; and libsrt's
-/// legacy 32-byte form with one extra, unused field) always carry a
-/// nonzero ACK number. Any other aligned length is not a size pinned
-/// Haivision is shown to emit.
+/// legacy 32-byte form with one extra, unused field) always carry an ACK
+/// number, which may be zero: libsrt's 31-bit number rolls 0x7fff_ffff -> 0
+/// (`CAckNo::incack`) and `processCtrlAck` accepts it. Any other aligned
+/// length is not a size pinned Haivision is shown to emit.
 fn validate_ack_shape(ack_number: u32, len: usize) -> Result<(), Error> {
     if !matches!(len, 4 | 16 | 24 | 28 | 32) {
         return Err(Error::invalid_data(format!(
@@ -5297,12 +5297,15 @@ fn validate_ack_shape(ack_number: u32, len: usize) -> Result<(), Error> {
             "Light ACK (4-byte CIF) must not carry an ACK number",
         ));
     }
-    if len >= 24 && ack_number == 0 {
-        return Err(Error::invalid_data(format!(
-            "{len}-byte ACK must carry a nonzero ACK number"
-        )));
-    }
     Ok(())
+}
+
+/// Whether an ACK named an ACK number the peer expects ACKACKed: every
+/// 24/28/32-byte ACK (zero included, after libsrt's 31-bit wrap) and a
+/// numbered 16-byte Small ACK; never a Light ACK or the draft's unnumbered
+/// Small form.
+fn ack_names_a_number(pkt: &ControlPacket) -> bool {
+    pkt.control_info.len() >= 24 || pkt.type_specific_info != 0
 }
 
 /// Parse a loss list (from a NAK packet's control_info).
@@ -5740,6 +5743,67 @@ mod tests {
             let expected = (!answers).then_some(SRT_REJ_GROUP);
             assert_eq!(rejection_reason(&mut listener), expected, "{group:?}");
         }
+    }
+
+    /// The first queued control datagram of `control_type`, with its wire.
+    fn take_control(
+        conn: &mut SrtConnection,
+        control_type: ControlType,
+    ) -> Option<(Vec<u8>, ControlPacket)> {
+        drain_outputs(conn).into_iter().find_map(|output| {
+            let ConnectionOutput::SendPacket(wire) = output else {
+                return None;
+            };
+            match SrtPacket::decode(&wire) {
+                Ok(SrtPacket::Control(control)) if control.control_type == control_type => {
+                    Some((wire, control))
+                }
+                _ => None,
+            }
+        })
+    }
+
+    /// A Full ACK numbered 0 is a real ACK: libsrt's 31-bit ACK number
+    /// rolls 0x7fff_ffff -> 0 (`CAckNo::incack`, common.h:728-735) and
+    /// `processCtrlAck` acknowledges it. The peer answers with ACKACK 0 and
+    /// the RTT sample lands.
+    #[test]
+    fn a_full_ack_numbered_zero_gets_its_ackack_and_rtt_sample() {
+        let (mut caller, mut listener) = connected_pair();
+        let start = Timestamp::from_micros(1_000_000);
+        caller.send(b"zero", start).unwrap();
+        listener
+            .feed_recv_buf(&next_wire(&mut caller), start)
+            .unwrap();
+        drain_outputs(&mut listener);
+        listener
+            .receiver
+            .as_mut()
+            .unwrap()
+            .seed_full_acks_sent_for_test(0x7FFF_FFFF);
+
+        let ack_time = start.add_micros(20_000);
+        listener.handle_timer(TimerId::Ack, ack_time).unwrap();
+        let (ack, packet) = take_control(&mut listener, ControlType::Ack).expect("a Full ACK");
+        assert!(packet.control_info.len() >= 24, "a Full ACK");
+        assert_eq!(packet.type_specific_info, 0, "the number after 0x7fff_ffff");
+
+        caller
+            .feed_recv_buf(&ack, ack_time.add_micros(5_000))
+            .expect("a Full ACK numbered 0 is accepted");
+        let (ackack, packet) =
+            take_control(&mut caller, ControlType::AckAck).expect("the ACK is acknowledged");
+        assert_eq!(packet.type_specific_info, 0);
+
+        let rtt_before = listener.receiver.as_ref().unwrap().rtt();
+        listener
+            .feed_recv_buf(&ackack, ack_time.add_micros(10_000))
+            .expect("ACKACK 0 names a sent ACK");
+        assert_ne!(
+            listener.receiver.as_ref().unwrap().rtt(),
+            rtt_before,
+            "RTT sampled"
+        );
     }
 
     #[test]
@@ -8244,17 +8308,17 @@ mod tests {
             );
         }
 
-        // A Light ACK must never carry an ACK number, and every
-        // reference-Full size must always carry one.
+        // A Light ACK must never carry an ACK number. A reference-Full size
+        // numbered 0 is libsrt's 31-bit ACK number after its wrap and is
+        // accepted (`CAckNo::incack`, `processCtrlAck`).
         let ack_seq = caller.sender.as_ref().unwrap().oldest_unacked_sequence();
         let error = caller
             .feed_recv_buf(&ack_datagram_with_shape(socket_id, ack_seq, 4, 1), now)
             .expect_err("a Light ACK must not carry an ACK number");
         assert_eq!(error.kind, crate::error::ErrorKind::InvalidData);
-        let error = caller
+        caller
             .feed_recv_buf(&ack_datagram_with_shape(socket_id, ack_seq, 24, 0), now)
-            .expect_err("a 24-byte ACK must carry a nonzero ACK number");
-        assert_eq!(error.kind, crate::error::ErrorKind::InvalidData);
+            .expect("a 24-byte ACK numbered 0 is accepted");
     }
 
     /// Haivision's deployed numbered Small ACK (16 bytes, nonzero ACK

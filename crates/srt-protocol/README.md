@@ -223,6 +223,9 @@ Packets carry what libsrt 1.5.7 emits:
   `set_listener_group_extension` refuse another; a listener configured with
   one through `ConnectionOptions` refuses bonded callers with
   `SRT_REJ_GROUP`. Received GROUP values are still decoded raw for policy.
+- Full ACK numbers are 31-bit like libsrt's (`CAckNo`): they start at 1 and
+  roll 0x7fff_ffff -> 0. A 24/28/32-byte ACK numbered 0 is accepted and
+  acknowledged with ACKACK 0, whose RTT sample is taken.
 
 ## Testing
 
