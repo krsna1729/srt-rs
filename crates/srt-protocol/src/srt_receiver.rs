@@ -189,29 +189,6 @@ fn sequence_in_range(first_seq: u32, distance: u32, sequence: u32) -> bool {
     sequence.wrapping_sub(first_seq) & SEQUENCE_MASK <= distance
 }
 
-/// Emit the runs of `losses`, already in the order to report. Only
-/// numerically adjacent positions join a run, so a run never spans the
-/// 2^31 wrap.
-fn emit_sorted_runs(
-    losses: &[u32],
-    mut emit: impl FnMut(u32, u32) -> ControlFlow<()>,
-) -> ControlFlow<()> {
-    let Some((&first, rest)) = losses.split_first() else {
-        return ControlFlow::Continue(());
-    };
-    let (mut start, mut end) = (first, first);
-    for &loss in rest {
-        if loss == end + 1 {
-            end = loss;
-        } else {
-            emit(start, end)?;
-            start = loss;
-            end = loss;
-        }
-    }
-    emit(start, end)
-}
-
 /// Circular loss membership for one negotiated receive window.
 ///
 /// Positions map onto a [`RangeBitset`] of the window rounded up to a power
@@ -355,23 +332,10 @@ impl LossBitmap {
         })
     }
 
+    /// Loss runs in numeric order: the part of the window past the 2^31
+    /// wrap first.
     fn for_each_numeric_run(&self, mut emit: impl FnMut(u32, u32)) {
         if self.is_empty() {
-            return;
-        }
-        // A fixed stack sort preserves the measured sparse-loss fast path;
-        // word-native run extraction wins once there are more than eight bits.
-        if self.len() <= 8 {
-            let mut losses = [0; 8];
-            let len = self.len() as usize;
-            for (slot, loss) in losses.iter_mut().zip(self.iter()) {
-                *slot = loss;
-            }
-            losses[..len].sort_unstable();
-            let _ = emit_sorted_runs(&losses[..len], |start, end| {
-                emit(start, end);
-                ControlFlow::Continue(())
-            });
             return;
         }
         let mut emit = |start, end| {
@@ -413,21 +377,6 @@ impl LossBitmap {
             .map(offset_of)
             .filter(|&offset| offset < self.window_size)
             .unwrap_or(0);
-        if self.len() <= 8 {
-            let mut losses = [0; 8];
-            let mut len = 0;
-            for loss in self.iter().filter(|&loss| offset_of(loss) >= start) {
-                losses[len] = loss;
-                len += 1;
-            }
-            // Numeric order is sequence order unless the window wraps.
-            if u64::from(base) + u64::from(self.window_size) <= 1u64 << 31 {
-                losses[..len].sort_unstable();
-            } else {
-                losses[..len].sort_unstable_by_key(|&loss| offset_of(loss));
-            }
-            return emit_sorted_runs(&losses[..len], emit);
-        }
         let first = base.wrapping_add(start) & SEQUENCE_MASK;
         let count = self.window_size - start;
         let before_wrap = (1u64 << 31) - u64::from(first);
@@ -439,43 +388,40 @@ impl LossBitmap {
         }
     }
 
+    /// Runs of `count` positions from `seq`, a span that does not cross the
+    /// 2^31 wrap. Each run costs one next-set and one next-clear search, so
+    /// a walk reads words in proportion to the runs it reports, however far
+    /// apart they are.
     fn for_each_run_segment(
         &self,
-        mut seq: u32,
-        mut count: u32,
+        seq: u32,
+        count: u32,
         emit: &mut impl FnMut(u32, u32) -> ControlFlow<()>,
     ) -> ControlFlow<()> {
-        let mut pending = None;
-        while count != 0 {
-            let index = self.bit_index(seq);
-            let word_index = index / 64;
-            let bit_offset = index % 64;
-            let chunk = count.min((64 - bit_offset) as u32);
-            let chunk_mask = (u64::MAX >> (64 - chunk)) << bit_offset;
-            let mut bits = self.bits.word(word_index) & chunk_mask;
-            while bits != 0 {
-                let run_bit = bits.trailing_zeros();
-                let run_len = (!(bits >> run_bit)).trailing_zeros();
-                let run_start = seq + (run_bit as usize - bit_offset) as u32;
-                let run_end = run_start + run_len - 1;
-                if let Some((pending_start, pending_end)) = pending {
-                    if pending_end + 1 == run_start {
-                        pending = Some((pending_start, run_end));
-                    } else {
-                        emit(pending_start, pending_end)?;
-                        pending = Some((run_start, run_end));
+        let mut pending: Option<(u32, u32)> = None;
+        let mut piece_seq = seq;
+        for (start, end) in self.index_ranges(seq, count) {
+            let mut index = start;
+            while let Some(run_start) = self.bits.next_one(index, end) {
+                let run_end = self.bits.next_zero(run_start, end).unwrap_or(end);
+                let first = piece_seq + (run_start - start) as u32;
+                let last = piece_seq + (run_end - start) as u32 - 1;
+                pending = match pending {
+                    Some((pending_first, pending_last)) if pending_last + 1 == first => {
+                        Some((pending_first, last))
                     }
-                } else {
-                    pending = Some((run_start, run_end));
-                }
-                let run_mask = (u64::MAX >> (64 - run_len)) << run_bit;
-                bits &= !run_mask;
+                    Some((pending_first, pending_last)) => {
+                        emit(pending_first, pending_last)?;
+                        Some((first, last))
+                    }
+                    None => Some((first, last)),
+                };
+                index = run_end;
             }
-            seq += chunk;
-            count -= chunk;
+            piece_seq += (end - start) as u32;
         }
         match pending {
-            Some((start, end)) => emit(start, end),
+            Some((first, last)) => emit(first, last),
             None => ControlFlow::Continue(()),
         }
     }
@@ -2381,6 +2327,62 @@ mod tests {
                 work.bitmap_words(),
                 0,
                 "an in-order packet exposes no new position"
+            );
+        }
+    }
+
+    /// Bitmap words one reported loss run may cost a periodic NAK: finding
+    /// where the run starts and where it ends, each a constant number of
+    /// word and mask reads.
+    const NAK_BITMAP_WORDS_PER_RUN: u64 = 24;
+
+    /// F09: a periodic NAK reads bitmap words in proportion to the runs it
+    /// reports, not to the window -- with one far loss, nine sparse losses
+    /// spread over the window, one window-wide run, and an alternating list
+    /// the encoder cuts after 16 runs.
+    #[test]
+    fn periodic_nak_bitmap_reads_scale_with_runs_not_window() {
+        let mut results = Vec::new();
+        for window in WORK_BOUND_WINDOWS {
+            let base = SEQUENCE_MASK - window / 2;
+            let at = |offset: u32| base.wrapping_add(offset) & SEQUENCE_MASK;
+            let mut far = LossBitmap::new(base, window);
+            far.insert(at(window - 2));
+            let mut sparse = LossBitmap::new(base, window);
+            for index in 1..=9 {
+                sparse.insert(at(window / 10 * index));
+            }
+            let mut dense = LossBitmap::new(base, window);
+            dense.insert_range(base, window);
+            let mut alternating = LossBitmap::new(base, window);
+            for offset in (0..window).step_by(2) {
+                alternating.insert(at(offset));
+            }
+            for (name, losses, limit_runs) in [
+                ("far", &far, None),
+                ("sparse", &sparse, None),
+                ("dense", &dense, None),
+                ("alternating", &alternating, Some(16)),
+            ] {
+                let mut runs = 0u64;
+                let ((), work) = WorkCounters::measure(|| {
+                    let _ = losses.try_for_each_run_in_sequence_from(None, |_, _| {
+                        runs += 1;
+                        if Some(runs) == limit_runs {
+                            ControlFlow::Break(())
+                        } else {
+                            ControlFlow::Continue(())
+                        }
+                    });
+                });
+                results.push((window, name, runs, work.bitmap_words()));
+            }
+        }
+        eprintln!("(window, list, runs, bitmap words): {results:?}");
+        for &(window, name, runs, words) in &results {
+            assert!(
+                words <= NAK_BITMAP_WORDS_PER_RUN * (runs + 1),
+                "window {window}, {name}: {words} words for {runs} runs"
             );
         }
     }

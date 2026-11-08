@@ -475,7 +475,6 @@ impl RangeBitset {
     }
 
     /// First clear position in `from..end`.
-    #[cfg(test)]
     pub(crate) fn next_zero(&self, from: usize, end: usize) -> Option<usize> {
         if from >= end {
             return None;
