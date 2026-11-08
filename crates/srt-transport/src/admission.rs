@@ -1065,13 +1065,11 @@ pub struct PeerTable {
     /// When the key-derivation budget is next fully replenished, in
     /// microseconds (GCRA theoretical arrival time), for the table and for
     /// each source IP that has spent part of its share. A source whose
-    /// share has refilled carries no information and is pruned.
+    /// share has refilled carries no information and is pruned. The
+    /// per-source times live in an exact expiry heap, so pruning retires
+    /// the earliest expired entries a few at a time instead of scanning.
     key_derivations_due_micros: u64,
-    key_derivations_due_by_source: HashMap<std::net::IpAddr, u64>,
-    /// Size at which `key_derivations_due_by_source` is next pruned: twice
-    /// the table rate, or twice what survived the last prune, so pruning
-    /// stays amortized O(1) per derivation however many sources are live.
-    key_derivations_prune_at: usize,
+    key_derivations_due_by_source: DueIndex<std::net::IpAddr>,
     idle_deadlines: DueIndex<PhysicalPeerKey>,
     deadlines: DenseDueIndex,
     group_deadlines: DueIndex<GroupDeadlineKey>,
@@ -1257,8 +1255,7 @@ impl PeerTable {
             protocol_failure_scratch: Vec::new(),
             half_open_deadlines: DueIndex::default(),
             key_derivations_due_micros: 0,
-            key_derivations_due_by_source: HashMap::new(),
-            key_derivations_prune_at: 2 * config.max_key_derivations_per_second as usize,
+            key_derivations_due_by_source: DueIndex::default(),
             idle_deadlines: DueIndex::default(),
             deadlines: DenseDueIndex::default(),
             group_deadlines: DueIndex::default(),
@@ -1860,8 +1857,7 @@ impl PeerTable {
         let source_due = self
             .key_derivations_due_by_source
             .get(&source)
-            .copied()
-            .unwrap_or(0);
+            .map_or(0, |due| due.as_micros());
         let Some(source_due) = gcra_take(
             source_due,
             now,
@@ -1877,19 +1873,20 @@ impl PeerTable {
             return false;
         };
         self.key_derivations_due_micros = table_due;
-        // Each source still refilling spent a table token within the last
-        // second, so at most about twice the table rate of them are live,
-        // and at most twice that survive into the next threshold: the map
-        // holds at most about four times the table rate between prunes.
-        if self.key_derivations_due_by_source.len() >= self.key_derivations_prune_at {
-            self.key_derivations_due_by_source
-                .retain(|_, due| *due > now);
-            self.key_derivations_prune_at = (2 * self.config.max_key_derivations_per_second
-                as usize)
-                .max(2 * self.key_derivations_due_by_source.len());
-        }
+        // An expired entry (its share refilled) is the same as none. Each
+        // derivation adds at most one entry and retires up to two expired
+        // ones, earliest first, so the map only grows while every entry is
+        // live, and drains back after a burst. A live source spent a table
+        // token within the last second, and the table grants at most twice
+        // its rate per second (burst plus refill): the map holds at most
+        // twice the table rate plus one.
+        let expired = self
+            .key_derivations_due_by_source
+            .discard_due(Timestamp::from_micros(now), 2);
+        debug_assert!(expired <= 2, "a derivation retires at most two entries");
+        count_work!(LimiterEntriesVisited, expired);
         self.key_derivations_due_by_source
-            .insert(source, source_due);
+            .set(source, Timestamp::from_micros(source_due));
         true
     }
 
@@ -5613,8 +5610,7 @@ pub(crate) mod tests {
 
     /// Per-source key-derivation state lives only while a source's share is
     /// refilling: however many sources come and go, the table keeps at most
-    /// four times its rate of them (twice the live ones, which are at most
-    /// twice its rate).
+    /// twice its rate of them (the live ones) plus one.
     #[test]
     fn per_source_key_derivation_state_stays_bounded() {
         const RATE: u32 = 4;
@@ -5630,8 +5626,54 @@ pub(crate) mod tests {
                 let source = std::net::IpAddr::from(std::net::Ipv4Addr::from(0x0A00_0000 + host));
                 let now = Timestamp::from_micros(second * 1_000_000 + step * 250_000);
                 assert!(table.take_key_derivation(source, now));
-                assert!(table.key_derivations_due_by_source.len() <= 4 * RATE as usize);
+                assert!(table.key_derivations_due_by_source.len() <= 2 * RATE as usize + 1);
             }
+        }
+    }
+
+    /// F18: the derivation that finds the source map full of expired entries
+    /// retires at most two of them, earliest first, through the expiry heap,
+    /// rather than scanning the whole map. Two seconds of derivations at
+    /// rate 64 / 512 / 4,096 fill it with 2 x rate sources, all expired by
+    /// the third.
+    #[test]
+    fn key_derivation_pruning_does_bounded_work_per_admission() {
+        for rate in [64u32, 512, 4096] {
+            let mut table = PeerTable::with_config(PeerTableConfig {
+                max_key_derivations_per_second: rate,
+                max_key_derivations_per_source_per_second: 1,
+                ..PeerTableConfig::default()
+            });
+            let mut host = 0u32;
+            let mut next_source = || {
+                host += 1;
+                std::net::IpAddr::from(std::net::Ipv4Addr::from(0x0A00_0000 + host))
+            };
+            for second in 0..2u64 {
+                let now = Timestamp::from_micros(second * 1_000_000);
+                for _ in 0..rate {
+                    assert!(table.take_key_derivation(next_source(), now));
+                }
+            }
+            let late = Timestamp::from_micros(3_000_000);
+            let source = next_source();
+            let (taken, work) =
+                crate::work::WorkCounters::measure(|| table.take_key_derivation(source, late));
+            assert!(taken);
+            // Two removals and one insertion, each a sift of at most the
+            // heap's depth.
+            let depth = u64::from(u32::BITS - (2 * rate).leading_zeros());
+            assert!(
+                work.limiter_entries_visited <= 2 && work.heap_entries_visited <= 3 * (depth + 1),
+                "rate {rate}: {work:?}"
+            );
+            // Retiring two per derivation, not one, drains the map after a
+            // burst: the rate entries of second 1 are now rate - 1.
+            assert_eq!(
+                table.key_derivations_due_by_source.len(),
+                rate as usize - 1,
+                "rate {rate}"
+            );
         }
     }
 

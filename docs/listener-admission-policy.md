@@ -308,11 +308,13 @@ undefined, broadcast or backup).
   process- or host-global limiter exists. Exhaustion drops the CONCLUSION before
   policy runs and sends no rejection, so the caller retransmits;
   `key_derivation_drops` counts table and source refusals without separating
-  them. The budget covers key derivation only: decoding, routing, INDUCTION
-  handling and unencrypted CONCLUSION policy work are limited per visit by the
-  owner service budget, not by this rate. Callers derive a KEK once per connect
-  attempt through `CryptoContext::new_sender` and caller tables have no derivation
-  bucket, so a listener that keeps rejecting bounds that work only by the
+  them. Per-source state lives only while a source's share refills and
+  expires through a heap, at most two sources per derivation, so the limiter
+  itself never scans its sources. The budget covers key derivation only:
+  decoding, routing, INDUCTION handling and unencrypted CONCLUSION policy
+  work are limited per visit by the owner service budget, not by this rate.
+  Callers derive a KEK once per connect attempt through
+  `CryptoContext::new_sender` and caller tables have no derivation bucket, so a listener that keeps rejecting bounds that work only by the
   application's reconnect cadence.
 - Set `max_window_memory_bytes` to bound the payload one table can buffer.
   Each established peer reserves its worst case, `(flow window + receive

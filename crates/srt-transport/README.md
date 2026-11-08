@@ -117,9 +117,10 @@ Transport work that remote traffic can trigger once per datagram or per
 service visit does not grow with the peer population or the arena size:
 unknown handshakes route through exact indexes, listener deadlines live in
 exact indexed heaps (finalization reads their roots), promoted-socket
-receive work is found through a waker-fed ready queue, and retiring a session
+receive work is found through a waker-fed ready queue, retiring a session
 removes its index entries by exact key and folds its receive counters from
-scalars.
+scalars, and the key-derivation limiter expires sources through a heap a
+few at a time.
 `docs/production-progress.md` (Transport work is independent of the peer
 population) lists each bound, its evidence and the paths still amortized.
 

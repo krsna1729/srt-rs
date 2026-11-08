@@ -21,9 +21,11 @@ pub(crate) enum Counter {
     PromotedSlotProbes,
     RetirementProbes,
     ReceiverStatEntries,
+    LimiterEntriesVisited,
+    FreeSlotProbes,
 }
 
-const COUNTERS: usize = Counter::ReceiverStatEntries as usize + 1;
+const COUNTERS: usize = Counter::FreeSlotProbes as usize + 1;
 
 thread_local! {
     static WORK: [Cell<u64>; COUNTERS] = const { [const { Cell::new(0) }; COUNTERS] };
@@ -55,6 +57,10 @@ pub(crate) struct WorkCounters {
     /// Receive-buffer entries walked to sample a connection's receiver
     /// counters.
     pub receiver_stat_entries: u64,
+    /// Key-derivation limiter source entries examined to prune expired ones.
+    pub limiter_entries_visited: u64,
+    /// Free-list entries examined to find a preferred socket ID's slot.
+    pub free_slot_probes: u64,
 }
 
 impl WorkCounters {
@@ -71,6 +77,8 @@ impl WorkCounters {
                 promoted_slot_probes: get(Counter::PromotedSlotProbes),
                 retirement_probes: get(Counter::RetirementProbes),
                 receiver_stat_entries: get(Counter::ReceiverStatEntries),
+                limiter_entries_visited: get(Counter::LimiterEntriesVisited),
+                free_slot_probes: get(Counter::FreeSlotProbes),
             }
         })
     }
@@ -87,6 +95,8 @@ impl WorkCounters {
             promoted_slot_probes: now.promoted_slot_probes - before.promoted_slot_probes,
             retirement_probes: now.retirement_probes - before.retirement_probes,
             receiver_stat_entries: now.receiver_stat_entries - before.receiver_stat_entries,
+            limiter_entries_visited: now.limiter_entries_visited - before.limiter_entries_visited,
+            free_slot_probes: now.free_slot_probes - before.free_slot_probes,
         }
     }
 

@@ -83,16 +83,31 @@ where
         out.clear();
         let mut visited = 0;
         while visited < max_work && self.has_due(now) {
-            let (_, handle) = self.heap.pop().expect("a due entry exists");
             visited += 1;
-            let key = self.keys[handle as usize]
-                .take()
-                .expect("a heap node names a live key");
-            self.handles.remove(&key);
-            self.free.push(handle);
-            out.push(key);
+            out.push(self.pop_earliest());
         }
         (visited, self.has_due(now))
+    }
+
+    /// Discard at most `max_work` due entries, earliest first, returning
+    /// how many: for an owner whose due entries mean nothing but expiry.
+    pub fn discard_due(&mut self, now: Timestamp, max_work: usize) -> usize {
+        let mut discarded = 0;
+        while discarded < max_work && self.has_due(now) {
+            discarded += 1;
+            self.pop_earliest();
+        }
+        discarded
+    }
+
+    fn pop_earliest(&mut self) -> K {
+        let (_, handle) = self.heap.pop().expect("a due entry exists");
+        let key = self.keys[handle as usize]
+            .take()
+            .expect("a heap node names a live key");
+        self.handles.remove(&key);
+        self.free.push(handle);
+        key
     }
 
     /// Whether the earliest entry is due at `now`. O(1).

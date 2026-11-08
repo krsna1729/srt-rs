@@ -216,10 +216,10 @@ impl<T> DenseSlotArena<T> {
                 && self.is_local_slot(target_slot)
                 && !self.slot_used[target_slot]
                 && self.slots[target_slot].value.is_none()
-                && let Some(pos) = self
-                    .free_slots
-                    .iter()
-                    .position(|&s| s as usize == target_slot)
+                && let Some(pos) = self.free_slots.iter().position(|&s| {
+                    count_work!(FreeSlotProbes);
+                    s as usize == target_slot
+                })
             {
                 self.free_slots.remove(pos);
                 self.slot_used[target_slot] = true;
@@ -721,6 +721,38 @@ mod kani_proofs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F18: honoring a preferred socket ID searches the free list only for
+    /// a slot never used, and the search uses it, so it happens at most once
+    /// per slot in the arena's life. The worst case (the last slot) visits
+    /// the whole free list once; every later allocation with the same
+    /// preferred ID, after that session ends too, visits none.
+    #[test]
+    fn a_preferred_slot_is_searched_for_at_most_once() {
+        let address = SocketAddr::from(([10, 0, 0, 1], 9000));
+        for capacity in [64, 4096, MAX_DENSE_SLOTS] {
+            let mut arena = DenseSlotArena::<u8>::new(capacity);
+            let last = arena.slot_mask() as u32;
+            let preferred = (7 << arena.slot_bits()) | last;
+            let (first, search) =
+                crate::work::WorkCounters::measure(|| arena.allocate_socket_id(preferred));
+            assert_eq!(first, Some((last as usize, preferred)));
+            assert_eq!(search.free_slot_probes, capacity as u64, "one full search");
+            arena.insert_at_slot(last as usize, preferred, address, 0);
+            assert!(arena.remove_by_slot(last as usize).is_some());
+            for round in 1..=3 {
+                let (next, again) =
+                    crate::work::WorkCounters::measure(|| arena.allocate_socket_id(preferred));
+                let (slot, socket_id) = next.expect("a free slot");
+                assert_ne!(socket_id, preferred);
+                assert_eq!(
+                    again.free_slot_probes, 0,
+                    "capacity {capacity}, round {round}"
+                );
+                arena.insert_at_slot(slot, socket_id, address, round);
+            }
+        }
+    }
 
     #[test]
     fn arena_clamps_adversarial_capacity_before_rounding() {

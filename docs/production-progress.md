@@ -782,13 +782,20 @@ population or the arena size. Each is now bounded per call.
   ready-queue compaction stays amortized: it runs only once stale entries
   outnumber live sessions three to one, so it is O(1) per push or detach, and
   a keyed queue there would tax every `enqueue_ready` on the data path.
-
-Not yet bounded: the key-derivation limiter prunes its source map with a full
-`retain` past its threshold (F18). It runs once per pruning threshold, not per
-steady-state datagram.
+- Admission limiter and preferred slots (F18). The key-derivation limiter
+  keeps each source's refill time in an exact expiry heap; every derivation
+  retires at most two expired sources, earliest first, so the map stays
+  within twice the table rate plus one and drains after a burst. It used to
+  `retain` the whole map (up to twice the table rate, and the rate goes up to
+  1,000,000) on the derivation that crossed its threshold. Honoring a
+  preferred socket ID still searches the free list linearly, but only for a
+  slot that has never been used, and that allocation uses it: at most one
+  search per slot in the arena's life. The preferred ID is the listener's
+  configured `AdmissionOptions::socket_id`, not a value a datagram carries,
+  so in practice the search runs once per table.
 
 Evidence. `WorkCounters` (unit tests only) count arena slot probes, route
 index probes, heap entries visited or cloned, promoted slot probes,
-retirement index probes and receiver-stat entries walked. Each finding has a
-test at three sizes; before/after counts and mutations are in each commit
-message.
+retirement index probes, receiver-stat entries walked, limiter entries
+visited and free-slot probes. Each finding has a test at three sizes;
+before/after counts and mutations are in each commit message.
