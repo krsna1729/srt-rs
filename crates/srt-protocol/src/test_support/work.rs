@@ -28,9 +28,13 @@ pub(crate) enum Counter {
     SenderSlotProbes,
     SenderRecordProbes,
     OutputQueueVisits,
+    RetransmitEntriesVisited,
+    RtoCandidateSteps,
+    NakPositionsVisited,
+    DropreqRunsVisited,
 }
 
-const COUNTERS: usize = Counter::OutputQueueVisits as usize + 1;
+const COUNTERS: usize = Counter::DropreqRunsVisited as usize + 1;
 
 thread_local! {
     static WORK: [Cell<u64>; COUNTERS] = const { [const { Cell::new(0) }; COUNTERS] };
@@ -71,6 +75,14 @@ pub struct WorkCounters {
     pub sender_record_probes: u64,
     /// Queued output actions inspected.
     pub output_queue_visits: u64,
+    /// Retransmission-list entries popped or checked for staleness.
+    pub retransmit_entries_visited: u64,
+    /// Candidates the sender RTO probe stepped over.
+    pub rto_candidate_steps: u64,
+    /// Peer loss-report positions validated or committed.
+    pub nak_positions_visited: u64,
+    /// Tombstone runs one loss report found, inspected to pick its DROPREQs.
+    pub dropreq_runs_visited: u64,
 }
 
 impl WorkCounters {
@@ -92,6 +104,10 @@ impl WorkCounters {
                 sender_slot_probes: get(Counter::SenderSlotProbes),
                 sender_record_probes: get(Counter::SenderRecordProbes),
                 output_queue_visits: get(Counter::OutputQueueVisits),
+                retransmit_entries_visited: get(Counter::RetransmitEntriesVisited),
+                rto_candidate_steps: get(Counter::RtoCandidateSteps),
+                nak_positions_visited: get(Counter::NakPositionsVisited),
+                dropreq_runs_visited: get(Counter::DropreqRunsVisited),
             }
         })
     }
@@ -118,6 +134,11 @@ impl WorkCounters {
             sender_slot_probes: now.sender_slot_probes - before.sender_slot_probes,
             sender_record_probes: now.sender_record_probes - before.sender_record_probes,
             output_queue_visits: now.output_queue_visits - before.output_queue_visits,
+            retransmit_entries_visited: now.retransmit_entries_visited
+                - before.retransmit_entries_visited,
+            rto_candidate_steps: now.rto_candidate_steps - before.rto_candidate_steps,
+            nak_positions_visited: now.nak_positions_visited - before.nak_positions_visited,
+            dropreq_runs_visited: now.dropreq_runs_visited - before.dropreq_runs_visited,
         }
     }
 

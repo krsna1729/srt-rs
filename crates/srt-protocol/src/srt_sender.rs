@@ -23,7 +23,17 @@ use crate::srt_receiver::LossRange;
 use crate::time::Timestamp;
 
 const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
+/// Stale retransmission-list entries above which a compaction pass starts.
 const STALE_RETRANSMIT_COMPACT_THRESHOLD: usize = 1_024;
+/// Retransmission-list entries one cumulative ACK or TLPKTDROP tick checks
+/// for staleness (see [`RetransmitList`]).
+pub(crate) const STALE_RETRANSMITS_CHECKED_PER_CALL: usize = 256;
+/// Retransmission-list entries checked for each entry pushed while a
+/// compaction pass runs: one pays for the entry itself, the other moves the
+/// pass on, so it reaches the end however fast a peer's NAKs push.
+pub(crate) const STALE_RETRANSMITS_CHECKED_PER_PUSH: usize = 2;
+/// Retransmission-list entries one `pop_retransmit` call may inspect.
+pub(crate) const MAX_STALE_RETRANSMITS_SKIPPED_PER_POP: usize = 64;
 
 /// Largest DATA message number (26 bits).
 const MESSAGE_NUMBER_MAX: u32 = 0x03FF_FFFF;
@@ -46,7 +56,7 @@ const fn next_message_number(current: u32) -> u32 {
 /// maps to one DROPREQ; without a ceiling a single datagram could be
 /// amplified into thousands of control datagrams. Capping is safe because a
 /// DROPREQ is idempotent: a peer that still needs one NAKs again.
-const MAX_DROPREQ_PER_NAK: usize = 16;
+pub(crate) const MAX_DROPREQ_PER_NAK: usize = 16;
 
 /// Positions of peer loss reports one visit validates or queues for
 /// retransmission. A NAK can name the whole negotiated window (up to
@@ -204,14 +214,112 @@ enum NakStep {
     Applied(Vec<DroppedMessage>),
 }
 
+/// The FIFO of sequences queued for retransmission, compacted a bounded
+/// number of entries per call.
+///
+/// An entry goes stale when the cumulative ACK retires its packet or
+/// TLPKTDROP drops it; `pop_retransmit` skips stale entries it meets. Once
+/// more than `STALE_RETRANSMIT_COMPACT_THRESHOLD` are stale, a compaction
+/// pass checks entries in place, front to back, a budget per call: while
+/// it runs the list is `entries[..kept]` (checked and kept) followed by
+/// `entries[next..]` (not yet checked), and `entries[kept..next]` holds
+/// nothing. A call that pushes entries while a pass runs checks
+/// `STALE_RETRANSMITS_CHECKED_PER_PUSH` per entry, so the pass outruns the
+/// pushes, reaches the end and drops the removed run; the list stays within
+/// a few windows plus the threshold however a peer orders its NAKs and ACKs.
+#[derive(Debug, Default)]
+struct RetransmitList {
+    entries: VecDeque<u32>,
+    /// Entries the running pass checked and kept.
+    kept: usize,
+    /// The first entry the running pass has not checked; 0 when none runs.
+    next: usize,
+}
+
+impl RetransmitList {
+    fn push_back(&mut self, sequence: u32) {
+        self.entries.push_back(sequence);
+    }
+
+    fn pop_front(&mut self) -> Option<u32> {
+        if self.kept == 0 && self.next != 0 {
+            // Nothing kept yet: the front is the removed run. Dropping a
+            // front run of `u32`s only moves the head.
+            self.entries.drain(..self.next);
+            self.next = 0;
+        }
+        let sequence = self.entries.pop_front()?;
+        if self.next != 0 {
+            self.kept -= 1;
+            self.next -= 1;
+        }
+        Some(sequence)
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        (self.kept, self.next) = (0, 0);
+    }
+
+    /// The entries in FIFO order.
+    #[cfg(test)]
+    fn to_vec(&self) -> Vec<u32> {
+        let kept = self.entries.range(..self.kept);
+        kept.chain(self.entries.range(self.next..))
+            .copied()
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len() - (self.next - self.kept)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether a compaction pass is part-way through the list.
+    fn compacting(&self) -> bool {
+        self.next != 0
+    }
+
+    /// Check up to `budget` entries of the running pass (starting one at
+    /// the front if none runs), keeping those `live` accepts in order.
+    /// Returns how many it removed.
+    fn compact(&mut self, budget: usize, mut live: impl FnMut(u32) -> bool) -> usize {
+        let mut removed = 0;
+        for _ in 0..budget {
+            let Some(&sequence) = self.entries.get(self.next) else {
+                break;
+            };
+            count_work!(RetransmitEntriesVisited);
+            self.next += 1;
+            if live(sequence) {
+                self.entries[self.kept] = sequence;
+                self.kept += 1;
+            } else {
+                removed += 1;
+            }
+        }
+        if self.next == self.entries.len() {
+            // Truncating `u32`s only moves the tail.
+            self.entries.truncate(self.kept);
+            (self.kept, self.next) = (0, 0);
+        }
+        removed
+    }
+}
+
 /// Send buffer.
 #[derive(Debug)]
 pub struct SenderBuffer {
     /// Sent packets in a direct paged sequence window.
     packets: SenderPacketWindow<SentPacket>,
 
-    /// Loss list (packets reported via NAK).
-    loss_list: VecDeque<u32>,
+    /// Loss list (packets reported via NAK, or the RTO probe), in FIFO order.
+    loss_list: RetransmitList,
 
     /// Queue entries invalidated by ACK/TLPKTDROP and awaiting lazy removal.
     stale_retransmits: usize,
@@ -448,7 +556,7 @@ impl SenderBuffer {
         let flow_window = flow_window.clamp(1, MAX_FLOW_WINDOW);
         let mut buf = Self {
             packets: SenderPacketWindow::new(flow_window),
-            loss_list: VecDeque::new(),
+            loss_list: RetransmitList::default(),
             stale_retransmits: 0,
             oldest_unacked: initial_seq,
             next_seq: initial_seq,
@@ -913,6 +1021,7 @@ impl SenderBuffer {
         let newest = self.newest_submitted?;
         let mut ceiling = newest;
         loop {
+            count_work!(RtoCandidateSteps);
             let (sequence, eligible) =
                 self.packets
                     .last_occupied_before(ceiling.wrapping_add(1))
@@ -931,6 +1040,7 @@ impl SenderBuffer {
                         self.loss_list.push_back(sequence);
                     },
                 );
+                self.compact_stale_retransmits(STALE_RETRANSMITS_CHECKED_PER_PUSH);
                 return Some(sequence);
             }
             ceiling = sequence.wrapping_sub(1);
@@ -1393,7 +1503,13 @@ impl SenderBuffer {
     /// delivery deadline passes, to bound latency -- since a packet
     /// retransmitted repeatedly would then never expire.)
     pub fn pop_retransmit(&mut self, dest_socket_id: u32) -> Option<(DataHeader, Bytes)> {
-        while let Some(seq) = self.loss_list.pop_front() {
+        // A NAK storm followed by an ACK can leave a long run of stale
+        // entries at the front; one call skips a bounded number of them and
+        // leaves the rest for the next (the caller continues while
+        // `has_retransmit` still counts live ones).
+        for _ in 0..MAX_STALE_RETRANSMITS_SKIPPED_PER_POP {
+            let seq = self.loss_list.pop_front()?;
+            count_work!(RetransmitEntriesVisited);
             if let Some(entry) = self.packets.pop_retransmit_slot(seq) {
                 if entry.dropped {
                     // A tombstone answers a repeated NAK with DROPREQ, never
@@ -1517,7 +1633,7 @@ impl SenderBuffer {
         if sequence_less_than(self.justified_frontier, self.oldest_unacked) {
             self.justified_frontier = self.oldest_unacked;
         }
-        self.compact_stale_retransmits();
+        self.compact_stale_retransmits(STALE_RETRANSMITS_CHECKED_PER_CALL);
         self.packets
             .release_retired(MAX_ACKED_PAGES_RELEASED_PER_VISIT);
         live_bytes_discarded
@@ -1776,6 +1892,7 @@ impl SenderBuffer {
             let remaining = (last_seq.wrapping_sub(report.next) & SEQUENCE_MASK) + 1;
             let chunk = remaining.min(*budget);
             let chunk_last = report.next.wrapping_add(chunk - 1) & SEQUENCE_MASK;
+            count_work!(NakPositionsVisited, u64::from(chunk));
             self.queue_loss_range(report.next, chunk_last);
             *budget -= chunk;
             if chunk == remaining {
@@ -1816,6 +1933,7 @@ impl SenderBuffer {
                 break false;
             }
             left -= 1;
+            count_work!(NakPositionsVisited);
             if let Some((first, last)) = known_run
                 && !sequence_less_than(sequence, first)
                 && !sequence_less_than(last, sequence)
@@ -1884,41 +2002,57 @@ impl SenderBuffer {
     /// never shrinks (the peer keeps repeating the same NAK) serves a
     /// different window of messages each time instead of stalling on the
     /// same first ones. See `dropreq_cursor`'s doc comment.
-    fn serve_dropreqs(&mut self, mut tombstones: Vec<DroppedMessage>) -> Vec<DroppedMessage> {
+    fn serve_dropreqs(&mut self, tombstones: Vec<DroppedMessage>) -> Vec<DroppedMessage> {
         if tombstones.is_empty() {
             return tombstones;
         }
-        let start = (self.dropreq_cursor as usize) % tombstones.len();
-        tombstones.rotate_left(start);
-        tombstones.truncate(MAX_DROPREQ_PER_NAK);
-        self.dropreq_cursor = self.dropreq_cursor.wrapping_add(tombstones.len() as u16);
-        tombstones
+        let len = tombstones.len();
+        let start = (self.dropreq_cursor as usize) % len;
+        // Take the served window by index, without rotating the rest.
+        let served: Vec<DroppedMessage> = (0..len.min(MAX_DROPREQ_PER_NAK))
+            .map(|offset| {
+                count_work!(DropreqRunsVisited);
+                tombstones[(start + offset) % len].clone()
+            })
+            .collect();
+        self.dropreq_cursor = self.dropreq_cursor.wrapping_add(served.len() as u16);
+        served
     }
 
     /// Queue retained, live, transmitted packets intersecting one loss range.
     fn queue_loss_range(&mut self, first_seq: u32, last_seq: u32) {
         let packets = &mut self.packets;
         let loss_list = &mut self.loss_list;
-        let total_lost = &mut self.total_lost;
+        let mut queued = 0usize;
         packets.queue_loss_range(
             first_seq & SEQUENCE_MASK,
             last_seq & SEQUENCE_MASK,
             |entry: &SentPacket| !entry.dropped,
             |sequence| {
                 loss_list.push_back(sequence);
-                *total_lost = total_lost.saturating_add(1);
+                queued += 1;
             },
         );
+        self.total_lost = self.total_lost.saturating_add(queued as u64);
+        self.compact_stale_retransmits(queued * STALE_RETRANSMITS_CHECKED_PER_PUSH);
     }
 
-    fn compact_stale_retransmits(&mut self) {
-        if self.stale_retransmits <= STALE_RETRANSMIT_COMPACT_THRESHOLD {
+    /// Check up to `budget` entries of the stale-entry compaction pass (see
+    /// [`RetransmitList`]), starting one past the threshold. A cumulative
+    /// ACK or TLPKTDROP tick checks `STALE_RETRANSMITS_CHECKED_PER_CALL`;
+    /// whatever pushes entries checks `STALE_RETRANSMITS_CHECKED_PER_PUSH`
+    /// per entry pushed.
+    fn compact_stale_retransmits(&mut self, budget: usize) {
+        if !self.loss_list.compacting()
+            && self.stale_retransmits <= STALE_RETRANSMIT_COMPACT_THRESHOLD
+        {
             return;
         }
         let packets = &self.packets;
-        self.loss_list
-            .retain(|&sequence| packets.retransmit_queued_contains(sequence));
-        self.stale_retransmits = 0;
+        let removed = self.loss_list.compact(budget, |sequence| {
+            packets.retransmit_queued_contains(sequence)
+        });
+        self.stale_retransmits = self.stale_retransmits.saturating_sub(removed);
     }
 
     /// Retain measurements carried by the most recent compatible non-Light
@@ -2035,7 +2169,7 @@ impl SenderBuffer {
         }
         self.expiry_scan_from = seq;
 
-        self.compact_stale_retransmits();
+        self.compact_stale_retransmits(STALE_RETRANSMITS_CHECKED_PER_CALL);
 
         messages
     }
@@ -2472,6 +2606,217 @@ mod tests {
         );
         buf.handle_ack(4);
         assert!(buf.drop_records.is_empty());
+    }
+
+    /// The DROPREQ answer and the per-visit work of one peer loss report,
+    /// from arrival until it applied.
+    fn nak_visits(
+        buf: &mut SenderBuffer,
+        first: u32,
+        last: u32,
+    ) -> (Vec<DroppedMessage>, Vec<WorkCounters>) {
+        let (receipt, work) =
+            WorkCounters::measure(|| buf.receive_nak(one_range(first, last), Timestamp::default()));
+        let mut answer = match receipt.expect("a credible report") {
+            NakReceipt::Applied(answer) => answer,
+            NakReceipt::Deferred => Vec::new(),
+            NakReceipt::Shed => panic!("nothing else is pending"),
+        };
+        let mut visits = vec![work];
+        while buf.has_pending_nak() {
+            let (progress, work) = WorkCounters::measure(|| buf.continue_naks());
+            assert_eq!(progress.rejected, 0);
+            answer.extend(progress.dropped);
+            visits.push(work);
+        }
+        (answer, visits)
+    }
+
+    /// A sender at `window` holding `window` single-packet messages, all
+    /// submitted.
+    fn submitted_window(window: u32, latency_ms: u16) -> SenderBuffer {
+        let mut buf = SenderBuffer::new(0, window, latency_ms);
+        for _ in 0..window {
+            buf.push_submitted(vec![1], 1, 1, Timestamp::default())
+                .expect("the window is open");
+        }
+        buf
+    }
+
+    fn most(works: &[WorkCounters], counter: impl Fn(&WorkCounters) -> u64) -> u64 {
+        works.iter().map(counter).max().unwrap_or(0)
+    }
+
+    /// F17: after a NAK storm, cumulative ACKs leave the retransmission
+    /// list full of stale entries. Each ACK checks a bounded number of them
+    /// and each pop skips a bounded number, however large the window; the
+    /// old compaction swept the whole list on every ACK past the threshold.
+    #[test]
+    fn a_nak_storm_then_acks_and_pops_does_window_independent_list_work() {
+        let mut results = Vec::new();
+        for window in WORK_BOUND_WINDOWS {
+            let mut buf = submitted_window(window, 120);
+            let step = window / 8;
+            let (_, mut naks) = nak_visits(&mut buf, 0, window - 1);
+            let (mut acks, mut pops) = (Vec::new(), Vec::new());
+            for round in 1..8 {
+                let acked = round * step;
+                acks.push(WorkCounters::measure(|| buf.handle_ack(acked)).1);
+                for _ in 0..4 {
+                    let (popped, work) = WorkCounters::measure(|| buf.pop_retransmit(1));
+                    if let Some((header, _)) = popped {
+                        assert!(!sequence_less_than(header.sequence_number, acked));
+                    }
+                    pops.push(work);
+                }
+                naks.extend(nak_visits(&mut buf, acked, window - 1).1);
+            }
+            let list = |work: &WorkCounters| work.retransmit_entries_visited;
+            results.push((
+                window,
+                most(&naks, list),
+                most(&acks, list),
+                most(&pops, list),
+            ));
+        }
+        eprintln!("(window, most list entries per NAK visit, ACK, pop): {results:?}");
+        for (window, nak, ack, pop) in results {
+            assert!(
+                nak <= NAK_VISIT_LIST_LIMIT
+                    && ack <= STALE_RETRANSMITS_CHECKED_PER_CALL as u64
+                    && pop <= MAX_STALE_RETRANSMITS_SKIPPED_PER_POP as u64,
+                "window {window}: {nak} / {ack} / {pop}"
+            );
+        }
+    }
+
+    /// List entries one NAK visit may check: two per position it queues.
+    const NAK_VISIT_LIST_LIMIT: u64 =
+        (STALE_RETRANSMITS_CHECKED_PER_PUSH as u64) * MAX_NAK_POSITIONS_PER_VISIT as u64;
+
+    /// Whole-window NAK/ACK cycles nothing pops keep the retransmission
+    /// list bounded: every entry pushed while a compaction pass runs checks
+    /// two more, so the pass reaches the end and drops what it removed.
+    #[test]
+    fn unpopped_nak_and_ack_cycles_keep_the_retransmission_list_bounded() {
+        let mut results = Vec::new();
+        for window in WORK_BOUND_WINDOWS {
+            let mut buf = SenderBuffer::new(0, window, 120);
+            let mut longest = 0;
+            let mut naks = Vec::new();
+            for cycle in 0..6 {
+                for _ in 0..window {
+                    buf.push_submitted(vec![1], 1, 1, Timestamp::default())
+                        .expect("the window is open");
+                }
+                let first = cycle * window;
+                naks.extend(nak_visits(&mut buf, first, first + window - 1).1);
+                longest = longest.max(buf.loss_list.entries.len());
+                buf.handle_ack(first + window);
+                buf.set_peer_window(first + window, window);
+                // The connection's continuation visits release the pages.
+                while buf.release_acked_packets() {}
+            }
+            let list = most(&naks, |work| work.retransmit_entries_visited);
+            results.push((window, longest, list));
+        }
+        eprintln!("(window, longest retransmission list, most entries per NAK visit): {results:?}");
+        for (window, longest, list) in results {
+            assert!(
+                longest <= 2 * window as usize + STALE_RETRANSMIT_COMPACT_THRESHOLD
+                    && list <= NAK_VISIT_LIST_LIMIT,
+                "window {window}: {longest} / {list}"
+            );
+        }
+    }
+
+    /// F17: a report naming a window of dropped single-packet messages is
+    /// answered with `MAX_DROPREQ_PER_NAK` of them picked by index, so no
+    /// visit touches every run the report found; the old answer rotated
+    /// them all.
+    #[test]
+    fn a_nak_over_many_dropped_messages_picks_its_dropreqs_by_index() {
+        let mut results = Vec::new();
+        for window in WORK_BOUND_WINDOWS {
+            let mut buf = submitted_window(window, 10);
+            assert_eq!(
+                buf.drop_expired(Timestamp::from_micros(1_000_001)).len(),
+                window as usize
+            );
+            let mut answers = Vec::new();
+            let mut runs = 0;
+            for _ in 0..2 {
+                let (answer, visits) = nak_visits(&mut buf, 0, window - 1);
+                runs = runs.max(most(&visits, |work| work.dropreq_runs_visited));
+                answers.push(answer.iter().map(|m| m.first_seq).collect::<Vec<_>>());
+            }
+            assert_eq!(answers[0].len(), MAX_DROPREQ_PER_NAK, "window {window}");
+            assert_ne!(
+                answers[0], answers[1],
+                "window {window}: the served window moves"
+            );
+            results.push((window, runs));
+        }
+        eprintln!("(window, most DROPREQ runs inspected per visit): {results:?}");
+        for (window, runs) in results {
+            assert!(
+                runs <= MAX_DROPREQ_PER_NAK as u64,
+                "window {window}: {runs}"
+            );
+        }
+    }
+
+    /// The RTO probe runs only while something submitted is live and
+    /// nothing is queued for retransmission. TLPKTDROP tombstones only a
+    /// prefix of the retained span (its scan stops at the first packet not
+    /// yet expired), so the newest submitted packet is then live and the
+    /// candidate walk takes one step, under any expiry and ACK order.
+    #[test]
+    fn the_rto_probe_takes_one_candidate_step_under_adversarial_expiry_and_acks() {
+        let mut results = Vec::new();
+        for window in WORK_BOUND_WINDOWS {
+            let mut buf = SenderBuffer::new(0, window, 10);
+            // Messages of one to four fragments admitted at times that go
+            // back and forth, so expiry order is not sequence order.
+            let (mut pushed, mut message) = (0u32, 0u64);
+            while pushed < window {
+                let fragments = (message % 4 + 1).min(u64::from(window - pushed)) as usize;
+                let at = Timestamp::from_micros(message % 7 * 300_000);
+                pushed += buf.push_message(&vec![0u8; fragments], 1, 1, 1, at).len() as u32;
+                message += 1;
+            }
+            // The last quarter never leaves: accepted, not submitted.
+            for sequence in 0..window - window / 4 {
+                buf.note_data_submitted(sequence);
+            }
+            let (mut probes, mut steps) = (0u32, 0u64);
+            for tick in 0..40u32 {
+                let now = Timestamp::from_micros(u64::from(tick) * 100_000);
+                let _ = buf.drop_expired(now);
+                if tick % 3 == 1 {
+                    // A peer can acknowledge only what was submitted.
+                    let ahead = window / 16 * (tick % 5);
+                    let target = (buf.oldest_unacked + ahead).min(window - window / 4);
+                    buf.handle_ack(target);
+                }
+                if buf.has_outstanding_submitted_data() && !buf.has_retransmit() {
+                    let (probe, work) =
+                        WorkCounters::measure(|| buf.queue_retransmission_of_newest_submitted());
+                    assert!(probe.is_some(), "window {window}, tick {tick}");
+                    probes += 1;
+                    steps = steps.max(work.rto_candidate_steps);
+                    assert!(buf.pop_retransmit(1).is_some());
+                }
+            }
+            results.push((window, probes, steps));
+        }
+        eprintln!("(window, probes, most candidate steps): {results:?}");
+        for (window, probes, steps) in results {
+            assert!(
+                probes > 0 && steps == 1,
+                "window {window}: {probes} / {steps}"
+            );
+        }
     }
 
     /// A complete rate snapshot, as only a 28/32-byte ACK can report.
@@ -2926,11 +3271,16 @@ mod tests {
         // deliberate. An eighth added `drop_records` (a `VecDeque` of the
         // dropped messages' ranges, unallocated until TLPKTDROP gives one
         // up) so a NAK into a dropped message is answered by binary search
-        // instead of a walk of its tombstones -- 32 bytes, deliberate.
-        assert!(inline_bytes <= 448);
+        // instead of a walk of its tombstones -- 32 bytes, deliberate. A
+        // ninth added the retransmission list's two compaction cursors, so
+        // dropping stale entries is a bounded step per call instead of a
+        // whole-list pass -- 16 bytes, deliberate.
+        assert!(inline_bytes <= 464);
         assert_eq!(window.heap_bytes(), 8_320);
     }
 
+    /// Past the threshold, stale entries are compacted away a bounded step
+    /// per call until none is left.
     #[test]
     fn stale_retransmit_queue_is_compacted_at_a_bounded_threshold() {
         let mut buf = SenderBuffer::new(0, 2_048, 120);
@@ -2939,10 +3289,87 @@ mod tests {
         }
         buf.handle_nak(&(0..2_048).collect::<Vec<_>>());
         buf.handle_ack(2_048);
+        assert_eq!(
+            buf.loss_list.len(),
+            2_048 - STALE_RETRANSMITS_CHECKED_PER_CALL
+        );
 
-        assert!(buf.loss_list.is_empty());
+        let mut calls = 1;
+        while !buf.loss_list.is_empty() {
+            assert!(buf.drop_expired(Timestamp::default()).is_empty());
+            calls += 1;
+        }
+        assert_eq!(calls, 2_048 / STALE_RETRANSMITS_CHECKED_PER_CALL);
         assert_eq!(buf.stale_retransmits, 0);
+        assert!(!buf.loss_list.compacting());
         assert!(!buf.has_retransmit());
+    }
+
+    /// One operation on a [`RetransmitList`] the model test applies.
+    #[derive(Debug, Clone)]
+    enum ListOp {
+        Push,
+        Pop,
+        Retire(u16),
+        Compact(u8),
+    }
+
+    fn list_op() -> impl proptest::strategy::Strategy<Value = ListOp> {
+        use proptest::prelude::*;
+        prop_oneof![
+            3 => Just(ListOp::Push),
+            1 => Just(ListOp::Pop),
+            2 => any::<u16>().prop_map(ListOp::Retire),
+            2 => any::<u8>().prop_map(ListOp::Compact),
+        ]
+    }
+
+    proptest::proptest! {
+        /// Compaction steps interleaved with pushes and pops keep the list a
+        /// FIFO that differs from the pushed order only by retired entries.
+        #[test]
+        fn retransmit_list_compaction_keeps_fifo_order(
+            ops in proptest::collection::vec(list_op(), 1..256),
+        ) {
+            let mut list = RetransmitList::default();
+            let mut model = VecDeque::new();
+            let mut retired = std::collections::HashSet::new();
+            let mut pushed = 0u32;
+            for op in ops {
+                match op {
+                    ListOp::Push => {
+                        list.push_back(pushed);
+                        model.push_back(pushed);
+                        pushed += 1;
+                    }
+                    ListOp::Pop => {
+                        let popped = list.pop_front();
+                        while model.front().is_some_and(|&front| Some(front) != popped) {
+                            let skipped = model.pop_front().expect("checked");
+                            proptest::prop_assert!(retired.contains(&skipped));
+                        }
+                        proptest::prop_assert_eq!(model.pop_front(), popped);
+                    }
+                    ListOp::Retire(at) => {
+                        retired.insert(u32::from(at) % pushed.max(1));
+                    }
+                    ListOp::Compact(budget) => {
+                        let removed = list.compact(usize::from(budget), |s| !retired.contains(&s));
+                        proptest::prop_assert!(removed <= usize::from(budget));
+                    }
+                }
+                let entries = list.to_vec();
+                proptest::prop_assert_eq!(entries.len(), list.len());
+                let mut rest = model.iter();
+                for entry in &entries {
+                    let found = rest.by_ref().find(|&&kept| {
+                        kept == *entry || !retired.contains(&kept)
+                    });
+                    proptest::prop_assert_eq!(found, Some(entry), "{:?} vs {:?}", entries, model);
+                }
+                proptest::prop_assert!(rest.all(|left| retired.contains(left)));
+            }
+        }
     }
 
     /// `stats().total_retransmits` must stay accurate after the
