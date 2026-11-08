@@ -5,6 +5,8 @@
 //! and carry none of it.
 
 pub mod wire_checker;
+#[cfg(test)]
 pub mod work;
 
+#[cfg(test)]
 pub use work::WorkCounters;

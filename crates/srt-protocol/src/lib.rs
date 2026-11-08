@@ -1,12 +1,13 @@
 /// Count `units` of loop work under a `test_support::WorkCounters`
-/// counter. Expands to nothing in production builds: only this crate's
-/// tests and the opt-in `test-support` feature compile the counters.
+/// counter. Expands to nothing outside this crate's own unit tests, so
+/// production builds, benches and dependents' tests (even with
+/// `test-support`) measure uncounted code.
 macro_rules! count_work {
     ($counter:ident) => {
         count_work!($counter, 1)
     };
     ($counter:ident, $units:expr) => {
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(test)]
         $crate::test_support::work::add(
             $crate::test_support::work::Counter::$counter,
             ($units) as u64,

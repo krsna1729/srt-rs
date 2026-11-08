@@ -8,7 +8,7 @@
 //! state on purpose and are not part of any bounded path.
 //!
 //! The counting sites expand to nothing unless the crate is built for its own
-//! tests or with the `test-support` feature.
+//! unit tests: benches and dependents' tests run the uncounted code.
 
 use std::cell::Cell;
 
