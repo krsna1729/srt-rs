@@ -23,6 +23,11 @@ SRT listener admission is a two-packet handshake:
 5. Only after that result is applied does `SrtConnection::feed_recv_buf`
    interpret CONCLUSION and process KM.
 
+Routing a handshake that matches no live peer (a new caller's INDUCTION, a
+stale or foreign CONCLUSION) costs a constant number of ordered-index lookups
+(by address, by address and caller socket ID, by address and SYN cookie), not
+a walk of the slot arena, so rejection stays cheap at any table capacity.
+
 This is the same timing boundary as Haivision SRT's
 [`srt_listen_callback`](https://github.com/Haivision/srt/blob/fcae57145c000a9e7b72aa777adb8f85c2463242/docs/API/API-functions.md#srt_listen_callback):
 CONCLUSION has arrived but has not yet been interpreted, so a passphrase chosen

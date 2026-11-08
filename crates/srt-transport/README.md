@@ -111,6 +111,16 @@ service budget at the same time.
   the candidate's pool first; only after a successful admission is the managed
   receive started and the side, receive mode and started-session flag committed.
 
+### Work bounds
+
+Transport work that remote traffic can trigger once per datagram or per
+service visit does not grow with the peer population or the arena size:
+unknown handshakes route through exact indexes, listener deadlines live in
+exact indexed heaps (finalization reads their roots), and promoted-socket
+receive work is found through a waker-fed ready queue.
+`docs/production-progress.md` (Transport work is independent of the peer
+population) lists each bound, its evidence and the paths still amortized.
+
 ## Charter: this crate owns *things*
 
 The dividing line against [`srt-lifecycle`](../srt-lifecycle) is

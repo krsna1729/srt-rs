@@ -749,3 +749,36 @@ Evidence. One test per finding compares W = 32 / 8,192 / 65,536 with
 `WorkCounters`; `send_entry_points_do_window_independent_work` replays
 random send-side streams at all three windows. Before/after counts and
 mutations are in each commit message.
+
+## Transport work is independent of the peer population
+
+Each transport path below could be driven by remote traffic, once per
+datagram or per Owner service visit, into work proportional to the peer
+population or the arena size. Each is now bounded per call.
+
+- Unknown handshakes (F06). INDUCTION and CONCLUSION misses resolve through
+  exact route indexes kept beside the slot arena (address, address + caller
+  socket ID, address + SYN cookie), updated where handshake state changes.
+  A miss used to walk the whole arena, empty slots included, once or twice.
+- Listener deadlines (F05). The protocol, group-leg and idle deadline indexes
+  are exact indexed binary heaps: O(log n) per set, move or removal, and the
+  next deadline is the root. The lazy heaps they replace cloned every live key
+  on the datagram that crossed the stale threshold and popped stale heads
+  during report finalization, outside every budget. The idle index only moves
+  a peer's entry earlier, so the per-datagram activity refresh does no heap
+  work; the bounded idle prune re-indexes a peer that surfaces early.
+- Promoted sockets (F14). compio and Tokio find promoted receive work through
+  a ready queue filled by per-socket wakers instead of walking every promoted
+  slot each wait and visit. A retired socket leaves at most one stale entry,
+  skipped once.
+
+Not yet bounded: detach paths still filter the failure and caller-route
+queues and sample `receiver_stats` (F15), and the key-derivation limiter
+prunes its source map with a full `retain` past its threshold (F18). Both run
+once per session lifecycle or per pruning threshold, not per steady-state
+datagram.
+
+Evidence. `WorkCounters` (unit tests only) count arena slot probes, route
+index probes, heap entries visited or cloned, and promoted slot probes. Each
+finding has a test at three sizes; before/after counts and mutations are in
+each commit message.
