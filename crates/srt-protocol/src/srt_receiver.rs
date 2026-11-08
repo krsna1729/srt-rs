@@ -408,9 +408,7 @@ impl LossBitmap {
         let mut pending: Option<(u32, u32)> = None;
         let mut piece_seq = seq;
         for (start, end) in self.index_ranges(seq, count) {
-            let mut index = start;
-            while let Some(run_start) = self.bits.next_one(index, end) {
-                let run_end = self.bits.next_zero(run_start, end).unwrap_or(end);
+            let mut merge = |run_start: usize, run_end: usize| {
                 let first = piece_seq + (run_start - start) as u32;
                 let last = piece_seq + (run_end - start) as u32 - 1;
                 pending = match pending {
@@ -423,7 +421,11 @@ impl LossBitmap {
                     }
                     None => Some((first, last)),
                 };
-                index = run_end;
+                ControlFlow::Continue(())
+            };
+            let mut index = start;
+            while let Some(found) = self.bits.next_one(index, end) {
+                index = self.word_runs(found, end, &mut merge)?;
             }
             piece_seq += (end - start) as u32;
         }
@@ -431,6 +433,36 @@ impl LossBitmap {
             Some((first, last)) => emit(first, last),
             None => ControlFlow::Continue(()),
         }
+    }
+
+    /// Visit the runs of losses in the data word holding `found` (the first
+    /// loss at or after the walk's position), reading that word once; a
+    /// run reaching the word's end is followed through the summary levels.
+    /// Returns where the walk resumes.
+    fn word_runs(
+        &self,
+        found: usize,
+        end: usize,
+        visit: &mut impl FnMut(usize, usize) -> ControlFlow<()>,
+    ) -> ControlFlow<(), usize> {
+        let base = found & !63;
+        let limit = (base + 64).min(end);
+        let mut word = self.bits.word(base / 64) & (!0u64 << (found - base));
+        if limit < base + 64 {
+            word &= (1u64 << (limit - base)) - 1;
+        }
+        while word != 0 {
+            let run_start = base + word.trailing_zeros() as usize;
+            let run_end = run_start + (word >> (run_start - base)).trailing_ones() as usize;
+            if run_end == base + 64 && run_end < end {
+                let run_end = self.bits.next_zero(run_end, end).unwrap_or(end);
+                visit(run_start, run_end)?;
+                return ControlFlow::Continue(run_end);
+            }
+            visit(run_start, run_end)?;
+            word &= (!0u64).checked_shl((run_end - base) as u32).unwrap_or(0);
+        }
+        ControlFlow::Continue(limit)
     }
 
     /// The oldest loss in sequence order from the window base.

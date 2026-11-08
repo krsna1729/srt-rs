@@ -187,6 +187,7 @@ impl<T, const N: usize> Page<T, N> {
         }
     }
 
+    #[inline]
     fn remove(&mut self, sequence: u32, demote_at: usize) -> Option<(T, bool)> {
         let value = match self {
             Self::Sparse(page) => page.remove(sequence)?,
@@ -287,8 +288,9 @@ pub struct AdaptiveReceiverPacketWindow<T, const N: usize = 8> {
     release_cursor: u32,
     index_mask: usize,
     pages: Box<[Option<Page<T, N>>]>,
-    /// For each block of 64 pages, three words: the pages holding any value,
-    /// the pages retired by a range removal, and the block's live values.
+    /// For each block of 64 pages, three adjacent words: the pages holding
+    /// any value, the pages retired by a range removal, and the block's live
+    /// values.
     page_masks: Box<[u64]>,
     nonempty_summary: u64,
     /// Blocks retired wholesale: every page in one counts as retired.
@@ -379,20 +381,28 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
         self.page_masks.len() / 3
     }
 
+    fn nonempty_slot(block: usize) -> usize {
+        3 * block
+    }
+
+    fn retired_slot(block: usize) -> usize {
+        3 * block + 1
+    }
+
+    fn live_slot(block: usize) -> usize {
+        3 * block + 2
+    }
+
     fn nonempty_pages(&self, block: usize) -> u64 {
-        self.page_masks[block]
+        self.page_masks[Self::nonempty_slot(block)]
     }
 
     fn retired_pages(&self, block: usize) -> u64 {
         if self.retired_blocks & (1u64 << block) != 0 {
             ALL
         } else {
-            self.page_masks[self.blocks() + block]
+            self.page_masks[Self::retired_slot(block)]
         }
-    }
-
-    fn live_slot(&self, block: usize) -> usize {
-        2 * self.blocks() + block
     }
 
     /// Whether `page`'s values are reachable.
@@ -406,22 +416,27 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
         !self.has_retired() || self.page_live(page)
     }
 
+    #[inline]
     fn add_live(&mut self, page: usize, added: u32) {
-        let slot = self.live_slot(page >> 6);
+        let slot = Self::live_slot(page >> 6);
         self.page_masks[slot] += u64::from(added);
         self.len += added;
     }
 
+    #[inline]
     fn sub_live(&mut self, block: usize, removed: u32) {
-        let slot = self.live_slot(block);
+        let slot = Self::live_slot(block);
         self.page_masks[slot] -= u64::from(removed);
         self.len -= removed;
     }
 
+    #[inline]
     pub fn insert(&mut self, sequence: u32, value: T) -> Result<Option<T>, T> {
         count_work!(PacketSlotProbes);
         let (page_index, _) = self.indices(sequence);
-        if !self.page_live(page_index) {
+        // Only a retirement in progress, or a block retired wholesale while
+        // empty, can leave this page retired.
+        if (self.has_retired() || self.retired_blocks != 0) && !self.page_live(page_index) {
             self.revive_page(page_index);
         }
         let result = if let Some(page) = &mut self.pages[page_index] {
@@ -448,7 +463,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
     fn revive_page(&mut self, page: usize) {
         let block = page >> 6;
         self.split_retired_block(block);
-        let retired = self.blocks() + block;
+        let retired = Self::retired_slot(block);
         let bit = 1u64 << (page & 63);
         if self.page_masks[retired] & bit != 0 {
             self.release_page(page, PAGE_SLOTS);
@@ -462,11 +477,12 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
         let bit = 1u64 << block;
         if self.retired_blocks & bit != 0 {
             self.retired_blocks &= !bit;
-            let retired = self.blocks() + block;
-            self.page_masks[retired] = self.page_masks[block];
+            let retired = Self::retired_slot(block);
+            self.page_masks[retired] = self.nonempty_pages(block);
         }
     }
 
+    #[inline]
     pub fn get(&self, sequence: u32) -> Option<&T> {
         count_work!(PacketSlotProbes);
         let (page_index, _) = self.indices(sequence);
@@ -486,6 +502,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
         self.get(sequence).is_some()
     }
 
+    #[inline]
     pub fn remove(&mut self, sequence: u32) -> Option<T> {
         count_work!(PacketSlotProbes);
         let (page_index, _) = self.indices(sequence);
@@ -507,6 +524,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
         Some(value)
     }
 
+    #[inline]
     pub fn successor_after(&self, sequence: u32) -> Option<u32> {
         if self.is_empty() {
             return None;
@@ -631,8 +649,8 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
     fn retire_pages_in_block(&mut self, block: usize, pages: u64) -> u32 {
         count_work!(PacketSlotProbes);
         self.split_retired_block(block);
-        let retired = self.blocks() + block;
-        let mut newly = self.page_masks[block] & !self.page_masks[retired] & pages;
+        let retired = Self::retired_slot(block);
+        let mut newly = self.nonempty_pages(block) & !self.page_masks[retired] & pages;
         self.page_masks[retired] |= newly;
         let mut removed = 0;
         while newly != 0 {
@@ -655,7 +673,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
         while newly != 0 {
             count_work!(PacketSlotProbes);
             let block = newly.trailing_zeros() as usize;
-            let live = self.page_masks[self.live_slot(block)] as u32;
+            let live = self.page_masks[Self::live_slot(block)] as u32;
             self.sub_live(block, live);
             removed += live;
             newly &= newly - 1;
@@ -672,7 +690,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
     fn retire_all(&mut self) {
         self.retired_blocks = span(0, self.blocks());
         for block in 0..self.blocks() {
-            let slot = self.live_slot(block);
+            let slot = Self::live_slot(block);
             self.page_masks[slot] = 0;
         }
         self.len = 0;
@@ -725,7 +743,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
         if occupied == 0 {
             self.pages[page_index] = None;
             self.mark_page_empty(page_index);
-            let retired = self.blocks() + (page_index >> 6);
+            let retired = Self::retired_slot(page_index >> 6);
             self.page_masks[retired] &= !(1u64 << (page_index & 63));
         }
         released
@@ -769,14 +787,14 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
 
     fn mark_page_nonempty(&mut self, page_index: usize) {
         let word = page_index >> 6;
-        self.page_masks[word] |= 1 << (page_index & 63);
+        self.page_masks[Self::nonempty_slot(word)] |= 1 << (page_index & 63);
         self.nonempty_summary |= 1 << word;
     }
 
     fn mark_page_empty(&mut self, page_index: usize) {
         let word = page_index >> 6;
-        self.page_masks[word] &= !(1 << (page_index & 63));
-        if self.page_masks[word] == 0 {
+        self.page_masks[Self::nonempty_slot(word)] &= !(1 << (page_index & 63));
+        if self.nonempty_pages(word) == 0 {
             self.nonempty_summary &= !(1 << word);
         }
     }

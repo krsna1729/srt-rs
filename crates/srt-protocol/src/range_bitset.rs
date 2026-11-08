@@ -363,7 +363,8 @@ impl RangeBitset {
         if !value && self.len == 0 {
             return false;
         }
-        self.assign(index, index + 1, value) != 0
+        self.ensure_storage();
+        self.assign_in_word(index / 64, 1u64 << (index % 64), value) != 0
     }
 
     /// Number of set positions in `start..end`.
