@@ -226,6 +226,11 @@ Packets carry what libsrt 1.5.7 emits:
 - Full ACK numbers are 31-bit like libsrt's (`CAckNo`): they start at 1 and
   roll 0x7fff_ffff -> 0. A 24/28/32-byte ACK numbered 0 is accepted and
   acknowledged with ACKACK 0, whose RTT sample is taken.
+- In live (TSBPD) mode `send_message` still fragments a payload over one
+  packet. This is an srt-rs extension: libsrt's sender refuses such a
+  message (`MN_XSIZE`). A libsrt receiver reassembles it, but its
+  application must read with a buffer that holds the whole message, or the
+  message arrives truncated. See VENDOR.md, "Message reassembly and DROPREQ".
 
 ## Testing
 

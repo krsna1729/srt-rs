@@ -2431,6 +2431,12 @@ impl SrtConnection {
     /// The payload is fragmented into multiple packets if it exceeds the
     /// negotiated maximum payload size. The receiver reassembles the
     /// fragments before delivering them as a single `DataReceived` event.
+    ///
+    /// In live (TSBPD) mode this is an srt-rs extension: libsrt's sender
+    /// refuses such a message (`MN_XSIZE`, `core.cpp:7003-7011`). A libsrt
+    /// receiver still reassembles it (`CRcvBuffer::updateNonreadPos` and
+    /// `readMessage`, `buffer_rcv.cpp`), but its application must read with
+    /// a buffer that holds the whole message, or libsrt truncates it.
     pub fn send_message(&mut self, payload: &[u8], now: Timestamp) -> Result<(), Error> {
         if self.state != ConnectionState::Connected {
             return Err(Error::invalid_state("not connected"));
