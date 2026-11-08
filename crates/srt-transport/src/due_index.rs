@@ -1,5 +1,6 @@
 use srt_proto::Timestamp;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::hash::Hash;
 
 use crate::indexed_heap::IndexedHeap;
@@ -125,18 +126,21 @@ where
         self.heap.is_empty()
     }
 
-    /// The heap handle of `key`, allocating one for a new key.
+    /// The heap handle of `key`, allocating one for a new key. One hash
+    /// either way.
     fn handle(&mut self, key: K) -> u32 {
-        if let Some(&handle) = self.handles.get(&key) {
-            return handle;
+        match self.handles.entry(key) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let handle = self.free.pop().unwrap_or_else(|| {
+                    self.keys.push(None);
+                    u32::try_from(self.keys.len() - 1).expect("fewer than 2^32 keys")
+                });
+                self.keys[handle as usize] = Some(entry.key().clone());
+                entry.insert(handle);
+                handle
+            }
         }
-        let handle = self.free.pop().unwrap_or_else(|| {
-            self.keys.push(None);
-            u32::try_from(self.keys.len() - 1).expect("fewer than 2^32 keys")
-        });
-        self.keys[handle as usize] = Some(key.clone());
-        self.handles.insert(key, handle);
-        handle
     }
 
     fn release(&mut self, handle: u32) {

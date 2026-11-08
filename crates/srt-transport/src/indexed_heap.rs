@@ -11,54 +11,76 @@
 /// Position marker for a handle with no node.
 const ABSENT: u32 = u32::MAX;
 
+/// Entry `i` of the one backing vector carries two unrelated things: heap
+/// node `i` (meaningful for `i < len`) and the node position of handle `i`.
+/// Every node names a distinct handle, so there are never more nodes than
+/// entries, and one allocation serves both: a heap costs a table one
+/// allocation, not two.
+#[derive(Clone, Copy, Debug)]
+struct Entry {
+    /// Node `i`'s deadline, in microseconds.
+    deadline: u64,
+    /// Node `i`'s handle.
+    handle: u32,
+    /// Node index of handle `i`, [`ABSENT`] if it has none.
+    position: u32,
+}
+
+const VACANT: Entry = Entry {
+    deadline: 0,
+    handle: 0,
+    position: ABSENT,
+};
+
 #[derive(Debug, Default)]
 pub(crate) struct IndexedHeap {
-    /// `(deadline_micros, handle)`, a binary min-heap on the deadline.
-    nodes: Vec<(u64, u32)>,
-    /// Node index of each handle, [`ABSENT`] if it has none.
-    positions: Vec<u32>,
+    /// Nodes `0..len` form a binary min-heap on the deadline.
+    entries: Vec<Entry>,
+    len: usize,
 }
 
 impl IndexedHeap {
     /// Live nodes.
     #[inline]
     pub(crate) fn len(&self) -> usize {
-        self.nodes.len()
+        self.len
     }
 
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.len == 0
+    }
+
+    #[inline]
+    fn position(&self, handle: u32) -> Option<usize> {
+        let position = self.entries.get(handle as usize)?.position;
+        (position != ABSENT).then_some(position as usize)
     }
 
     /// The deadline indexed for `handle`.
     #[inline]
     pub(crate) fn get(&self, handle: u32) -> Option<u64> {
-        let position = *self.positions.get(handle as usize)?;
-        (position != ABSENT).then(|| self.nodes[position as usize].0)
+        self.position(handle).map(|at| self.entries[at].deadline)
     }
 
     /// The earliest node.
     #[inline]
     pub(crate) fn peek(&self) -> Option<(u64, u32)> {
-        self.nodes.first().copied()
+        (self.len > 0).then(|| (self.entries[0].deadline, self.entries[0].handle))
     }
 
     /// Index `handle` at exactly `deadline`.
     pub(crate) fn set(&mut self, handle: u32, deadline: u64) {
-        match self.get(handle) {
-            None => self.push(handle, deadline),
-            Some(old) if deadline < old => {
-                let at = self.positions[handle as usize] as usize;
-                self.nodes[at].0 = deadline;
-                self.sift_up(at);
-            }
-            Some(old) if deadline > old => {
-                let at = self.positions[handle as usize] as usize;
-                self.nodes[at].0 = deadline;
-                self.sift_down(at);
-            }
-            Some(_) => {}
+        let Some(at) = self.position(handle) else {
+            self.push(handle, deadline);
+            return;
+        };
+        let old = self.entries[at].deadline;
+        self.entries[at].deadline = deadline;
+        if deadline < old {
+            self.sift_up(at);
+        } else if deadline > old {
+            self.sift_down(at);
         }
     }
 
@@ -74,8 +96,8 @@ impl IndexedHeap {
 
     /// Remove `handle`'s node, returning its deadline.
     pub(crate) fn remove(&mut self, handle: u32) -> Option<u64> {
-        let deadline = self.get(handle)?;
-        let at = self.positions[handle as usize] as usize;
+        let at = self.position(handle)?;
+        let deadline = self.entries[at].deadline;
         self.take_at(at);
         Some(deadline)
     }
@@ -89,22 +111,32 @@ impl IndexedHeap {
 
     fn push(&mut self, handle: u32, deadline: u64) {
         let index = handle as usize;
-        if index >= self.positions.len() {
-            self.positions.resize(index + 1, ABSENT);
+        if index >= self.entries.len() {
+            self.entries.resize(index + 1, VACANT);
         }
-        let at = self.nodes.len();
-        self.nodes.push((deadline, handle));
-        self.positions[index] = at as u32;
+        let at = self.len;
+        // A new node names a handle with none yet, so the nodes stay fewer
+        // than the handles the vector already covers.
+        debug_assert!(at < self.entries.len());
+        self.len += 1;
+        self.entries[at].deadline = deadline;
+        self.entries[at].handle = handle;
+        self.entries[index].position = at as u32;
         self.sift_up(at);
     }
 
     /// Remove the node at `at`, filling the hole with the last node.
     fn take_at(&mut self, at: usize) {
         count_work!(HeapEntriesVisited);
-        let (_, handle) = self.nodes.swap_remove(at);
-        self.positions[handle as usize] = ABSENT;
-        if at < self.nodes.len() {
-            self.positions[self.nodes[at].1 as usize] = at as u32;
+        let handle = self.entries[at].handle;
+        self.entries[handle as usize].position = ABSENT;
+        self.len -= 1;
+        let last = self.len;
+        if at < last {
+            let (deadline, moved) = (self.entries[last].deadline, self.entries[last].handle);
+            self.entries[at].deadline = deadline;
+            self.entries[at].handle = moved;
+            self.entries[moved as usize].position = at as u32;
             self.sift_up(at);
             self.sift_down(at);
         }
@@ -112,15 +144,20 @@ impl IndexedHeap {
 
     fn swap(&mut self, a: usize, b: usize) {
         count_work!(HeapEntriesVisited);
-        self.nodes.swap(a, b);
-        self.positions[self.nodes[a].1 as usize] = a as u32;
-        self.positions[self.nodes[b].1 as usize] = b as u32;
+        let (deadline_a, handle_a) = (self.entries[a].deadline, self.entries[a].handle);
+        let (deadline_b, handle_b) = (self.entries[b].deadline, self.entries[b].handle);
+        self.entries[a].deadline = deadline_b;
+        self.entries[a].handle = handle_b;
+        self.entries[b].deadline = deadline_a;
+        self.entries[b].handle = handle_a;
+        self.entries[handle_b as usize].position = a as u32;
+        self.entries[handle_a as usize].position = b as u32;
     }
 
     fn sift_up(&mut self, mut at: usize) {
         while at > 0 {
             let parent = (at - 1) / 2;
-            if self.nodes[at].0 >= self.nodes[parent].0 {
+            if self.entries[at].deadline >= self.entries[parent].deadline {
                 break;
             }
             self.swap(at, parent);
@@ -129,19 +166,20 @@ impl IndexedHeap {
     }
 
     fn sift_down(&mut self, mut at: usize) {
-        let len = self.nodes.len();
+        let len = self.len;
         loop {
             let left = 2 * at + 1;
             if left >= len {
                 break;
             }
             let right = left + 1;
-            let child = if right < len && self.nodes[right].0 < self.nodes[left].0 {
+            let child = if right < len && self.entries[right].deadline < self.entries[left].deadline
+            {
                 right
             } else {
                 left
             };
-            if self.nodes[child].0 >= self.nodes[at].0 {
+            if self.entries[child].deadline >= self.entries[at].deadline {
                 break;
             }
             self.swap(at, child);

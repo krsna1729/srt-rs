@@ -32,9 +32,52 @@ pub(crate) struct RouteKeys {
 #[derive(Debug, Default)]
 pub(crate) struct RouteIndex {
     keys: IdHashMap<u32, RouteKeys>,
-    by_address: BTreeSet<(SocketAddr, u32)>,
-    by_caller: BTreeSet<(SocketAddr, u32, u32)>,
-    by_cookie: BTreeSet<(SocketAddr, u32, u32)>,
+    by_address: BTreeSet<(Addr, u32)>,
+    /// `(caller ID, address, slot)`: the ID leads, so a probe usually
+    /// settles on one integer comparison per node entry.
+    by_caller: BTreeSet<(u32, Addr, u32)>,
+    /// `(cookie, address, slot)`, likewise.
+    by_cookie: BTreeSet<(u32, Addr, u32)>,
+}
+
+/// A socket address as plain integers, so an index comparison is a few
+/// integer compares rather than `SocketAddr`'s per-family ordering. Exact:
+/// it keeps every field `SocketAddr` equality looks at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Addr {
+    ip: u128,
+    /// Port in the low 16 bits; bit 16 set for IPv6.
+    port_family: u32,
+    flowinfo: u32,
+    scope_id: u32,
+}
+
+impl From<SocketAddr> for Addr {
+    fn from(address: SocketAddr) -> Self {
+        match address {
+            SocketAddr::V4(v4) => Self {
+                ip: u128::from(v4.ip().to_bits()),
+                port_family: u32::from(v4.port()),
+                flowinfo: 0,
+                scope_id: 0,
+            },
+            SocketAddr::V6(v6) => Self {
+                ip: v6.ip().to_bits(),
+                port_family: 1 << 16 | u32::from(v6.port()),
+                flowinfo: v6.flowinfo(),
+                scope_id: v6.scope_id(),
+            },
+        }
+    }
+}
+
+/// Lowest slot of `(id, address)` in an id-led index.
+fn first_slot(index: &BTreeSet<(u32, Addr, u32)>, id: u32, address: SocketAddr) -> Option<u32> {
+    let address = Addr::from(address);
+    index
+        .range((id, address, 0)..=(id, address, u32::MAX))
+        .next()
+        .map(|&(_, _, slot)| slot)
 }
 
 impl RouteIndex {
@@ -48,21 +91,23 @@ impl RouteIndex {
             return;
         }
         if let Some(old) = old {
-            self.by_address.remove(&(old.address, slot));
+            let address = Addr::from(old.address);
+            self.by_address.remove(&(address, slot));
             if let Some(id) = old.caller_socket_id {
-                self.by_caller.remove(&(old.address, id, slot));
+                self.by_caller.remove(&(id, address, slot));
             }
             if let Some(cookie) = old.syn_cookie {
-                self.by_cookie.remove(&(old.address, cookie, slot));
+                self.by_cookie.remove(&(cookie, address, slot));
             }
         }
         if let Some(new) = keys {
-            self.by_address.insert((new.address, slot));
+            let address = Addr::from(new.address);
+            self.by_address.insert((address, slot));
             if let Some(id) = new.caller_socket_id {
-                self.by_caller.insert((new.address, id, slot));
+                self.by_caller.insert((id, address, slot));
             }
             if let Some(cookie) = new.syn_cookie {
-                self.by_cookie.insert((new.address, cookie, slot));
+                self.by_cookie.insert((cookie, address, slot));
             }
         }
     }
@@ -70,6 +115,7 @@ impl RouteIndex {
     /// Lowest slot at `address`.
     pub(crate) fn first_at(&self, address: SocketAddr) -> Option<u32> {
         count_work!(RouteIndexProbes);
+        let address = Addr::from(address);
         self.by_address
             .range((address, 0)..=(address, u32::MAX))
             .next()
@@ -79,6 +125,7 @@ impl RouteIndex {
     /// The slot at `address` when it is the only one there.
     pub(crate) fn sole_at(&self, address: SocketAddr) -> Option<u32> {
         count_work!(RouteIndexProbes);
+        let address = Addr::from(address);
         let mut at = self.by_address.range((address, 0)..=(address, u32::MAX));
         let (_, slot) = *at.next()?;
         at.next().is_none().then_some(slot)
@@ -87,19 +134,13 @@ impl RouteIndex {
     /// Lowest slot at `address` whose peer has SRT socket ID `caller`.
     pub(crate) fn first_for_caller(&self, address: SocketAddr, caller: u32) -> Option<u32> {
         count_work!(RouteIndexProbes);
-        self.by_caller
-            .range((address, caller, 0)..=(address, caller, u32::MAX))
-            .next()
-            .map(|&(_, _, slot)| slot)
+        first_slot(&self.by_caller, caller, address)
     }
 
     /// Lowest direct-peer slot at `address` expecting SYN cookie `cookie`.
     pub(crate) fn first_for_cookie(&self, address: SocketAddr, cookie: u32) -> Option<u32> {
         count_work!(RouteIndexProbes);
-        self.by_cookie
-            .range((address, cookie, 0)..=(address, cookie, u32::MAX))
-            .next()
-            .map(|&(_, _, slot)| slot)
+        first_slot(&self.by_cookie, cookie, address)
     }
 
     /// Entries in the address, caller-ID and cookie indexes.
@@ -162,5 +203,38 @@ mod tests {
         assert_eq!(index.first_for_cookie(at(2), 80), None);
         assert_eq!(index.sole_at(at(2)), Some(3));
         assert_eq!(index.sizes(), (1, 1, 0));
+    }
+
+    /// The integer key keeps every field `SocketAddr` equality compares:
+    /// family, port, and an IPv6 address's flow info and scope.
+    #[test]
+    fn addresses_equal_only_when_socket_addrs_are() {
+        use std::net::{Ipv4Addr, SocketAddrV6};
+        let v4 = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 9));
+        let mapped = Ipv4Addr::new(10, 0, 0, 1).to_ipv6_mapped();
+        let v6 = |flowinfo, scope| SocketAddr::V6(SocketAddrV6::new(mapped, 9, flowinfo, scope));
+        let all = [
+            v4,
+            SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 10)),
+            v6(0, 0),
+            v6(1, 0),
+            v6(0, 1),
+        ];
+        let mut index = RouteIndex::default();
+        for (slot, address) in (0..).zip(all) {
+            index.sync(
+                slot,
+                Some(RouteKeys {
+                    address,
+                    caller_socket_id: Some(7),
+                    syn_cookie: Some(70),
+                }),
+            );
+        }
+        for (slot, address) in (0..).zip(all) {
+            assert_eq!(index.sole_at(address), Some(slot), "{address}");
+            assert_eq!(index.first_for_caller(address, 7), Some(slot));
+            assert_eq!(index.first_for_cookie(address, 70), Some(slot));
+        }
     }
 }
