@@ -18,9 +18,10 @@ pub(crate) enum Counter {
     RouteIndexProbes,
     HeapEntriesVisited,
     HeapEntriesCloned,
+    PromotedSlotProbes,
 }
 
-const COUNTERS: usize = Counter::HeapEntriesCloned as usize + 1;
+const COUNTERS: usize = Counter::PromotedSlotProbes as usize + 1;
 
 thread_local! {
     static WORK: [Cell<u64>; COUNTERS] = const { [const { Cell::new(0) }; COUNTERS] };
@@ -44,6 +45,8 @@ pub(crate) struct WorkCounters {
     pub heap_entries_visited: u64,
     /// Deadline-heap keys cloned into a rebuilt heap.
     pub heap_entries_cloned: u64,
+    /// Promoted-socket slots examined for receive readiness or drained.
+    pub promoted_slot_probes: u64,
 }
 
 impl WorkCounters {
@@ -57,6 +60,7 @@ impl WorkCounters {
                 route_index_probes: get(Counter::RouteIndexProbes),
                 heap_entries_visited: get(Counter::HeapEntriesVisited),
                 heap_entries_cloned: get(Counter::HeapEntriesCloned),
+                promoted_slot_probes: get(Counter::PromotedSlotProbes),
             }
         })
     }
@@ -70,6 +74,7 @@ impl WorkCounters {
             route_index_probes: now.route_index_probes - before.route_index_probes,
             heap_entries_visited: now.heap_entries_visited - before.heap_entries_visited,
             heap_entries_cloned: now.heap_entries_cloned - before.heap_entries_cloned,
+            promoted_slot_probes: now.promoted_slot_probes - before.promoted_slot_probes,
         }
     }
 

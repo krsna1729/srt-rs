@@ -130,6 +130,8 @@ mod reuseport_group;
 mod route_index;
 pub use owner_layout::{ListenerTransfer, OwnerListenerPlan, ReusePortMember, owner_plans};
 mod sink;
+#[cfg(any(feature = "compio", feature = "tokio"))]
+mod slot_wakeups;
 mod socket_io;
 mod telemetry;
 mod timer;
