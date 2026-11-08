@@ -1,3 +1,19 @@
+/// Count `units` of loop work under a `test_support::WorkCounters`
+/// counter. Expands to nothing in production builds: only this crate's
+/// tests and the opt-in `test-support` feature compile the counters.
+macro_rules! count_work {
+    ($counter:ident) => {
+        count_work!($counter, 1)
+    };
+    ($counter:ident, $units:expr) => {
+        #[cfg(any(test, feature = "test-support"))]
+        $crate::test_support::work::add(
+            $crate::test_support::work::Counter::$counter,
+            ($units) as u64,
+        );
+    };
+}
+
 pub(crate) mod adaptive_receiver_packet_window;
 pub(crate) mod sender_packet_window;
 

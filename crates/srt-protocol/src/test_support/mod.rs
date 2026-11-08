@@ -5,3 +5,6 @@
 //! and carry none of it.
 
 pub mod wire_checker;
+pub mod work;
+
+pub use work::WorkCounters;

@@ -481,6 +481,7 @@ impl SrtGroup {
                 .keys()
                 .copied()
                 .reduce(|left, right| {
+                    count_work!(PendingKeysVisited);
                     if sequence_less_than(right, left) {
                         right
                     } else {
@@ -534,6 +535,7 @@ impl SrtGroup {
     /// The oldest pending sequence, in wrapping order.
     fn oldest_pending(&self) -> Option<u32> {
         self.pending.keys().copied().reduce(|left, right| {
+            count_work!(PendingKeysVisited);
             if sequence_less_than(right, left) {
                 right
             } else {
@@ -673,6 +675,7 @@ impl SrtGroup {
         self.next_receive_sequence = Some(following);
         self.release_pending_reservation(&packet);
         for offset in 1..packet.packet_count {
+            count_work!(PendingKeysVisited);
             let stale_sequence = next.wrapping_add(offset) & 0x7FFF_FFFF;
             if let Some(stale) = self.pending.remove(&stale_sequence) {
                 self.release_pending_reservation(&stale);

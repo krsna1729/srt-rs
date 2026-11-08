@@ -12896,13 +12896,14 @@ mod tests {
                 replay = wire;
             }
         }
-        let checks = conn.receiver.as_ref().unwrap().delivery_time_checks();
+        let before = crate::test_support::WorkCounters::snapshot();
         for _ in 0..64 {
             conn.feed_recv_buf(&replay, now)
                 .expect("receive duplicate DATA");
         }
+        let work = crate::test_support::WorkCounters::since(before);
+        assert!(work.deadline_probes <= 64);
         let receiver = conn.receiver.as_ref().unwrap();
-        assert!(receiver.delivery_time_checks() - checks <= 64);
         assert_eq!(receiver.stats().packets_in_buffer, 32);
         assert_eq!(receiver.stats().total_duplicates, 64);
         assert_eq!(conn.pending_data_events, 0);

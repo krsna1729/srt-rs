@@ -332,6 +332,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
     }
 
     pub fn insert(&mut self, sequence: u32, value: T) -> Result<Option<T>, T> {
+        count_work!(PacketSlotProbes);
         let (page_index, _) = self.indices(sequence);
         if let Some(page) = &mut self.pages[page_index] {
             let was_sparse = matches!(page, Page::Sparse(_));
@@ -351,6 +352,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
     }
 
     pub fn get(&self, sequence: u32) -> Option<&T> {
+        count_work!(PacketSlotProbes);
         let (page_index, _) = self.indices(sequence);
         self.pages[page_index].as_ref()?.get(sequence)
     }
@@ -365,6 +367,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
     }
 
     pub fn remove(&mut self, sequence: u32) -> Option<T> {
+        count_work!(PacketSlotProbes);
         let (page_index, _) = self.indices(sequence);
         let page = self.pages[page_index].as_mut()?;
         let (value, was_demoted) = page.remove(sequence, self.demote_at)?;
@@ -414,6 +417,11 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
 
     pub fn clear(&mut self) {
         for page in self.pages.iter_mut() {
+            count_work!(PacketSlotProbes);
+            count_work!(
+                ReleasedChunks,
+                page.as_ref().map_or(0, |page| page.occupied().count_ones())
+            );
             *page = None;
         }
         self.nonempty_pages.fill(0);
@@ -430,6 +438,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
                 break;
             };
             drop(self.remove(sequence).expect("occupied receive slot"));
+            count_work!(ReleasedChunks);
             released += 1;
         }
         released
@@ -477,6 +486,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
             summary &= (1u64 << (last_word + 1)) - 1;
         }
         while summary != 0 {
+            count_work!(PacketSlotProbes);
             let word_index = summary.trailing_zeros() as usize;
             let mut pages = self.nonempty_pages[word_index];
             if word_index == first_word {
@@ -501,6 +511,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
         let last_page = (end - 1) >> PAGE_SHIFT;
         let mut page_index = self.next_nonempty_page(first_page, last_page + 1)?;
         loop {
+            count_work!(PacketSlotProbes);
             let page = self.pages[page_index]
                 .as_ref()
                 .expect("summary names a page");
@@ -528,6 +539,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
     ) -> usize {
         let mut removed = 0;
         while selected != 0 {
+            count_work!(PacketSlotProbes);
             let slot_index = selected.trailing_zeros() as usize;
             selected &= selected - 1;
             let sequence = self.pages[page_index]
@@ -543,6 +555,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
                 .expect("page remains while selected bits exist")
                 .remove(sequence, 0);
             debug_assert!(removed_value.is_some());
+            count_work!(ReleasedChunks);
             removed += 1;
         }
         removed
@@ -581,6 +594,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
         let mut removed = 0;
         let mut search_page = first_page;
         while let Some(page_index) = self.next_nonempty_page(search_page, last_page + 1) {
+            count_work!(PacketSlotProbes);
             let mut selected = self.pages[page_index]
                 .as_ref()
                 .expect("summary names a page")
