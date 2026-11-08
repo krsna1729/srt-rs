@@ -187,7 +187,9 @@ impl<T, const N: usize> Page<T, N> {
         }
     }
 
-    #[inline]
+    // Always inlined: out of line it hands its value back through memory,
+    // which cost the in-order receive/pop path ~48 instructions a packet.
+    #[inline(always)]
     fn remove(&mut self, sequence: u32, demote_at: usize) -> Option<(T, bool)> {
         let value = match self {
             Self::Sparse(page) => page.remove(sequence)?,
@@ -213,6 +215,7 @@ impl<T, const N: usize> Page<T, N> {
         Some((value, was_demoted))
     }
 
+    #[cold]
     fn demote(&mut self) {
         let Self::Dense(page) = self else {
             return;
@@ -282,8 +285,10 @@ pub struct AdaptiveReceiverPacketWindow<T, const N: usize = 8> {
     window_size: u32,
     /// Live values.
     len: u32,
-    /// Values physically held, live or retired.
-    stored: u32,
+    /// Retired values still held, awaiting [`Self::release_retired`]. Point
+    /// insertion and removal of live values never change it, so the in-order
+    /// path pays one test for retirement.
+    retired_held: u32,
     /// The page `release_retired` inspects next.
     release_cursor: u32,
     index_mask: usize,
@@ -312,7 +317,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
         Self {
             window_size,
             len: 0,
-            stored: 0,
+            retired_held: 0,
             release_cursor: 0,
             index_mask: capacity - 1,
             pages: std::iter::repeat_with(|| None).take(page_count).collect(),
@@ -336,12 +341,12 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
 
     /// Whether removed values still await [`Self::release_retired`].
     pub fn has_retired(&self) -> bool {
-        self.stored > self.len
+        self.retired_held != 0
     }
 
     /// Whether no value, live or retired, is held.
     pub fn is_released(&self) -> bool {
-        self.stored == 0
+        self.len == 0 && self.retired_held == 0
     }
 
     pub fn sparse_pages(&self) -> usize {
@@ -434,9 +439,9 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
     pub fn insert(&mut self, sequence: u32, value: T) -> Result<Option<T>, T> {
         count_work!(PacketSlotProbes);
         let (page_index, _) = self.indices(sequence);
-        // Only a retirement in progress, or a block retired wholesale while
-        // empty, can leave this page retired.
-        if (self.has_retired() || self.retired_blocks != 0) && !self.page_live(page_index) {
+        // Retired marks exist only while a retired value is held (see
+        // `settle_retired`), so the common case pays this one test.
+        if self.has_retired() && !self.page_live(page_index) {
             self.revive_page(page_index);
         }
         let result = if let Some(page) = &mut self.pages[page_index] {
@@ -452,7 +457,6 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
             Ok(None)
         };
         if matches!(result, Ok(None)) {
-            self.stored += 1;
             self.add_live(page_index, 1);
         }
         result
@@ -460,6 +464,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
 
     /// Make a retired `page` live again by releasing what it still holds:
     /// at most one page of values.
+    #[cold]
     fn revive_page(&mut self, page: usize) {
         let block = page >> 6;
         self.split_retired_block(block);
@@ -515,7 +520,6 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
             self.demotions += 1;
         }
         let emptied = page.occupied() == 0;
-        self.stored -= 1;
         self.sub_live(page_index >> 6, 1);
         if emptied {
             self.pages[page_index] = None;
@@ -611,7 +615,6 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
             selected &= selected - 1;
             removed += 1;
         }
-        self.stored -= removed;
         self.sub_live(page_index >> 6, removed);
         self.settle_page_after_removal(page_index);
         removed
@@ -662,6 +665,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
             newly &= newly - 1;
         }
         self.sub_live(block, removed);
+        self.retired_held += removed;
         removed
     }
 
@@ -678,6 +682,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
             removed += live;
             newly &= newly - 1;
         }
+        self.retired_held += removed;
         removed
     }
 
@@ -693,7 +698,22 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
             let slot = Self::live_slot(block);
             self.page_masks[slot] = 0;
         }
+        self.retired_held += self.len;
         self.len = 0;
+        self.settle_retired();
+    }
+
+    /// With no retired value held every retired mark is vacuous: per-page
+    /// marks clear as their pages empty, so only wholesale block marks (set
+    /// over empty blocks, or outliving their released pages) remain to drop.
+    fn settle_retired(&mut self) {
+        if self.retired_held == 0 {
+            self.retired_blocks = 0;
+            debug_assert!(
+                (0..self.blocks()).all(|block| self.page_masks[Self::retired_slot(block)] == 0),
+                "a retired page mark outlived its values"
+            );
+        }
     }
 
     /// Release up to `budget` work units of retired values -- each page
@@ -719,6 +739,7 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
                 page as u32
             };
         }
+        self.settle_retired();
         released
     }
 
@@ -739,12 +760,13 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
             occupied &= occupied - 1;
             released += 1;
         }
-        self.stored -= released as u32;
+        self.retired_held -= released as u32;
         if occupied == 0 {
             self.pages[page_index] = None;
             self.mark_page_empty(page_index);
             let retired = Self::retired_slot(page_index >> 6);
             self.page_masks[retired] &= !(1u64 << (page_index & 63));
+            self.settle_retired();
         }
         released
     }
@@ -843,6 +865,9 @@ impl<T, const N: usize> AdaptiveReceiverPacketWindow<T, N> {
     }
 
     fn next_live_page(&self, start: usize, end: usize) -> Option<usize> {
+        if !self.has_retired() {
+            return self.next_nonempty_page(start, end);
+        }
         self.next_page_where(start, end, |block, pages| {
             pages & !self.retired_pages(block)
         })

@@ -256,7 +256,7 @@ impl LossBitmap {
     }
 
     fn remove(&mut self, seq: u32) -> bool {
-        if self.offset(seq).is_none() {
+        if self.is_empty() || self.offset(seq).is_none() {
             return false;
         }
         let index = self.bit_index(seq);
@@ -302,7 +302,7 @@ impl LossBitmap {
     }
 
     fn contains(&self, seq: u32) -> bool {
-        self.offset(seq).is_some() && self.bits.get(self.bit_index(seq))
+        !self.is_empty() && self.offset(seq).is_some() && self.bits.get(self.bit_index(seq))
     }
 
     fn is_empty(&self) -> bool {
@@ -467,6 +467,9 @@ impl LossBitmap {
 
     /// The oldest loss in sequence order from the window base.
     fn first(&self) -> Option<u32> {
+        if self.is_empty() {
+            return None;
+        }
         let mask = self.capacity() - 1;
         let start = self.base_seq as usize & mask;
         let index = self
@@ -2101,7 +2104,9 @@ impl ReceiverBuffer {
     /// visits rather than in the call that made it. Returns whether retired
     /// packets remain.
     pub fn release_retired_packets(&mut self) -> bool {
-        self.packets.release_retired(MAX_RETIRED_RELEASED_PER_VISIT);
+        if self.packets.has_retired() {
+            self.packets.release_retired(MAX_RETIRED_RELEASED_PER_VISIT);
+        }
         self.packets.has_retired()
     }
 
