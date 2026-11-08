@@ -1357,12 +1357,21 @@ impl ReceiverBuffer {
         if was_expected && !recovered_loss {
             self.expected_seq = self.expected_seq.wrapping_add(1) & 0x7FFF_FFFF;
         } else if was_expected {
-            while self.packets.contains_key(self.expected_seq) {
-                count_work!(FrontierSteps);
-                self.expected_seq = self.expected_seq.wrapping_add(1) & 0x7FFF_FFFF;
-            }
+            self.expected_seq = self.first_unresolved_seq();
         }
         self.loss_list.set_base(self.expected_seq);
+    }
+
+    /// The oldest position still unresolved: the oldest loss, or the
+    /// position after the classification frontier when nothing is missing.
+    /// Every position before it was received, dropped or given up, so this
+    /// is the next expected sequence -- libsrt's first-loss-or-next ACK
+    /// position (`CUDT::getFirstNoncontSequence`) -- found without probing
+    /// the received packets it passes.
+    fn first_unresolved_seq(&self) -> u32 {
+        self.loss_list
+            .first()
+            .unwrap_or(self.loss_detection_frontier.wrapping_add(1) & SEQUENCE_MASK)
     }
 
     fn packet_base_time(&self, timestamp: u32) -> u64 {
@@ -2385,6 +2394,56 @@ mod tests {
                 "window {window}, {name}: {words} words for {runs} runs"
             );
         }
+    }
+
+    /// Packet-window probes one DATA arrival may make, whatever it fills.
+    const RECEIVE_SLOT_PROBE_LIMIT: u64 = 8;
+
+    /// F12: filling the hole in front of a retained window-wide suffix
+    /// takes the new expected sequence from the loss list and the
+    /// classification frontier instead of probing every retained packet.
+    #[test]
+    fn filling_the_head_hole_does_not_scan_the_retained_suffix() {
+        let now = Timestamp::from_micros(1);
+        let mut results = Vec::new();
+        for window in WORK_BOUND_WINDOWS {
+            let mut buf =
+                ReceiverBuffer::with_buffer_size(0, 120, Timestamp::from_micros(0), 0, window);
+            for seq in 1..window {
+                buf.receive(make_packet(seq, 100_000_000), now);
+            }
+            let (_, work) = WorkCounters::measure(|| buf.receive(make_packet(0, 100_000_000), now));
+            assert_eq!(buf.expected_sequence(), window);
+            assert!(buf.loss_list.is_empty());
+            results.push((window, work.frontier_steps, work.packet_slot_probes));
+        }
+        eprintln!("(window, frontier steps, slot probes): {results:?}");
+        for &(window, steps, probes) in &results {
+            assert!(
+                steps == 0 && probes <= RECEIVE_SLOT_PROBE_LIMIT,
+                "window {window}: {steps} frontier steps, {probes} slot probes"
+            );
+        }
+    }
+
+    /// Positions a DROPREQ gave up between two losses do not pin the
+    /// expected sequence once the losses are repaired: like libsrt's
+    /// first-loss-or-next ACK position, it moves past everything resolved.
+    #[test]
+    fn dropped_positions_between_repaired_losses_do_not_pin_the_ack() {
+        let mut buf = ReceiverBuffer::new(100, 120, Timestamp::from_micros(0), 0);
+        buf.set_tsbpd_enabled(false);
+        let now = Timestamp::from_micros(1_000);
+        buf.receive(make_packet(101, 1), now);
+        buf.drop_range(103, 104).expect("forward drop");
+        buf.receive(make_packet(105, 2), now);
+        assert_eq!(loss_set(&buf), FxHashSet::from_iter([100, 102]));
+
+        buf.receive(make_packet(100, 3), now);
+        assert_eq!(buf.expected_sequence(), 102);
+        buf.receive(make_packet(102, 4), now);
+        assert_eq!(buf.expected_sequence(), 106);
+        assert_eq!(buf.generate_ack(now).ack_seq, 106);
     }
 
     /// A periodic NAK walks a wrapped window oldest first, resumes inside
