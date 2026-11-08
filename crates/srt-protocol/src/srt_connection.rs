@@ -1114,34 +1114,46 @@ impl SrtConnection {
     /// an already-queued sequence (`SenderBuffer::drop_expired` and
     /// `SenderBuffer::handle_ack`), so `peek_output`/`poll_output_into`
     /// never have to reconsider what is already at the front of the queue.
+    ///
+    /// Only cumulative-ACK progress or a drop changes what is live, so a
+    /// duplicate or non-advancing ACK never calls this. One pass removes
+    /// every stale entry in place, so a purge costs one visit per queued
+    /// output (at most `MAX_OUTPUT_QUEUE_ACTIONS`), never one shift per
+    /// removal.
     fn purge_stale_queued_data(&mut self) {
         let Some(sender) = self.sender.as_ref() else {
             return;
         };
-        if self.output_queue.is_empty() {
-            return;
-        }
-        let mut stale_indices: Vec<usize> = Vec::new();
-        for (index, output) in self.output_queue.iter().enumerate() {
-            if let QueuedOutput::Datagram(PendingDatagram::Data(data)) = output
-                && !sender.is_live(data.header.sequence_number)
-            {
-                stale_indices.push(index);
-            }
-        }
-        for &index in stale_indices.iter().rev() {
-            let Some(QueuedOutput::Datagram(pkt)) = self.output_queue.remove(index) else {
-                continue;
+        let priority = self.output_queue_priority;
+        let (mut index, mut priority_removed, mut bytes) = (0usize, 0usize, 0usize);
+        let (mut even, mut odd) = (0u64, 0u64);
+        self.output_queue.retain(|output| {
+            count_work!(OutputQueueVisits);
+            index += 1;
+            let QueuedOutput::Datagram(pkt @ PendingDatagram::Data(data)) = output else {
+                return true;
             };
-            self.output_queue_bytes = self.output_queue_bytes.saturating_sub(pkt.wire_len());
-            if let PendingDatagram::Data(data) = &pkt
-                && let Some(stamp) = data.crypto
-            {
-                self.release_tx_reservation(stamp.key_flag);
+            if sender.is_live(data.header.sequence_number) {
+                return true;
             }
-            if index < self.output_queue_priority {
-                self.output_queue_priority -= 1;
+            bytes += pkt.wire_len();
+            priority_removed += usize::from(index <= priority);
+            match data.crypto.map(|stamp| stamp.key_flag) {
+                Some(KeyFlag::Even) => even += 1,
+                Some(KeyFlag::Odd) => odd += 1,
+                None => {}
             }
+            false
+        });
+        self.output_queue_bytes = self.output_queue_bytes.saturating_sub(bytes);
+        self.output_queue_priority -= priority_removed;
+        self.pending_tx_even = self.pending_tx_even.saturating_sub(even);
+        self.pending_tx_odd = self.pending_tx_odd.saturating_sub(odd);
+    }
+
+    fn purge_stale_queued_data_after_ack(&mut self, ack_progressed: bool) {
+        if ack_progressed {
+            self.purge_stale_queued_data();
         }
     }
 
@@ -4248,10 +4260,10 @@ impl SrtConnection {
             tracing::debug!("sender buffer: {} -> {} packets", before, after);
         }
         self.continue_acked_release_later();
-        // TLPKTDROP may have just tombstoned the only outstanding flight
-        // this ACK retired; a queued DATA output for one of those sequences
-        // must not survive it (see `purge_stale_queued_data`).
-        self.purge_stale_queued_data();
+        // A queued DATA output for a sequence this ACK retired must not
+        // survive it (see `purge_stale_queued_data`). An ACK that retired
+        // nothing changed nothing that is live, so it skips the purge.
+        self.purge_stale_queued_data_after_ack(ack_progressed);
 
         // RTT, RTTVar, and the advertised receive-buffer size are present in
         // every non-Light ACK size this crate accepts: 16 (Small), 24, 28
@@ -8428,6 +8440,124 @@ mod tests {
             {
                 return;
             }
+        }
+    }
+
+    /// Caller/listener pair negotiated at a `window`-packet flow window,
+    /// already `Connected`.
+    fn connected_pair_with_window(window: u32) -> (SrtConnection, SrtConnection) {
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 1,
+            flow_window_packets: window,
+            receive_buffer_packets: window,
+            ..ConnectionOptions::default()
+        });
+        let mut listener = SrtConnection::new_listener(ConnectionOptions {
+            socket_id: 2,
+            syn_cookie: Some(7),
+            flow_window_packets: window,
+            receive_buffer_packets: window,
+            ..ConnectionOptions::default()
+        });
+        drive_handshake_to_connected(&mut caller, &mut listener);
+        (caller, listener)
+    }
+
+    /// The windows every connection work-bound test compares.
+    const WORK_BOUND_WINDOWS: [u32; 3] = [32, DEFAULT_FLOW_WINDOW, MAX_FLOW_WINDOW];
+
+    /// A sender at `window` with `sent` packets accepted, the first half
+    /// submitted and NAKed, so the output queue holds the unsubmitted half
+    /// followed by the retransmissions of the submitted half. Returns the
+    /// first sequence.
+    fn queued_output_behind_retransmissions(caller: &mut SrtConnection, sent: u32) -> u32 {
+        let socket_id = caller.socket_id();
+        let now = Timestamp::from_micros(1_000_000);
+        let first = caller.next_sequence_number().expect("connected sender");
+        for i in 0..sent {
+            caller
+                .send(format!("payload {i}").as_bytes(), now)
+                .expect("the window is open");
+        }
+        for _ in 0..sent / 2 {
+            drain_until_one_data_packet_submitted(caller);
+        }
+        let last = first.wrapping_add(sent / 2 - 1);
+        caller
+            .feed_recv_buf(&nak_datagram(socket_id, &[first, last]), now)
+            .expect("the NAK names submitted packets");
+        while caller.has_retransmit() {
+            caller.process_retransmit(now);
+        }
+        first
+    }
+
+    /// A duplicate or non-advancing ACK changes nothing that is live, so it
+    /// never rescans the queued output; an advancing one purges it in one
+    /// pass, one visit per queued action, even when what it retires sits in
+    /// the middle of the queue (retransmissions behind unsubmitted DATA).
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "thousands of real sends and polls at three windows; correctness is proven \
+                  outside Miri. Run in the miri-extended scheduled job."
+    )]
+    fn a_non_advancing_ack_does_not_rescan_queued_output() {
+        use crate::test_support::work::WorkCounters;
+        let mut results = Vec::new();
+        for window in WORK_BOUND_WINDOWS {
+            let (mut caller, _listener) = connected_pair_with_window(window);
+            let socket_id = caller.socket_id();
+            let now = Timestamp::from_micros(1_000_000);
+            let sent = window.min(4_000);
+            let first = queued_output_behind_retransmissions(&mut caller, sent);
+            let queued = caller.output_queue.len() as u64;
+            assert!(queued >= u64::from(sent), "window {window}: {queued}");
+            let duplicate = ack_datagram(socket_id, first, Some(window));
+            let (_, duplicates) = WorkCounters::measure(|| {
+                for _ in 0..100 {
+                    caller
+                        .feed_recv_buf(&duplicate, now)
+                        .expect("a duplicate ACK is accepted");
+                }
+            });
+            let advancing = ack_datagram(socket_id, first.wrapping_add(sent / 4), Some(window));
+            let queued = caller.output_queue.len() as u64;
+            let retiring = caller
+                .output_queue
+                .iter()
+                .filter(|output| {
+                    matches!(
+                        output,
+                        QueuedOutput::Datagram(PendingDatagram::Data(data))
+                            if data.header.sequence_number.wrapping_sub(first) < sent / 4
+                    )
+                })
+                .count();
+            assert_eq!(retiring, sent as usize / 4, "window {window}");
+            let (_, advance) = WorkCounters::measure(|| caller.feed_recv_buf(&advancing, now));
+            let sender = caller.sender.as_ref().expect("connected sender");
+            assert!(
+                caller.output_queue.iter().all(|output| !matches!(
+                    output,
+                    QueuedOutput::Datagram(PendingDatagram::Data(data))
+                        if !sender.is_live(data.header.sequence_number)
+                )),
+                "window {window}: the retired retransmissions left the queue"
+            );
+            results.push((
+                window,
+                queued,
+                duplicates.output_queue_visits,
+                advance.output_queue_visits,
+            ));
+        }
+        eprintln!(
+            "(window, queued, 100 duplicate ACKs' output visits, advancing ACK's): {results:?}"
+        );
+        for (window, queued, duplicates, advance) in results {
+            assert_eq!(duplicates, 0, "window {window}");
+            assert!(advance <= queued + 1, "window {window}");
         }
     }
 

@@ -27,9 +27,10 @@ pub(crate) enum Counter {
     ReleasedChunks,
     SenderSlotProbes,
     SenderRecordProbes,
+    OutputQueueVisits,
 }
 
-const COUNTERS: usize = Counter::SenderRecordProbes as usize + 1;
+const COUNTERS: usize = Counter::OutputQueueVisits as usize + 1;
 
 thread_local! {
     static WORK: [Cell<u64>; COUNTERS] = const { [const { Cell::new(0) }; COUNTERS] };
@@ -68,6 +69,8 @@ pub struct WorkCounters {
     pub sender_slot_probes: u64,
     /// Dropped-message records inspected.
     pub sender_record_probes: u64,
+    /// Queued output actions inspected.
+    pub output_queue_visits: u64,
 }
 
 impl WorkCounters {
@@ -88,6 +91,7 @@ impl WorkCounters {
                 released_chunks: get(Counter::ReleasedChunks),
                 sender_slot_probes: get(Counter::SenderSlotProbes),
                 sender_record_probes: get(Counter::SenderRecordProbes),
+                output_queue_visits: get(Counter::OutputQueueVisits),
             }
         })
     }
@@ -113,6 +117,7 @@ impl WorkCounters {
             released_chunks: now.released_chunks - before.released_chunks,
             sender_slot_probes: now.sender_slot_probes - before.sender_slot_probes,
             sender_record_probes: now.sender_record_probes - before.sender_record_probes,
+            output_queue_visits: now.output_queue_visits - before.output_queue_visits,
         }
     }
 
