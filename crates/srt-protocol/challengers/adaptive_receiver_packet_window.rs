@@ -6,6 +6,12 @@
 #![allow(dead_code)]
 #![allow(clippy::module_inception)]
 
+// The crate's work counters exist only inside `srt-proto`; harnesses that
+// compile this file standalone count nothing.
+macro_rules! count_work {
+    ($($counter:tt)*) => {};
+}
+
 #[path = "../src/adaptive_receiver_packet_window.rs"]
 mod adaptive_receiver_packet_window;
 

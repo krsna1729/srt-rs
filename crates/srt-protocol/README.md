@@ -231,6 +231,12 @@ Packets carry what libsrt 1.5.7 emits:
   message (`MN_XSIZE`). A libsrt receiver reassembles it, but its
   application must read with a buffer that holds the whole message, or the
   message arrives truncated. See VENDOR.md, "Message reassembly and DROPREQ".
+- TLPKTDROP gives up only the head gap, like libsrt's TSBPD loop: at most 64
+  gaps per visit, continued on the zero-delay `DeliveryContinue` timer.
+  `ReceiverBuffer::drop_too_late` returns the gaps as `LossRange`s. A DROPREQ
+  makes its packets unreachable at once; their storage is released in visits
+  of at most 256 work units (`ReceiverBuffer::release_retired_packets`, run on
+  each DATA, drop and ACK tick). See VENDOR.md, "Receive-side work bounds".
 - The handshake peer-IP field carries the peer's IP, as libsrt's does; a
   libsrt peer reports it as its own local address. Transports set it with
   `SrtConnection::set_peer_address(SocketAddr)`, which replaces

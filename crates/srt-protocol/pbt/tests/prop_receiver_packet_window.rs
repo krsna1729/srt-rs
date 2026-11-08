@@ -40,7 +40,7 @@ proptest! {
         for (opcode, raw_offset, raw_count) in actions {
             let offset = u32::from(raw_offset) % window_size;
             let sequence = base.wrapping_add(offset) & MASK;
-            match opcode % 5 {
+            match opcode % 7 {
                 0 => {
                     let expected = model.insert(sequence, offset);
                     prop_assert_eq!(paged.insert(sequence, offset), Ok(expected));
@@ -67,8 +67,32 @@ proptest! {
                     prop_assert_eq!(adaptive_demoting.successor_after(sequence), model_successor(&model, sequence));
                     prop_assert_eq!(adaptive_candidate.successor_after(sequence), model_successor(&model, sequence));
                 }
+                5 => {
+                    // A burst fills a run, so a later range removal retires
+                    // more than one release visit frees.
+                    let end = (offset + u32::from(raw_count) % 1_024).min(window_size);
+                    for run_offset in offset..end {
+                        let run_sequence = base.wrapping_add(run_offset) & MASK;
+                        let expected = model.insert(run_sequence, run_offset);
+                        prop_assert_eq!(adaptive.insert(run_sequence, run_offset), Ok(expected));
+                        prop_assert_eq!(adaptive_demoting.insert(run_sequence, run_offset), Ok(expected));
+                        prop_assert_eq!(adaptive_candidate.insert(run_sequence, run_offset), Ok(expected));
+                        prop_assert_eq!(paged.insert(run_sequence, run_offset), Ok(expected));
+                    }
+                }
+                4 => {
+                    // Release part of what range removals retired; live
+                    // contents never change.
+                    let budget = usize::from(raw_count % 8);
+                    adaptive.release_retired(budget);
+                    adaptive_demoting.release_retired(budget);
+                    adaptive_candidate.release_retired(budget);
+                }
                 _ => {
-                    let count = u32::from(raw_count) % window_size + 1;
+                    // A range clear works by slot, so it stays inside the
+                    // live span `base..base + window_size`, as the receiver
+                    // keeps it.
+                    let count = (u32::from(raw_count) % window_size + 1).min(window_size - offset);
                     let last = sequence.wrapping_add(count - 1) & MASK;
                     let before = model.len();
                     model.retain(|&candidate, _| !in_range(sequence, count, candidate));

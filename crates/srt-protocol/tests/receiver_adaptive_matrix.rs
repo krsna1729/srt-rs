@@ -21,7 +21,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use srt_proto::receiver::ReceiverBuffer;
+use srt_proto::receiver::{LossRange, ReceiverBuffer};
 use srt_proto::wire::{DataPacket, PacketPosition};
 use srt_proto::{
     ConnectionOptions, ConnectionOutput, ConnectionState, GroupEvent, GroupMode, SrtConnection,
@@ -360,7 +360,13 @@ fn tlpktdrop_expiry_advances_frontier_and_expected_seq() {
     // Time advances past TLPKTDROP threshold (minimum 1 second + delivery time).
     let t_late = Timestamp::from_micros(2_000_000);
     let dropped = buf.drop_too_late(t_late);
-    assert_eq!(dropped, vec![0]);
+    assert_eq!(
+        dropped,
+        vec![LossRange {
+            first_seq: 0,
+            last_seq: 0
+        }]
+    );
     assert_eq!(buf.expected_sequence(), 6);
 
     // Buffered packets 1..5 can now be popped.
@@ -471,7 +477,7 @@ fn exercise_adversarial_sparse_phase(
         assert_eq!(r.promotions(), 0);
     }
     let heap: usize = receivers.iter().map(|r| r.packet_window_heap_bytes()).sum();
-    assert_eq!(heap, connections * 68_624);
+    assert_eq!(heap, connections * 68_656);
     (report, heap, rss_bytes())
 }
 
@@ -553,6 +559,13 @@ fn exercise_full_drain_phase(
     let ((), report) = measure_allocations(|| {
         for r in receivers.iter_mut() {
             let _ = r.drop_range(0, 8191);
+            // The dropped packets' storage goes in bounded visits: the
+            // 512 packets in 128 pages take three.
+            let mut visits = 0;
+            while r.release_retired_packets() {
+                visits += 1;
+            }
+            assert!(visits <= 3, "{visits} release visits");
         }
     });
     for r in receivers.iter() {

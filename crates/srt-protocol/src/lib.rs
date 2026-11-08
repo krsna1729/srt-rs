@@ -1,3 +1,20 @@
+/// Count `units` of loop work under a `test_support::WorkCounters`
+/// counter. Expands to nothing outside this crate's own unit tests, so
+/// production builds, benches and dependents' tests (even with
+/// `test-support`) measure uncounted code.
+macro_rules! count_work {
+    ($counter:ident) => {
+        count_work!($counter, 1)
+    };
+    ($counter:ident, $units:expr) => {
+        #[cfg(test)]
+        $crate::test_support::work::add(
+            $crate::test_support::work::Counter::$counter,
+            ($units) as u64,
+        );
+    };
+}
+
 pub(crate) mod adaptive_receiver_packet_window;
 pub(crate) mod sender_packet_window;
 
@@ -7,6 +24,7 @@ mod buf;
 mod crypto_impl;
 mod error;
 mod message_assembler;
+mod range_bitset;
 mod received_payload;
 mod sender_rto;
 mod srt_connection;
@@ -38,9 +56,9 @@ pub mod receiver {
     pub use super::srt_receiver::{
         ACK_INTERVAL_MICROS, AckPacket, DropRangeSummary, HIGH_FANIN_ACK_INTERVAL_MICROS,
         HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS, LIGHT_ACK_INTERVAL_PACKETS, LossRange,
-        MAX_ACK_INTERVAL_MICROS, MAX_LIGHT_ACK_INTERVAL_PACKETS, MIN_ACK_INTERVAL_MICROS,
-        MIN_LIGHT_ACK_INTERVAL_PACKETS, NakPacket, ReceiverBuffer, ReceiverStats,
-        clamp_ack_interval_micros, clamp_light_ack_interval_packets,
+        MAX_ACK_INTERVAL_MICROS, MAX_EXPIRED_GAPS_PER_VISIT, MAX_LIGHT_ACK_INTERVAL_PACKETS,
+        MIN_ACK_INTERVAL_MICROS, MIN_LIGHT_ACK_INTERVAL_PACKETS, NakPacket, ReceiverBuffer,
+        ReceiverStats, clamp_ack_interval_micros, clamp_light_ack_interval_packets,
     };
 }
 

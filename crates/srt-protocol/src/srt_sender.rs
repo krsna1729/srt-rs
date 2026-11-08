@@ -1430,6 +1430,24 @@ impl SenderBuffer {
         self.total_bytes_acked = self.total_bytes_acked.saturating_add(acked);
     }
 
+    /// Discard as `discard_acked(seq)` would for every `seq` of
+    /// `first..=last` in turn, in one call: the largest of them that lies
+    /// after the oldest unacknowledged packet and no later than the next
+    /// sequence to send is the one that takes effect.
+    pub(crate) fn discard_acked_within(&mut self, first: u32, last: u32) -> u64 {
+        let span = self.next_seq.wrapping_sub(self.oldest_unacked) & SEQUENCE_MASK;
+        let last_distance = last.wrapping_sub(self.oldest_unacked) & SEQUENCE_MASK;
+        let next_distance = self.next_seq.wrapping_sub(first) & SEQUENCE_MASK;
+        let target = if last_distance != 0 && last_distance <= span {
+            last
+        } else if span != 0 && next_distance <= last.wrapping_sub(first) & SEQUENCE_MASK {
+            self.next_seq
+        } else {
+            return 0;
+        };
+        self.discard_acked(target)
+    }
+
     /// Discard acknowledged packets without recording a peer ACK. This is
     /// used by local sequence reconciliation paths.
     /// Returns the payload bytes of the live (not locally dropped) packets it

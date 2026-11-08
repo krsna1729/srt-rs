@@ -476,19 +476,10 @@ impl SrtGroup {
         if self.owned_packets <= limit {
             return;
         }
-        let base = self.next_receive_sequence.unwrap_or_else(|| {
-            self.pending
-                .keys()
-                .copied()
-                .reduce(|left, right| {
-                    if sequence_less_than(right, left) {
-                        right
-                    } else {
-                        left
-                    }
-                })
-                .unwrap_or_default()
-        });
+        let base = self
+            .next_receive_sequence
+            .or_else(|| self.oldest_pending())
+            .unwrap_or_default();
         // Farthest first: sequences that wrapped below `base`, then those
         // from `base` up, each walked down.
         for (low, high) in [(0, base), (base, u32::MAX)] {
@@ -531,15 +522,46 @@ impl SrtGroup {
         self.skipped_receive_packets
     }
 
-    /// The oldest pending sequence, in wrapping order.
+    /// The oldest pending sequence, in wrapping order, in two ordered
+    /// lookups. Pending sequences span less than half the sequence space,
+    /// so either none lies half a space above the numerically first and that
+    /// one is oldest, or the span wraps and the first of those above is.
     fn oldest_pending(&self) -> Option<u32> {
-        self.pending.keys().copied().reduce(|left, right| {
-            if sequence_less_than(right, left) {
-                right
-            } else {
-                left
+        count_work!(PendingKeysVisited);
+        let (&first, _) = self.pending.first_key_value()?;
+        count_work!(PendingKeysVisited);
+        let wrapped = self
+            .pending
+            .range(first.saturating_add(SEQUENCE_HALF_SPACE)..)
+            .next()
+            .map(|(&sequence, _)| sequence);
+        Some(wrapped.unwrap_or(first))
+    }
+
+    /// Remove the pending payloads stored at the interior sequences of a
+    /// delivered message, `first..first + count`, visiting only those
+    /// present: at most two ordered ranges across a wrap.
+    fn remove_pending_within(&mut self, first: u32, count: u32) {
+        if count == 0 {
+            return;
+        }
+        let last = first.wrapping_add(count - 1) & SEQUENCE_MASK;
+        let ranges = if first <= last {
+            [(first, last), (1, 0)]
+        } else {
+            [(first, SEQUENCE_MASK), (0, last)]
+        };
+        for (low, high) in ranges {
+            while let Some(sequence) = (low <= high)
+                .then(|| self.pending.range(low..=high).next().map(|(&key, _)| key))
+                .flatten()
+            {
+                count_work!(PendingKeysVisited);
+                if let Some(stale) = self.pending.remove(&sequence) {
+                    self.release_pending_reservation(&stale);
+                }
             }
-        })
+        }
     }
 
     /// Whether TLPKTDROP has given up, at `now`, on every sequence before the
@@ -672,12 +694,10 @@ impl SrtGroup {
         let following = next.wrapping_add(packet.packet_count) & 0x7FFF_FFFF;
         self.next_receive_sequence = Some(following);
         self.release_pending_reservation(&packet);
-        for offset in 1..packet.packet_count {
-            let stale_sequence = next.wrapping_add(offset) & 0x7FFF_FFFF;
-            if let Some(stale) = self.pending.remove(&stale_sequence) {
-                self.release_pending_reservation(&stale);
-            }
-        }
+        self.remove_pending_within(
+            next.wrapping_add(1) & SEQUENCE_MASK,
+            packet.packet_count.saturating_sub(1),
+        );
         for member in &mut self.members {
             member.connection.advance_receive_sequence(following, now);
         }
@@ -932,9 +952,15 @@ impl SrtGroup {
     }
 }
 
+/// The 31-bit sequence space's mask, and half of the space: the farthest
+/// apart two comparable sequences can be.
+const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
+const SEQUENCE_HALF_SPACE: u32 = 0x4000_0000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::WorkCounters;
 
     #[test]
     fn bounded_data_poll_reports_lifecycle_continuation() {
@@ -952,5 +978,73 @@ mod tests {
         let second = group.poll_data_bounded(Timestamp::default(), MAX_GROUP_MEMBERS);
         assert!(second.packet.is_none());
         assert!(!second.continuation);
+    }
+
+    /// A pending payload at `sequence_number` spanning `packet_count`
+    /// packets, owned by the group.
+    fn pending_packet(group: &mut SrtGroup, sequence_number: u32, packet_count: u32) {
+        group.pending.insert(
+            sequence_number,
+            GroupPacket {
+                member_id: 0,
+                sequence_number,
+                message_number: 1,
+                timestamp: 0,
+                source_time: Timestamp::default(),
+                packet_count,
+                payload: bytes::Bytes::from_static(b"x").into(),
+            },
+        );
+        group.owned.insert(sequence_number);
+        group.owned_packets += packet_count;
+    }
+
+    /// The group windows the pending-work test compares.
+    const PENDING_BACKLOGS: [u32; 3] = [32, 8_192, 65_536];
+
+    /// Pending keys one head lookup or one delivery may visit.
+    const PENDING_KEY_LIMIT: u64 = 8;
+
+    /// F13: finding the oldest pending payload and delivering a
+    /// multi-packet one cost the same whatever the backlog behind it or the
+    /// packets it spans, across a sequence wrap.
+    #[test]
+    fn pending_head_and_fragment_delivery_work_is_backlog_independent() {
+        let mut results = Vec::new();
+        for backlog in PENDING_BACKLOGS {
+            // A backlog that wraps: the oldest key is numerically largest.
+            let mut group = SrtGroup::new(SRTGROUP_MASK, GroupMode::Broadcast).unwrap();
+            let oldest = SEQUENCE_MASK - 3;
+            for offset in 0..backlog {
+                pending_packet(&mut group, oldest.wrapping_add(offset) & SEQUENCE_MASK, 1);
+            }
+            let (head, head_work) = WorkCounters::measure(|| group.oldest_pending());
+            assert_eq!(head, Some(oldest));
+
+            // One message spanning the backlog, two stale fragments inside.
+            let mut group = SrtGroup::new(SRTGROUP_MASK, GroupMode::Broadcast).unwrap();
+            pending_packet(&mut group, oldest, backlog);
+            for offset in [1, backlog - 1] {
+                pending_packet(&mut group, oldest.wrapping_add(offset) & SEQUENCE_MASK, 1);
+            }
+            let (event, delivery_work) =
+                WorkCounters::measure(|| group.poll_event(Timestamp::default()));
+            assert!(matches!(event, Some(GroupEvent::DataReceived(_))));
+            assert!(group.pending.is_empty(), "interior fragments are gone");
+            results.push((backlog, head_work, delivery_work));
+        }
+        for (backlog, head, delivery) in &results {
+            eprintln!(
+                "backlog {backlog}: head keys {} delivery keys {}",
+                head.pending_keys_visited, delivery.pending_keys_visited
+            );
+        }
+        for (backlog, head, delivery) in results {
+            assert!(
+                head.pending_keys_visited <= PENDING_KEY_LIMIT
+                    && delivery.pending_keys_visited <= PENDING_KEY_LIMIT,
+                "backlog {backlog}: head {head:?} delivery {delivery:?}"
+            );
+        }
     }
 }

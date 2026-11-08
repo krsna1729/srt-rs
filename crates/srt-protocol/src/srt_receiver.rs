@@ -67,12 +67,12 @@
 //! [`HIGH_FANIN_ACK_INTERVAL_MICROS`] / [`HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS`].
 //! Do not change the global defaults to those values.
 
-use crate::adaptive_receiver_packet_window::AdaptiveReceiverPacketWindow;
+use crate::adaptive_receiver_packet_window::{
+    AdaptiveReceiverPacketWindow, MAX_RETIRED_RELEASED_PER_VISIT,
+};
+use crate::range_bitset::RangeBitset;
 use bytes::Bytes;
-use rustc_hash::FxHashSet;
 
-#[cfg(test)]
-use std::cell::Cell;
 use std::ops::ControlFlow;
 
 use crate::error::Error;
@@ -99,6 +99,11 @@ pub const MAX_LIGHT_ACK_INTERVAL_PACKETS: u32 = 256;
 /// Contabo-measured 4× Light ACK coalesce for high-fan-in listeners
 /// (issue #30). Optional evidence target; **not** the protocol default.
 pub const HIGH_FANIN_LIGHT_ACK_INTERVAL_PACKETS: u32 = MAX_LIGHT_ACK_INTERVAL_PACKETS;
+
+/// Most gaps one [`ReceiverBuffer::drop_too_late`] call gives up. Each costs
+/// a constant amount of work, so a backlog of due gaps is retired over
+/// several visits instead of in one window-sized pass.
+pub const MAX_EXPIRED_GAPS_PER_VISIT: usize = 64;
 
 /// Sequence numbers are carried in the low 31 bits of each wire word.
 const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
@@ -190,101 +195,35 @@ fn sequence_in_range(first_seq: u32, distance: u32, sequence: u32) -> bool {
     sequence.wrapping_sub(first_seq) & SEQUENCE_MASK <= distance
 }
 
-/// Emit the runs of `losses`, already in the order to report. Only
-/// numerically adjacent positions join a run, so a run never spans the
-/// 2^31 wrap.
-fn emit_sorted_runs(
-    losses: &[u32],
-    mut emit: impl FnMut(u32, u32) -> ControlFlow<()>,
-) -> ControlFlow<()> {
-    let Some((&first, rest)) = losses.split_first() else {
-        return ControlFlow::Continue(());
-    };
-    let (mut start, mut end) = (first, first);
-    for &loss in rest {
-        if loss == end + 1 {
-            end = loss;
-        } else {
-            emit(start, end)?;
-            start = loss;
-            end = loss;
-        }
-    }
-    emit(start, end)
-}
-
-/// Worst-case work of one loss entry: the bitmap walks one 64-bit data word
-/// per 64 sequence positions and updates one summary word for each, so a single
-/// received packet can touch at most this many data words, even at the largest
-/// negotiated receive window. 1,024 words at the 65,536-packet limit, plus one
-/// because an unaligned start splits the run across a partial word at each end
-/// while the walk stays circular. A single position clear reads one further
-/// data word.
-const MAX_LOSS_WORDS_PER_ENTRY: usize = MAX_FLOW_WINDOW as usize / 64 + 1;
-
-// Data words walked by `mutate_contiguous_range` on this thread. Test-only:
-// it keeps the per-entry word bound observable without adding a field to the
-// receiver's pinned inline footprint.
-#[cfg(test)]
-thread_local! {
-    static LOSS_WORDS_TOUCHED: Cell<usize> = const { Cell::new(0) };
-}
-
-#[cfg(test)]
-fn loss_words_touched() -> usize {
-    LOSS_WORDS_TOUCHED.with(|words| words.get())
-}
-
-#[cfg(test)]
-fn reset_loss_words_touched() {
-    LOSS_WORDS_TOUCHED.with(|words| words.set(0));
-}
-
 /// Circular loss membership for one negotiated receive window.
 ///
-/// Storage is allocated on the first loss. Data words are followed by a
-/// summary bitmap whose set bits identify nonzero data words.
+/// Positions map onto a [`RangeBitset`] of the window rounded up to a power
+/// of two (at least 64), allocated on the first loss. A range of losses is
+/// one range assignment, so classifying or clearing a gap costs the same at
+/// every window size.
 #[derive(Debug)]
 struct LossBitmap {
-    storage: Vec<u64>,
-    word_count: u32,
+    bits: RangeBitset,
     window_size: u32,
     base_seq: u32,
-    len: u32,
 }
 
 impl LossBitmap {
     fn new(base_seq: u32, window_size: u32) -> Self {
-        Self {
-            storage: Vec::new(),
-            word_count: 0,
-            window_size,
-            base_seq,
-            len: 0,
-        }
-    }
-
-    fn ensure_storage(&mut self) {
-        if !self.storage.is_empty() {
-            return;
-        }
-        let capacity = self
-            .window_size
+        let capacity = window_size
             .max(64)
             .checked_next_power_of_two()
             .expect("receive window must fit the 31-bit sequence comparison domain")
             as usize;
-        self.word_count = (capacity / 64) as u32;
-        let word_count = self.word_count as usize;
-        debug_assert!(
-            word_count <= MAX_LOSS_WORDS_PER_ENTRY,
-            "one window cannot exceed the per-entry word budget"
-        );
-        self.storage.resize(word_count + word_count.div_ceil(64), 0);
+        Self {
+            bits: RangeBitset::new(capacity),
+            window_size,
+            base_seq,
+        }
     }
 
-    fn capacity_mask(&self) -> usize {
-        self.word_count as usize * 64 - 1
+    fn capacity(&self) -> usize {
+        self.bits.capacity()
     }
 
     fn offset(&self, seq: u32) -> Option<u32> {
@@ -293,64 +232,35 @@ impl LossBitmap {
     }
 
     fn bit_index(&self, seq: u32) -> usize {
-        seq as usize & self.capacity_mask()
+        seq as usize & (self.capacity() - 1)
+    }
+
+    /// The at most two linear bit ranges holding `count <= capacity`
+    /// positions from `first_seq`.
+    fn index_ranges(&self, first_seq: u32, count: u32) -> [(usize, usize); 2] {
+        let start = self.bit_index(first_seq);
+        let end = start + count as usize;
+        let capacity = self.capacity();
+        if end <= capacity {
+            [(start, end), (0, 0)]
+        } else {
+            [(start, capacity), (0, end - capacity)]
+        }
+    }
+
+    fn assign_range(&mut self, first_seq: u32, count: u32, value: bool) -> u32 {
+        self.index_ranges(first_seq, count)
+            .into_iter()
+            .map(|(start, end)| self.bits.assign(start, end, value))
+            .sum()
     }
 
     fn remove(&mut self, seq: u32) -> bool {
-        if self.storage.is_empty() || self.offset(seq).is_none() {
+        if self.is_empty() || self.offset(seq).is_none() {
             return false;
         }
         let index = self.bit_index(seq);
-        let word_index = index / 64;
-        let bit = 1u64 << (index % 64);
-        let old = self.storage[word_index];
-        if old & bit == 0 {
-            return false;
-        }
-        let new = old & !bit;
-        self.storage[word_index] = new;
-        if new == 0 {
-            self.storage[self.word_count as usize + word_index / 64] &=
-                !(1u64 << (word_index % 64));
-        }
-        self.len -= 1;
-        true
-    }
-
-    fn mutate_contiguous_range(&mut self, mut seq: u32, mut count: u32, insert: bool) -> u32 {
-        let mut changed = 0;
-        while count != 0 {
-            let index = self.bit_index(seq);
-            let word_index = index / 64;
-            let bit_offset = index % 64;
-            let chunk = count.min((64 - bit_offset) as u32);
-            let mask = (u64::MAX >> (64 - chunk)) << bit_offset;
-            #[cfg(test)]
-            LOSS_WORDS_TOUCHED.with(|words| words.set(words.get() + 1));
-            let old = self.storage[word_index];
-            let new = if insert { old | mask } else { old & !mask };
-            changed += if insert {
-                (!old & mask).count_ones()
-            } else {
-                (old & mask).count_ones()
-            };
-            self.storage[word_index] = new;
-            let summary = self.word_count as usize + word_index / 64;
-            let summary_bit = 1u64 << (word_index % 64);
-            if old == 0 && new != 0 {
-                self.storage[summary] |= summary_bit;
-            } else if old != 0 && new == 0 {
-                self.storage[summary] &= !summary_bit;
-            }
-            seq = seq.wrapping_add(chunk) & SEQUENCE_MASK;
-            count -= chunk;
-        }
-        if insert {
-            self.len += changed;
-        } else {
-            self.len -= changed;
-        }
-        changed
+        self.bits.set(index, false)
     }
 
     fn insert_range(&mut self, first_seq: u32, count: u32) -> u32 {
@@ -363,8 +273,7 @@ impl LossBitmap {
         if count > self.window_size - offset {
             return 0;
         }
-        self.ensure_storage();
-        self.mutate_contiguous_range(first_seq, count, true)
+        self.assign_range(first_seq, count, true)
     }
 
     #[cfg(test)]
@@ -373,23 +282,19 @@ impl LossBitmap {
     }
 
     fn remove_range(&mut self, first_seq: u32, count: u32) -> u32 {
-        if count == 0 || self.storage.is_empty() {
+        if count == 0 || self.is_empty() {
             return 0;
         }
         let offset = first_seq.wrapping_sub(self.base_seq) & SEQUENCE_MASK;
         if offset < self.window_size {
-            return self.mutate_contiguous_range(
-                first_seq,
-                count.min(self.window_size - offset),
-                false,
-            );
+            return self.assign_range(first_seq, count.min(self.window_size - offset), false);
         }
 
         let until_base = SEQUENCE_MASK - offset + 1;
         if count <= until_base {
             return 0;
         }
-        self.mutate_contiguous_range(
+        self.assign_range(
             self.base_seq,
             (count - until_base).min(self.window_size),
             false,
@@ -397,66 +302,47 @@ impl LossBitmap {
     }
 
     fn contains(&self, seq: u32) -> bool {
-        if self.storage.is_empty() || self.offset(seq).is_none() {
-            return false;
-        }
-        let index = self.bit_index(seq);
-        self.storage[index / 64] & (1u64 << (index % 64)) != 0
+        !self.is_empty() && self.offset(seq).is_some() && self.bits.get(self.bit_index(seq))
     }
 
     fn is_empty(&self) -> bool {
-        self.len == 0
+        self.bits.len() == 0
     }
 
-    fn len(&self) -> usize {
-        self.len as usize
+    fn len(&self) -> u32 {
+        self.bits.len()
     }
 
     fn set_base(&mut self, base_seq: u32) {
         self.base_seq = base_seq;
     }
 
+    #[cfg(test)]
     fn iter(&self) -> impl Iterator<Item = u32> + '_ {
         let base_seq = self.base_seq;
         let window_size = self.window_size;
-        let word_count = self.word_count as usize;
-        let mask = word_count.saturating_mul(64).saturating_sub(1);
+        let mask = self.capacity() - 1;
         let base_index = base_seq as usize & mask;
-        self.storage[..word_count]
-            .iter()
-            .copied()
-            .enumerate()
-            .flat_map(move |(word_index, word)| {
-                std::iter::successors((word != 0).then_some(word), |word| {
-                    let next = *word & (*word - 1);
-                    (next != 0).then_some(next)
-                })
-                .map(move |word| word_index * 64 + word.trailing_zeros() as usize)
+        (0..self.capacity() / 64).flat_map(move |word_index| {
+            let word = self.bits.word(word_index);
+            std::iter::successors((word != 0).then_some(word), |word| {
+                let next = *word & (*word - 1);
+                (next != 0).then_some(next)
             })
-            .filter_map(move |index| {
+            .filter_map(move |word| {
+                count_work!(LossEntriesVisited);
+                let index = word_index * 64 + word.trailing_zeros() as usize;
                 let offset = index.wrapping_sub(base_index) & mask;
                 (offset < window_size as usize)
                     .then_some(base_seq.wrapping_add(offset as u32) & SEQUENCE_MASK)
             })
+        })
     }
 
+    /// Loss runs in numeric order: the part of the window past the 2^31
+    /// wrap first.
     fn for_each_numeric_run(&self, mut emit: impl FnMut(u32, u32)) {
         if self.is_empty() {
-            return;
-        }
-        // A fixed stack sort preserves the measured sparse-loss fast path;
-        // word-native run extraction wins once there are more than eight bits.
-        if self.len <= 8 {
-            let mut losses = [0; 8];
-            let len = self.len();
-            for (slot, loss) in losses.iter_mut().zip(self.iter()) {
-                *slot = loss;
-            }
-            losses[..len].sort_unstable();
-            let _ = emit_sorted_runs(&losses[..len], |start, end| {
-                emit(start, end);
-                ControlFlow::Continue(())
-            });
             return;
         }
         let mut emit = |start, end| {
@@ -498,21 +384,6 @@ impl LossBitmap {
             .map(offset_of)
             .filter(|&offset| offset < self.window_size)
             .unwrap_or(0);
-        if self.len <= 8 {
-            let mut losses = [0; 8];
-            let mut len = 0;
-            for loss in self.iter().filter(|&loss| offset_of(loss) >= start) {
-                losses[len] = loss;
-                len += 1;
-            }
-            // Numeric order is sequence order unless the window wraps.
-            if u64::from(base) + u64::from(self.window_size) <= 1u64 << 31 {
-                losses[..len].sort_unstable();
-            } else {
-                losses[..len].sort_unstable_by_key(|&loss| offset_of(loss));
-            }
-            return emit_sorted_runs(&losses[..len], emit);
-        }
         let first = base.wrapping_add(start) & SEQUENCE_MASK;
         let count = self.window_size - start;
         let before_wrap = (1u64 << 31) - u64::from(first);
@@ -524,92 +395,87 @@ impl LossBitmap {
         }
     }
 
+    /// Runs of `count` positions from `seq`, a span that does not cross the
+    /// 2^31 wrap. Each run costs one next-set and one next-clear search, so
+    /// a walk reads words in proportion to the runs it reports, however far
+    /// apart they are.
     fn for_each_run_segment(
         &self,
-        mut seq: u32,
-        mut count: u32,
+        seq: u32,
+        count: u32,
         emit: &mut impl FnMut(u32, u32) -> ControlFlow<()>,
     ) -> ControlFlow<()> {
-        let mut pending = None;
-        while count != 0 {
-            let index = self.bit_index(seq);
-            let word_index = index / 64;
-            let bit_offset = index % 64;
-            let chunk = count.min((64 - bit_offset) as u32);
-            let chunk_mask = (u64::MAX >> (64 - chunk)) << bit_offset;
-            let mut bits = self.storage[word_index] & chunk_mask;
-            while bits != 0 {
-                let run_bit = bits.trailing_zeros();
-                let run_len = (!(bits >> run_bit)).trailing_zeros();
-                let run_start = seq + (run_bit as usize - bit_offset) as u32;
-                let run_end = run_start + run_len - 1;
-                if let Some((pending_start, pending_end)) = pending {
-                    if pending_end + 1 == run_start {
-                        pending = Some((pending_start, run_end));
-                    } else {
-                        emit(pending_start, pending_end)?;
-                        pending = Some((run_start, run_end));
+        let mut pending: Option<(u32, u32)> = None;
+        let mut piece_seq = seq;
+        for (start, end) in self.index_ranges(seq, count) {
+            let mut merge = |run_start: usize, run_end: usize| {
+                let first = piece_seq + (run_start - start) as u32;
+                let last = piece_seq + (run_end - start) as u32 - 1;
+                pending = match pending {
+                    Some((pending_first, pending_last)) if pending_last + 1 == first => {
+                        Some((pending_first, last))
                     }
-                } else {
-                    pending = Some((run_start, run_end));
-                }
-                let run_mask = (u64::MAX >> (64 - run_len)) << run_bit;
-                bits &= !run_mask;
+                    Some((pending_first, pending_last)) => {
+                        emit(pending_first, pending_last)?;
+                        Some((first, last))
+                    }
+                    None => Some((first, last)),
+                };
+                ControlFlow::Continue(())
+            };
+            let mut index = start;
+            while let Some(found) = self.bits.next_one(index, end) {
+                index = self.word_runs(found, end, &mut merge)?;
             }
-            seq += chunk;
-            count -= chunk;
+            piece_seq += (end - start) as u32;
         }
         match pending {
-            Some((start, end)) => emit(start, end),
+            Some((first, last)) => emit(first, last),
             None => ControlFlow::Continue(()),
         }
     }
 
-    fn next_nonzero_word(&self, start: usize, end: usize) -> Option<usize> {
-        if start >= end || self.storage.is_empty() {
-            return None;
+    /// Visit the runs of losses in the data word holding `found` (the first
+    /// loss at or after the walk's position), reading that word once; a
+    /// run reaching the word's end is followed through the summary levels.
+    /// Returns where the walk resumes.
+    fn word_runs(
+        &self,
+        found: usize,
+        end: usize,
+        visit: &mut impl FnMut(usize, usize) -> ControlFlow<()>,
+    ) -> ControlFlow<(), usize> {
+        let base = found & !63;
+        let limit = (base + 64).min(end);
+        let mut word = self.bits.word(base / 64) & (!0u64 << (found - base));
+        if limit < base + 64 {
+            word &= (1u64 << (limit - base)) - 1;
         }
-        let word_count = self.word_count as usize;
-        let summaries = &self.storage[word_count..];
-        let first_summary = start / 64;
-        for (summary_index, &summary) in summaries.iter().enumerate().skip(first_summary) {
-            if summary_index * 64 >= end {
-                break;
+        while word != 0 {
+            let run_start = base + word.trailing_zeros() as usize;
+            let run_end = run_start + (word >> (run_start - base)).trailing_ones() as usize;
+            if run_end == base + 64 && run_end < end {
+                let run_end = self.bits.next_zero(run_end, end).unwrap_or(end);
+                visit(run_start, run_end)?;
+                return ControlFlow::Continue(run_end);
             }
-            let bits = if summary_index == first_summary {
-                summary & (u64::MAX << (start % 64))
-            } else {
-                summary
-            };
-            if bits != 0 {
-                let word_index = summary_index * 64 + bits.trailing_zeros() as usize;
-                return (word_index < end).then_some(word_index);
-            }
+            visit(run_start, run_end)?;
+            word &= (!0u64).checked_shl((run_end - base) as u32).unwrap_or(0);
         }
-        None
+        ControlFlow::Continue(limit)
     }
 
+    /// The oldest loss in sequence order from the window base.
     fn first(&self) -> Option<u32> {
         if self.is_empty() {
             return None;
         }
-        let mask = self.capacity_mask();
+        let mask = self.capacity() - 1;
         let start = self.base_seq as usize & mask;
-        let start_word = start / 64;
-        let start_bit = start % 64;
-        let suffix = self.storage[start_word] & (u64::MAX << start_bit);
-        let index = if suffix != 0 {
-            start_word * 64 + suffix.trailing_zeros() as usize
-        } else if let Some(word) = self.next_nonzero_word(start_word + 1, self.word_count as usize)
-        {
-            word * 64 + self.storage[word].trailing_zeros() as usize
-        } else if let Some(word) = self.next_nonzero_word(0, start_word) {
-            word * 64 + self.storage[word].trailing_zeros() as usize
-        } else {
-            let prefix_mask = (1u64 << start_bit).wrapping_sub(1);
-            let prefix = self.storage[start_word] & prefix_mask;
-            start_word * 64 + prefix.trailing_zeros() as usize
-        };
+        let index = self
+            .bits
+            .next_one(start, self.capacity())
+            .or_else(|| self.bits.next_one(0, start))?;
         let offset = index.wrapping_sub(start) & mask;
         Some(self.base_seq.wrapping_add(offset as u32) & SEQUENCE_MASK)
     }
@@ -1138,25 +1004,13 @@ pub struct ReceiverBuffer {
 
     /// Link capacity estimator.
     link_capacity_estimator: LinkCapacityEstimator,
-
-    #[cfg(test)]
-    delivery_time_checks: Cell<usize>,
-
-    #[cfg(test)]
-    receive_expected_sequence_scans: Cell<usize>,
-
-    /// Number of newly exposed missing positions inspected by loss detection.
-    /// This makes the persistent-old-hole complexity invariant testable
-    /// without putting instrumentation in production builds.
-    #[cfg(test)]
-    loss_detection_steps: Cell<usize>,
 }
 
 impl ReceiverBuffer {
     /// Only used after the owning connection has relinquished protocol authority.
     pub(crate) fn reclaim_terminal(&mut self, max_packets: usize) -> (usize, bool) {
         let released = self.packets.clear_bounded(max_packets);
-        (released, self.packets.is_empty())
+        (released, self.packets.is_released())
     }
 
     /// Create a new receive buffer.
@@ -1228,12 +1082,6 @@ impl ReceiverBuffer {
             ack_timestamps: AckTimestampTracker::new(),
             rate_estimator: ReceivingRateEstimator::new(start_time),
             link_capacity_estimator: LinkCapacityEstimator::new(),
-            #[cfg(test)]
-            delivery_time_checks: Cell::new(0),
-            #[cfg(test)]
-            receive_expected_sequence_scans: Cell::new(0),
-            #[cfg(test)]
-            loss_detection_steps: Cell::new(0),
         }
     }
 
@@ -1356,19 +1204,15 @@ impl ReceiverBuffer {
             }
         }
         self.refresh_retained_hints();
-        let stale_losses: Vec<u32> = self
-            .loss_list
-            .iter()
-            .filter(|&seq| sequence_less_than(seq, sequence_number))
-            .collect();
-        for seq in stale_losses {
-            self.loss_list.remove(seq);
-        }
-        self.expected_seq = sequence_number;
-        while self.packets.contains_key(self.expected_seq) {
-            self.expected_seq = self.expected_seq.wrapping_add(1) & 0x7FFF_FFFF;
-        }
+        // Every loss lies at or after the expected sequence: the skipped
+        // ones go in one range clear, and the expected sequence becomes the
+        // first loss left or the position after the frontier, at least
+        // `sequence_number` either way.
+        let skipped = sequence_number.wrapping_sub(self.expected_seq) & SEQUENCE_MASK;
+        self.loss_list.remove_range(self.expected_seq, skipped);
+        self.expected_seq = self.first_unresolved_seq();
         self.loss_list.set_base(self.expected_seq);
+        self.release_retired_packets();
     }
 
     /// Receive a packet.
@@ -1427,6 +1271,7 @@ impl ReceiverBuffer {
 
         let recovered_loss = self.loss_list.remove(seq);
         self.advance_expected_seq(was_expected, recovered_loss);
+        self.release_retired_packets();
 
         new_loss_range
     }
@@ -1474,12 +1319,6 @@ impl ReceiverBuffer {
             inserted, count,
             "newly classified losses must fit in the receiver loss bitmap"
         );
-        #[cfg(test)]
-        self.loss_detection_steps.set(
-            self.loss_detection_steps
-                .get()
-                .saturating_add(count as usize),
-        );
         self.total_lost += u64::from(count);
         self.loss_detection_frontier = seq;
         (count != 0).then(|| LossRange {
@@ -1498,7 +1337,7 @@ impl ReceiverBuffer {
     }
 
     fn protocol_occupancy(&self) -> u32 {
-        (self.packets.len() as u32).saturating_add(self.loss_list.len)
+        (self.packets.len() as u32).saturating_add(self.loss_list.len())
     }
 
     fn receive_occupancy(&self) -> u32 {
@@ -1556,14 +1395,21 @@ impl ReceiverBuffer {
         if was_expected && !recovered_loss {
             self.expected_seq = self.expected_seq.wrapping_add(1) & 0x7FFF_FFFF;
         } else if was_expected {
-            #[cfg(test)]
-            self.receive_expected_sequence_scans
-                .set(self.receive_expected_sequence_scans.get().saturating_add(1));
-            while self.packets.contains_key(self.expected_seq) {
-                self.expected_seq = self.expected_seq.wrapping_add(1) & 0x7FFF_FFFF;
-            }
+            self.expected_seq = self.first_unresolved_seq();
         }
         self.loss_list.set_base(self.expected_seq);
+    }
+
+    /// The oldest position still unresolved: the oldest loss, or the
+    /// position after the classification frontier when nothing is missing.
+    /// Every position before it was received, dropped or given up, so this
+    /// is the next expected sequence -- libsrt's first-loss-or-next ACK
+    /// position (`CUDT::getFirstNoncontSequence`) -- found without probing
+    /// the received packets it passes.
+    fn first_unresolved_seq(&self) -> u32 {
+        self.loss_list
+            .first()
+            .unwrap_or(self.loss_detection_frontier.wrapping_add(1) & SEQUENCE_MASK)
     }
 
     fn packet_base_time(&self, timestamp: u32) -> u64 {
@@ -1579,9 +1425,7 @@ impl ReceiverBuffer {
     }
 
     fn delivery_time(&self, entry: &ReceivedPacket) -> Timestamp {
-        #[cfg(test)]
-        self.delivery_time_checks
-            .set(self.delivery_time_checks.get().saturating_add(1));
+        count_work!(DeadlineProbes);
         if !self.tsbpd_enabled {
             return entry.recv_time;
         }
@@ -1732,21 +1576,6 @@ impl ReceiverBuffer {
     pub fn packet_window_heap_bytes(&self) -> usize {
         self.packets.heap_bytes()
     }
-    #[cfg(test)]
-    pub(crate) fn delivery_time_checks(&self) -> usize {
-        self.delivery_time_checks.get()
-    }
-
-    #[cfg(test)]
-    fn receive_expected_sequence_scans(&self) -> usize {
-        self.receive_expected_sequence_scans.get()
-    }
-
-    #[cfg(test)]
-    fn loss_detection_steps(&self) -> usize {
-        self.loss_detection_steps.get()
-    }
-
     /// Whether the current ACK position was already confirmed by an ACKACK.
     ///
     /// Spec §4.8.1: "The ACKACK tells the receiver to stop sending the ACK
@@ -1922,7 +1751,7 @@ impl ReceiverBuffer {
     fn available_buffer_packets(&self) -> u32 {
         self.max_buffer_size
             .saturating_sub(self.packets.len() as u32)
-            .saturating_sub(self.loss_list.len)
+            .saturating_sub(self.loss_list.len())
             .saturating_sub(self.application_backlog_packets)
     }
 
@@ -2031,65 +1860,91 @@ impl ReceiverBuffer {
         })
     }
 
-    /// Remove expired packets (TLPKTDROP).
-    pub fn drop_too_late(&mut self, now: Timestamp) -> Vec<u32> {
-        if !self.tsbpd_enabled {
-            return Vec::new();
-        }
-
-        let tlpktdrop_threshold = self.tlpktdrop_threshold_us();
-
+    /// Give up, TLPKTDROP style, on missing positions the packet after them
+    /// has become due for, oldest gap first, and return the gaps given up.
+    ///
+    /// Like libsrt (`CUDT::tsbpd` checks only the first valid packet after
+    /// the head gap, `core.cpp`), only the head gap is inspected: its
+    /// successor's deadline is evaluated once, the whole gap goes in one
+    /// range clear, and the walk stops at the first gap that is not yet
+    /// due. A tick that expires nothing therefore costs one successor lookup
+    /// and one deadline however many losses wait behind the head. Each
+    /// returned range runs from the gap's oldest loss to the position before
+    /// the packet that made it due (or to the classification frontier when no
+    /// later packet is retained).
+    ///
+    /// At most [`MAX_EXPIRED_GAPS_PER_VISIT`] gaps go per call; a caller that
+    /// gets that many back calls again to continue.
+    pub fn drop_too_late(&mut self, now: Timestamp) -> Vec<LossRange> {
         let mut dropped = Vec::new();
-
-        let expired: Vec<u32> = self
-            .loss_list
-            .iter()
-            .filter(|&seq| {
-                let now = now.as_micros();
-                if let Some(packet) = self.packets.get(seq) {
-                    return now > self.delivery_time(packet).as_micros() + tlpktdrop_threshold;
-                }
-                let next_packet = self
-                    .packets
-                    .successor_after(seq)
-                    .and_then(|next_seq| self.packets.get(next_seq));
-                match next_packet {
-                    // Like libsrt (`CUDT::tsbpd` drops up to the first
-                    // received packet once it is due): the gap goes when the
-                    // packet after it is due. The 1 s floor of the threshold
-                    // is the sender's drop rule, not the receiver's.
-                    Some(next) => now >= self.delivery_time(next).as_micros(),
-                    None => {
-                        let base = self.tsbpd_time_base + self.tsbpd_delay_us;
-                        let estimated_delivery = if self.wrapping_period_active {
-                            base + MAX_TIMESTAMP + 1
-                        } else {
-                            base
-                        };
-                        now > estimated_delivery + tlpktdrop_threshold
-                    }
-                }
-            })
-            .collect();
-
-        for seq in expired {
-            self.loss_list.remove(seq);
-            dropped.push(seq);
+        if !self.tsbpd_enabled {
+            return dropped;
         }
-
-        self.total_dropped = self.total_dropped.saturating_add(dropped.len() as u64);
-
+        while dropped.len() < MAX_EXPIRED_GAPS_PER_VISIT {
+            let Some(gap) = self.due_head_gap(now) else {
+                break;
+            };
+            let removed = self
+                .loss_list
+                .remove_range(gap.first_seq, gap.sequence_count());
+            self.total_dropped = self.total_dropped.saturating_add(u64::from(removed));
+            dropped.push(gap);
+        }
         if !dropped.is_empty() {
-            let dropped_set: FxHashSet<u32> = dropped.iter().copied().collect();
-            while self.packets.contains_key(self.expected_seq)
-                || dropped_set.contains(&self.expected_seq)
-            {
-                self.expected_seq = self.expected_seq.wrapping_add(1) & 0x7FFF_FFFF;
-            }
+            self.expected_seq = self.first_unresolved_seq();
             self.loss_list.set_base(self.expected_seq);
         }
-
         dropped
+    }
+
+    /// The head gap -- from the oldest loss to the packet retained after it
+    /// -- if that packet is due. Every loss in the gap shares that packet,
+    /// so one deadline decides them all. Losses after the last retained
+    /// packet share its circular successor (the oldest one retained) and run
+    /// to the classification frontier; with nothing retained they wait for
+    /// the estimated play time plus the TLPKTDROP threshold.
+    fn due_head_gap(&self, now: Timestamp) -> Option<LossRange> {
+        let first_seq = self.loss_list.first()?;
+        count_work!(SuccessorProbes);
+        let successor = self
+            .packets
+            .successor_after(first_seq)
+            .and_then(|next| Some((next, self.packets.get(next)?)));
+        let now = now.as_micros();
+        let (last_seq, due) = match successor {
+            // Like libsrt (`CUDT::tsbpd` drops up to the first received
+            // packet once it is due): the gap goes when the packet after it
+            // is due. The 1 s floor of the threshold is the sender's drop
+            // rule, not the receiver's.
+            Some((next, packet)) => {
+                let last_seq = if sequence_greater_than(next, first_seq) {
+                    next.wrapping_sub(1) & SEQUENCE_MASK
+                } else {
+                    self.loss_detection_frontier
+                };
+                (last_seq, now >= self.delivery_time(packet).as_micros())
+            }
+            None => (
+                self.loss_detection_frontier,
+                now > self.estimated_tail_drop_time(),
+            ),
+        };
+        due.then_some(LossRange {
+            first_seq,
+            last_seq,
+        })
+    }
+
+    /// When a loss with no later packet retained is given up: the play time
+    /// estimated from the time base, plus the TLPKTDROP threshold.
+    fn estimated_tail_drop_time(&self) -> u64 {
+        let base = self.tsbpd_time_base + self.tsbpd_delay_us;
+        let estimated_delivery = if self.wrapping_period_active {
+            base + MAX_TIMESTAMP + 1
+        } else {
+            base
+        };
+        estimated_delivery + self.tlpktdrop_threshold_us()
     }
 
     /// Validate a 31-bit inclusive DROPREQ range against this receiver's
@@ -2155,6 +2010,11 @@ impl ReceiverBuffer {
     ///
     /// The inclusive range must fit within the negotiated receive window so
     /// this method cannot be used to force unbounded iteration or allocation.
+    /// The receive state moves by the range's endpoints: packets and losses
+    /// leave in one range clear each and the expected sequence is re-derived,
+    /// so the call costs the same at every range width. The dropped packets'
+    /// storage is released at most one visit's budget at a time; see
+    /// [`Self::release_retired_packets`].
     pub fn drop_range(&mut self, first_seq: u32, last_seq: u32) -> Result<DropRangeSummary, Error> {
         let distance = self.validate_drop_range(first_seq, last_seq)?;
         let sequence_count = distance + 1;
@@ -2164,16 +2024,14 @@ impl ReceiverBuffer {
         // dropped and must never be rediscovered by a later packet.
         self.advance_drop_frontier(first_seq, last_seq);
 
-        // Remove only packet keys that lie in the requested numeric interval.
-        // A circular range has at most two such intervals. Repeating a range
-        // successor lookup after each removal is O(k log n), where k is the
-        // number of requested sequence positions (bounded by the negotiated
-        // receive window), independent of unrelated retained TSBPD packets.
+        // Remove only packets in the requested circular interval. Those
+        // become unreachable at once; their storage is released in bounded
+        // visits, independent of the interval width.
         let packets_removed = self.remove_drop_packets(first_seq, last_seq);
         let losses_removed = self.remove_drop_losses(first_seq, sequence_count);
 
         self.total_dropped = self.total_dropped.saturating_add(u64::from(sequence_count));
-        self.advance_expected_after_drop(first_seq, distance);
+        self.advance_expected_after_drop();
         Ok(DropRangeSummary {
             sequence_count,
             packets_removed,
@@ -2195,7 +2053,10 @@ impl ReceiverBuffer {
         let oldest_was_dropped = self
             .oldest_retained_seq
             .is_some_and(|oldest| sequence_in_range(first_seq, distance, oldest));
-        let packets_removed = self.packets.remove_range(first_seq, last_seq).unwrap_or(0) as u32;
+        let packets_removed = self
+            .clip_to_live_span(first_seq, last_seq)
+            .and_then(|(first, last)| self.packets.remove_range(first, last))
+            .unwrap_or(0) as u32;
         if oldest_was_dropped {
             let next = self.next_sequence_after(last_seq);
             self.oldest_retained_seq = next;
@@ -2203,17 +2064,50 @@ impl ReceiverBuffer {
         packets_removed
     }
 
+    /// The part of `first_seq..=last_seq` inside the live packet span. Every
+    /// retained packet lies in that span, and the span maps one-to-one onto
+    /// the packet window's slots, so a range clear there cannot reach a
+    /// retained packet whose slot merely aliases a position outside it.
+    fn clip_to_live_span(&self, first_seq: u32, last_seq: u32) -> Option<(u32, u32)> {
+        let base = self.packet_window_base();
+        let distance = last_seq.wrapping_sub(first_seq) & SEQUENCE_MASK;
+        let first_offset = first_seq.wrapping_sub(base) & SEQUENCE_MASK;
+        let (start, end) = if first_offset < self.max_buffer_size {
+            (first_offset, first_offset + distance)
+        } else {
+            let lead = base.wrapping_sub(first_seq) & SEQUENCE_MASK;
+            if lead > distance {
+                return None;
+            }
+            (0, distance - lead)
+        };
+        let end = end.min(self.max_buffer_size - 1);
+        Some((
+            base.wrapping_add(start) & SEQUENCE_MASK,
+            base.wrapping_add(end) & SEQUENCE_MASK,
+        ))
+    }
+
     fn remove_drop_losses(&mut self, first_seq: u32, sequence_count: u32) -> u32 {
         self.loss_list.remove_range(first_seq, sequence_count)
     }
 
-    fn advance_expected_after_drop(&mut self, first_seq: u32, distance: u32) {
-        while self.packets.contains_key(self.expected_seq)
-            || sequence_in_range(first_seq, distance, self.expected_seq)
-        {
-            self.expected_seq = self.expected_seq.wrapping_add(1) & SEQUENCE_MASK;
-        }
+    fn advance_expected_after_drop(&mut self) {
+        self.expected_seq = self.first_unresolved_seq();
         self.loss_list.set_base(self.expected_seq);
+    }
+
+    /// Release packets a DROPREQ or a forced advance removed, at most one
+    /// visit's budget (`MAX_RETIRED_RELEASED_PER_VISIT` work units). Every
+    /// receive, drop and advance runs one, and the owning connection runs one
+    /// per ACK tick, so a window-sized removal is released over bounded
+    /// visits rather than in the call that made it. Returns whether retired
+    /// packets remain.
+    pub fn release_retired_packets(&mut self) -> bool {
+        if self.packets.has_retired() {
+            self.packets.release_retired(MAX_RETIRED_RELEASED_PER_VISIT);
+        }
+        self.packets.has_retired()
     }
 
     /// Get the current ACK sequence number (libsrt's 31-bit domain).
@@ -2287,7 +2181,7 @@ impl ReceiverBuffer {
         ReceiverStats {
             packets_in_buffer: self.packets.len() as u32,
             payload_bytes_in_buffer,
-            packets_in_loss_list: self.loss_list.len() as u32,
+            packets_in_loss_list: self.loss_list.len(),
             available_buffer_packets: self.available_buffer_packets(),
             available_buffer_bytes: None,
             max_buffer_packets: self.max_buffer_size,
@@ -2387,6 +2281,8 @@ pub struct ReceiverStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::WorkCounters;
+    use rustc_hash::FxHashSet;
 
     fn loss_set(buf: &ReceiverBuffer) -> FxHashSet<u32> {
         buf.loss_list.iter().collect()
@@ -2426,7 +2322,7 @@ mod tests {
     #[test]
     fn loss_bitmap_allocates_lazily_and_tracks_first_loss() {
         let mut losses = LossBitmap::new(100, 128);
-        assert!(losses.storage.is_empty());
+        assert!(!losses.bits.is_allocated());
         assert_eq!(losses.first(), None);
 
         assert!(losses.insert(102));
@@ -2447,9 +2343,9 @@ mod tests {
     #[test]
     fn default_loss_bitmap_heap_footprint_stays_bounded() {
         let mut losses = LossBitmap::new(0, DEFAULT_FLOW_WINDOW);
-        assert_eq!(losses.storage.capacity(), 0);
+        assert_eq!(losses.bits.allocated_bytes(), 0);
         assert!(losses.insert(0));
-        let bytes = losses.storage.capacity() * std::mem::size_of::<u64>();
+        let bytes = losses.bits.allocated_bytes();
         eprintln!("default LossBitmap heap footprint: {bytes} bytes");
         assert!(
             bytes <= 1_100,
@@ -2457,13 +2353,14 @@ mod tests {
         );
     }
 
+    /// 1,024 data words, three 16-word block levels and two top-level masks.
     #[test]
     fn maximum_loss_bitmap_heap_footprint_stays_bounded() {
         let mut losses = LossBitmap::new(0, MAX_FLOW_WINDOW);
         assert!(losses.insert(0));
-        let logical_bytes = losses.storage.len() * std::mem::size_of::<u64>();
-        eprintln!("maximum LossBitmap logical heap footprint: {logical_bytes} bytes");
-        assert_eq!(logical_bytes, 8_320);
+        let bytes = losses.bits.allocated_bytes();
+        eprintln!("maximum LossBitmap heap footprint: {bytes} bytes");
+        assert_eq!(bytes, 8_592);
     }
 
     #[test]
@@ -2489,80 +2386,415 @@ mod tests {
         assert_eq!(losses.len(), 89);
     }
 
-    /// One loss-list range operation walks one 64-bit data word per 64
-    /// positions, so the worst single packet the bitmap can be handed -- a peer
-    /// a full window ahead -- is bounded by `MAX_LOSS_WORDS_PER_ENTRY`, and
-    /// ordinary in-order traffic walks none. The production ISN is random, so
-    /// the unaligned case below is the common one: it touches one word more
-    /// than the aligned case because the run starts inside a word.
+    /// Bitmap words one DATA arrival may read or write, whatever gap it
+    /// classifies and whatever the window: a constant, not words per 64
+    /// positions.
+    const RECEIVE_BITMAP_WORD_LIMIT: u64 = 32;
+
+    /// The windows every work-bound test compares.
+    const WORK_BOUND_WINDOWS: [u32; 3] = [32, DEFAULT_FLOW_WINDOW, MAX_FLOW_WINDOW];
+
+    /// F11: classifying the gap a far-ahead DATA exposes is one range
+    /// assignment, so its cost does not grow with the gap. The production
+    /// ISN is random, so both an aligned and an unaligned start are covered.
     #[test]
-    fn one_loss_entry_walks_at_most_one_bitmap_word_per_64_positions() {
+    fn wide_gap_classification_work_is_window_independent() {
         let now = Timestamp::from_micros(1_000);
-
-        let mut buf =
-            ReceiverBuffer::with_buffer_size(0, 120, Timestamp::from_micros(0), 0, MAX_FLOW_WINDOW);
-        buf.set_tsbpd_enabled(false);
-        reset_loss_words_touched();
-        let _ = buf.receive(make_packet(MAX_FLOW_WINDOW - 1, 1), now);
-        assert_eq!(buf.loss_detection_steps(), (MAX_FLOW_WINDOW - 1) as usize);
-        assert_eq!(
-            loss_words_touched(),
-            MAX_FLOW_WINDOW as usize / 64,
-            "a full-window gap from an aligned start walks every data word once"
-        );
-
-        // The same gap from an ISN of 40 starts 40 bits into the first word,
-        // so the walk touches 1,025 words: the bound is the aligned count plus
-        // one, never more.
-        let mut buf = ReceiverBuffer::with_buffer_size(
-            40,
-            120,
-            Timestamp::from_micros(0),
-            0,
-            MAX_FLOW_WINDOW,
-        );
-        buf.set_tsbpd_enabled(false);
-        reset_loss_words_touched();
-        let _ = buf.receive(make_packet(40 + MAX_FLOW_WINDOW - 1, 1), now);
-        assert_eq!(buf.loss_detection_steps(), (MAX_FLOW_WINDOW - 1) as usize);
-        let touched = loss_words_touched();
+        let mut words = Vec::new();
+        for window in WORK_BOUND_WINDOWS {
+            for isn in [0, 40] {
+                let mut buf = ReceiverBuffer::with_buffer_size(
+                    isn,
+                    120,
+                    Timestamp::from_micros(0),
+                    0,
+                    window,
+                );
+                buf.set_tsbpd_enabled(false);
+                let far = isn + window - 1;
+                let (losses, work) =
+                    WorkCounters::measure(|| buf.receive(make_packet(far, 1), now));
+                assert_eq!(losses, Some(loss_range(isn, far - 1)));
+                assert_eq!(buf.total_lost, u64::from(window - 1));
+                words.push((window, isn, work.bitmap_words()));
+            }
+        }
+        eprintln!("(window, isn, bitmap words): {words:?}");
         assert!(
-            touched <= MAX_LOSS_WORDS_PER_ENTRY,
-            "an unaligned full-window gap must stay within the per-entry bound, \
-             visited {touched}"
-        );
-        assert_eq!(
-            touched, MAX_LOSS_WORDS_PER_ENTRY,
-            "an unaligned start splits the run across one partial word at each end"
+            words
+                .iter()
+                .all(|&(_, _, words)| words <= RECEIVE_BITMAP_WORD_LIMIT),
+            "a gap's classification must not walk the window"
         );
 
         let mut buf =
             ReceiverBuffer::with_buffer_size(0, 120, Timestamp::from_micros(0), 0, MAX_FLOW_WINDOW);
         buf.set_tsbpd_enabled(false);
         for seq in 0..DEFAULT_FLOW_WINDOW {
-            reset_loss_words_touched();
-            assert_eq!(buf.receive(make_packet(seq, seq), now), None);
+            let (losses, work) = WorkCounters::measure(|| buf.receive(make_packet(seq, seq), now));
+            assert_eq!(losses, None);
             assert_eq!(
-                loss_words_touched(),
+                work.bitmap_words(),
                 0,
                 "an in-order packet exposes no new position"
             );
         }
+    }
 
-        let mut buf =
-            ReceiverBuffer::with_buffer_size(0, 120, Timestamp::from_micros(0), 0, MAX_FLOW_WINDOW);
+    /// Bitmap words one reported loss run may cost a periodic NAK: finding
+    /// where the run starts and where it ends, each a constant number of
+    /// word and mask reads.
+    const NAK_BITMAP_WORDS_PER_RUN: u64 = 24;
+
+    /// F09: a periodic NAK reads bitmap words in proportion to the runs it
+    /// reports, not to the window -- with one far loss, nine sparse losses
+    /// spread over the window, one window-wide run, and an alternating list
+    /// the encoder cuts after 16 runs.
+    #[test]
+    fn periodic_nak_bitmap_reads_scale_with_runs_not_window() {
+        let mut results = Vec::new();
+        for window in WORK_BOUND_WINDOWS {
+            let base = SEQUENCE_MASK - window / 2;
+            let at = |offset: u32| base.wrapping_add(offset) & SEQUENCE_MASK;
+            let mut far = LossBitmap::new(base, window);
+            far.insert(at(window - 2));
+            let mut sparse = LossBitmap::new(base, window);
+            for index in 1..=9 {
+                sparse.insert(at(window / 10 * index));
+            }
+            let mut dense = LossBitmap::new(base, window);
+            dense.insert_range(base, window);
+            let mut alternating = LossBitmap::new(base, window);
+            for offset in (0..window).step_by(2) {
+                alternating.insert(at(offset));
+            }
+            for (name, losses, limit_runs) in [
+                ("far", &far, None),
+                ("sparse", &sparse, None),
+                ("dense", &dense, None),
+                ("alternating", &alternating, Some(16)),
+            ] {
+                let mut runs = 0u64;
+                let ((), work) = WorkCounters::measure(|| {
+                    let _ = losses.try_for_each_run_in_sequence_from(None, |_, _| {
+                        runs += 1;
+                        if Some(runs) == limit_runs {
+                            ControlFlow::Break(())
+                        } else {
+                            ControlFlow::Continue(())
+                        }
+                    });
+                });
+                results.push((window, name, runs, work.bitmap_words()));
+            }
+        }
+        eprintln!("(window, list, runs, bitmap words): {results:?}");
+        for &(window, name, runs, words) in &results {
+            assert!(
+                words <= NAK_BITMAP_WORDS_PER_RUN * (runs + 1),
+                "window {window}, {name}: {words} words for {runs} runs"
+            );
+        }
+    }
+
+    /// Packet-window probes one DATA arrival may make, whatever it fills.
+    const RECEIVE_SLOT_PROBE_LIMIT: u64 = 8;
+
+    /// F12: filling the hole in front of a retained window-wide suffix
+    /// takes the new expected sequence from the loss list and the
+    /// classification frontier instead of probing every retained packet.
+    #[test]
+    fn filling_the_head_hole_does_not_scan_the_retained_suffix() {
+        let now = Timestamp::from_micros(1);
+        let mut results = Vec::new();
+        for window in WORK_BOUND_WINDOWS {
+            let mut buf =
+                ReceiverBuffer::with_buffer_size(0, 120, Timestamp::from_micros(0), 0, window);
+            for seq in 1..window {
+                buf.receive(make_packet(seq, 100_000_000), now);
+            }
+            let (_, work) = WorkCounters::measure(|| buf.receive(make_packet(0, 100_000_000), now));
+            assert_eq!(buf.expected_sequence(), window);
+            assert!(buf.loss_list.is_empty());
+            results.push((window, work.frontier_steps, work.packet_slot_probes));
+        }
+        eprintln!("(window, frontier steps, slot probes): {results:?}");
+        for &(window, steps, probes) in &results {
+            assert!(
+                steps == 0 && probes <= RECEIVE_SLOT_PROBE_LIMIT,
+                "window {window}: {steps} frontier steps, {probes} slot probes"
+            );
+        }
+    }
+
+    /// Positions a DROPREQ gave up between two losses do not pin the
+    /// expected sequence once the losses are repaired: like libsrt's
+    /// first-loss-or-next ACK position, it moves past everything resolved.
+    #[test]
+    fn dropped_positions_between_repaired_losses_do_not_pin_the_ack() {
+        let mut buf = ReceiverBuffer::new(100, 120, Timestamp::from_micros(0), 0);
         buf.set_tsbpd_enabled(false);
-        let _ = buf.receive(make_packet(MAX_FLOW_WINDOW - 1, 1), now);
-        reset_loss_words_touched();
-        assert_eq!(
-            buf.loss_list.remove_range(0, MAX_FLOW_WINDOW),
-            MAX_FLOW_WINDOW - 1
+        let now = Timestamp::from_micros(1_000);
+        buf.receive(make_packet(101, 1), now);
+        buf.drop_range(103, 104).expect("forward drop");
+        buf.receive(make_packet(105, 2), now);
+        assert_eq!(loss_set(&buf), FxHashSet::from_iter([100, 102]));
+
+        buf.receive(make_packet(100, 3), now);
+        assert_eq!(buf.expected_sequence(), 102);
+        buf.receive(make_packet(102, 4), now);
+        assert_eq!(buf.expected_sequence(), 106);
+        assert_eq!(buf.generate_ack(now).ack_seq, 106);
+    }
+
+    /// F01: an ACK tick that expires nothing inspects only the head gap --
+    /// one successor lookup and one deadline -- however many losses wait
+    /// behind it. A due backlog of gaps is retired in bounded visits.
+    #[test]
+    fn tlpktdrop_tick_work_is_window_independent() {
+        let start = Timestamp::from_micros(0);
+        let mut results = Vec::new();
+        for window in WORK_BOUND_WINDOWS {
+            // One DATA a window ahead, due in 100 s: W - 1 losses behind it.
+            let mut buf = ReceiverBuffer::with_buffer_size(0, 120, start, 0, window);
+            buf.receive(make_packet(window - 1, 100_000_000), start);
+            let mut idle = WorkCounters::default();
+            for tick in 1..=8u64 {
+                let (dropped, work) = WorkCounters::measure(|| {
+                    buf.drop_too_late(Timestamp::from_micros(tick * 10_000))
+                });
+                assert!(dropped.is_empty());
+                idle = WorkCounters {
+                    loss_entries_visited: idle.loss_entries_visited.max(work.loss_entries_visited),
+                    successor_probes: idle.successor_probes.max(work.successor_probes),
+                    deadline_probes: idle.deadline_probes.max(work.deadline_probes),
+                    bitmap_data_words: idle.bitmap_data_words.max(work.bitmap_words()),
+                    ..idle
+                };
+            }
+            assert_eq!(buf.loss_list.len(), window - 1);
+            results.push((window, idle));
+        }
+        eprintln!("(window, worst idle tick): {results:?}");
+        for (window, idle) in results {
+            assert!(
+                idle.loss_entries_visited == 0
+                    && idle.successor_probes <= 1
+                    && idle.deadline_probes <= 1
+                    && idle.bitmap_data_words <= EXPIRY_TICK_BITMAP_WORD_LIMIT,
+                "window {window}: {idle:?}"
+            );
+        }
+    }
+
+    /// Bitmap words one given-up gap may cost: finding it and clearing it.
+    const EXPIRED_GAP_BITMAP_WORDS: u64 = 24;
+
+    /// F01: a backlog of due gaps goes `MAX_EXPIRED_GAPS_PER_VISIT` at a
+    /// time, each gap a constant amount of work, until none is left.
+    #[test]
+    fn tlpktdrop_due_backlog_retires_in_bounded_visits() {
+        let start = Timestamp::from_micros(0);
+        let late = Timestamp::from_micros(1_000_000);
+        let budget = MAX_EXPIRED_GAPS_PER_VISIT as u64;
+        for window in WORK_BOUND_WINDOWS {
+            let mut buf = ReceiverBuffer::with_buffer_size(0, 120, start, 0, window);
+            for seq in (1..window).step_by(2) {
+                buf.receive(make_packet(seq, 0), start);
+            }
+            let gaps = (window / 2) as usize;
+            let mut given_up = Vec::new();
+            loop {
+                let (dropped, work) = WorkCounters::measure(|| buf.drop_too_late(late));
+                assert!(dropped.len() <= MAX_EXPIRED_GAPS_PER_VISIT);
+                assert!(
+                    work.loss_entries_visited == 0
+                        && work.successor_probes <= budget + 1
+                        && work.deadline_probes <= budget + 1
+                        && work.bitmap_words() <= (budget + 1) * EXPIRED_GAP_BITMAP_WORDS,
+                    "window {window}: {work:?}"
+                );
+                let done = dropped.len() < MAX_EXPIRED_GAPS_PER_VISIT;
+                given_up.extend(dropped);
+                if done {
+                    break;
+                }
+            }
+            let expected: Vec<_> = (0..window)
+                .step_by(2)
+                .map(|seq| loss_range(seq, seq))
+                .collect();
+            assert_eq!(given_up.len(), gaps);
+            assert_eq!(given_up, expected);
+            assert_eq!(buf.expected_sequence(), window);
+            assert!(buf.loss_list.is_empty());
+            assert_eq!(buf.stats().total_dropped, gaps as u64);
+        }
+    }
+
+    /// Bitmap words a tick may read to find and inspect the head gap.
+    const EXPIRY_TICK_BITMAP_WORD_LIMIT: u64 = 16;
+
+    /// Packet-window probes plus released payloads one DROPREQ may cost:
+    /// the retirement budget of one visit plus a constant.
+    const DROP_VISIT_SLOT_LIMIT: u64 = 2 * 256 + 16;
+
+    /// Bitmap words one DROPREQ may read or write: two range clears and the
+    /// frontier lookup.
+    const DROP_BITMAP_WORD_LIMIT: u64 = 96;
+
+    /// A DROPREQ reaching back before the retained span drops only what is
+    /// in its range, even where a range position shares a packet-window slot
+    /// with a retained packet further on.
+    #[test]
+    fn a_dropreq_behind_the_span_spares_packets_sharing_its_slots() {
+        let now = Timestamp::from_micros(1);
+        let window = DEFAULT_FLOW_WINDOW;
+        let mut buf = ReceiverBuffer::with_buffer_size(0, 120, Timestamp::default(), 0, window);
+        for seq in (0..=50).chain([window - 42]) {
+            buf.receive(make_packet(seq, 100_000_000), now);
+        }
+        let behind = 0u32.wrapping_sub(100) & SEQUENCE_MASK;
+        let summary = buf.drop_range(behind, 50).expect("valid drop");
+        assert_eq!(summary.packets_removed, 51);
+        assert!(
+            buf.packets.contains_key(window - 42),
+            "slot alias was dropped"
         );
-        assert_eq!(
-            loss_words_touched(),
-            MAX_FLOW_WINDOW as usize / 64,
-            "a full-window drop range from an aligned start walks every data word once"
-        );
+        assert_eq!(buf.packets.len(), 1);
+    }
+
+    /// Arriving DATA also releases a visit's worth of dropped packets, so a
+    /// busy receiver does not wait for ACK ticks to free them.
+    #[test]
+    fn arriving_data_releases_dropped_packets() {
+        let now = Timestamp::from_micros(1);
+        let window = DEFAULT_FLOW_WINDOW;
+        let mut buf = ReceiverBuffer::with_buffer_size(0, 120, Timestamp::default(), 0, window);
+        for seq in 0..window {
+            buf.receive(make_packet(seq, 100_000_000), now);
+        }
+        buf.drop_range(0, window - 1).expect("valid drop");
+        let mut arrivals = 0;
+        while buf.packets.has_retired() {
+            assert!(arrivals < 40, "arrivals stopped releasing");
+            buf.receive(make_packet(window + arrivals, 100_000_000), now);
+            arrivals += 1;
+        }
+        assert_eq!(buf.packets.len(), arrivals as usize);
+    }
+
+    /// Bitmap words one forced advance may read or write.
+    const FORCED_ADVANCE_BITMAP_WORD_LIMIT: u64 = 32;
+
+    /// F04: a group member lagging behind a wide gap is advanced one
+    /// delivered packet at a time; each advance clears the losses it passes
+    /// as a range and re-derives the expected sequence, so it costs the same
+    /// at every window.
+    #[test]
+    fn forced_advance_work_is_window_independent() {
+        let now = Timestamp::from_micros(1);
+        let mut results = Vec::new();
+        for window in WORK_BOUND_WINDOWS {
+            let mut laggard =
+                ReceiverBuffer::with_buffer_size(0, 120, Timestamp::default(), 0, window);
+            laggard.receive(make_packet(window - 1, 100_000_000), now);
+            let mut worst = WorkCounters::default();
+            for target in 1..=8 {
+                let ((), work) =
+                    WorkCounters::measure(|| laggard.advance_expected_sequence(target));
+                assert_eq!(laggard.expected_sequence(), target);
+                if work.loss_entries_visited + work.bitmap_words() + work.frontier_steps
+                    > worst.loss_entries_visited + worst.bitmap_words() + worst.frontier_steps
+                {
+                    worst = work;
+                }
+            }
+            assert_eq!(laggard.stats().packets_in_loss_list, window - 1 - 8);
+            results.push((window, worst));
+        }
+        for (window, work) in &results {
+            eprintln!(
+                "window {window}: loss entries {} bitmap words {} frontier steps {} slots {}",
+                work.loss_entries_visited,
+                work.bitmap_words(),
+                work.frontier_steps,
+                work.packet_slot_probes
+            );
+        }
+        for (window, work) in results {
+            assert!(
+                work.loss_entries_visited == 0
+                    && work.frontier_steps == 0
+                    && work.bitmap_words() <= FORCED_ADVANCE_BITMAP_WORD_LIMIT,
+                "window {window}: {work:?}"
+            );
+        }
+    }
+
+    /// F10: a window-wide DROPREQ advances the receive state by the range's
+    /// endpoints and retires the packets it covers within a fixed per-visit
+    /// budget -- over a retained full window, and over an empty interval
+    /// starting at the expected sequence.
+    #[test]
+    fn wide_dropreq_work_per_visit_is_window_independent() {
+        let now = Timestamp::from_micros(1);
+        let mut results = Vec::new();
+        for window in WORK_BOUND_WINDOWS {
+            let mut full =
+                ReceiverBuffer::with_buffer_size(0, 120, Timestamp::default(), 0, window);
+            for seq in 0..window {
+                full.receive(make_packet(seq, 100_000_000), now);
+            }
+            let (summary, work) = WorkCounters::measure(|| full.drop_range(0, window - 1));
+            assert_eq!(summary.expect("valid drop").packets_removed, window);
+            assert_eq!(full.expected_sequence(), window);
+            assert!(
+                full.is_delivery_drained(),
+                "dropped packets are gone at once"
+            );
+            results.push((window, "retained", work));
+            // Their storage goes in bounded visits until none is left.
+            let mut visits = 0;
+            loop {
+                let (more, work) = WorkCounters::measure(|| full.release_retired_packets());
+                visits += 1;
+                results.push((window, "release visit", work));
+                if !more {
+                    break;
+                }
+            }
+            assert!(full.packets.is_released());
+            assert_eq!(full.sparse_pages() + full.dense_pages(), 0);
+            assert!(visits <= window as usize / 192 + 1, "{visits} visits");
+
+            let mut empty =
+                ReceiverBuffer::with_buffer_size(0, 120, Timestamp::default(), 0, window);
+            let (summary, work) = WorkCounters::measure(|| empty.drop_range(0, window - 1));
+            assert_eq!(summary.expect("valid drop").sequence_count, window);
+            assert_eq!(empty.expected_sequence(), window);
+            results.push((window, "empty", work));
+        }
+        for (window, case, work) in results
+            .iter()
+            .filter(|(_, case, _)| *case != "release visit")
+        {
+            eprintln!(
+                "window {window} {case}: slots {} released {} bitmap words {} frontier steps {}",
+                work.packet_slot_probes,
+                work.released_chunks,
+                work.bitmap_words(),
+                work.frontier_steps
+            );
+        }
+        for (window, case, work) in results {
+            assert!(
+                work.packet_slot_probes + work.released_chunks <= DROP_VISIT_SLOT_LIMIT
+                    && work.bitmap_words() <= DROP_BITMAP_WORD_LIMIT
+                    && work.frontier_steps == 0,
+                "window {window} {case}: {work:?}"
+            );
+        }
     }
 
     /// A periodic NAK walks a wrapped window oldest first, resumes inside
@@ -2822,7 +3054,7 @@ mod tests {
             Some(loss_range(0, WINDOW - 2))
         );
         assert_eq!(buf.packets.len(), 1);
-        assert_eq!(buf.loss_list.len, WINDOW - 1);
+        assert_eq!(buf.loss_list.len(), WINDOW - 1);
         assert_eq!(buf.receive_occupancy(), WINDOW);
         assert_eq!(buf.available_buffer_packets(), 0);
 
@@ -2832,7 +3064,7 @@ mod tests {
         assert!(buf.packets.contains_key(0));
         assert!(!buf.loss_list.contains(0));
         assert_eq!(buf.packets.len(), 2);
-        assert_eq!(buf.loss_list.len, WINDOW - 2);
+        assert_eq!(buf.loss_list.len(), WINDOW - 2);
         assert_eq!(buf.receive_occupancy(), WINDOW);
         assert_eq!(buf.available_buffer_packets(), 0);
     }
@@ -2899,7 +3131,7 @@ mod tests {
         buf.set_application_backlog_packets(WINDOW - 2);
         buf.drop_range(2, 2)
             .expect("two reservations exactly fill the receive capacity");
-        assert_eq!(buf.loss_list.len, 2);
+        assert_eq!(buf.loss_list.len(), 2);
         assert_eq!(buf.receive_occupancy(), WINDOW);
         assert_eq!(buf.available_buffer_packets(), 0);
     }
@@ -3661,13 +3893,14 @@ mod tests {
     fn test_in_order_receive_does_not_search_for_a_future_sequence() {
         let mut buf = ReceiverBuffer::new(0, 250, Timestamp::from_micros(0), 0);
 
+        let before = WorkCounters::snapshot();
         for seq in 0..512u32 {
             let now_us = (u64::from(seq) + 1) * 1_316;
             let now = Timestamp::from_micros(now_us);
             buf.receive(make_packet(seq, now_us as u32), now);
         }
 
-        assert_eq!(buf.receive_expected_sequence_scans(), 0);
+        assert_eq!(WorkCounters::since(before).frontier_steps, 0);
     }
 
     #[test]
@@ -3771,12 +4004,12 @@ mod tests {
                 );
             }
             assert_eq!(buf.stats().packets_in_buffer, window);
-            let before = buf.delivery_time_checks();
+            let before = WorkCounters::snapshot();
             for _ in 0..64 {
                 assert!(buf.pop_ready(Timestamp::from_micros(2)).is_none());
             }
             assert!(
-                buf.delivery_time_checks() - before <= 64,
+                WorkCounters::since(before).deadline_probes <= 64,
                 "each unsuccessful readiness check may inspect only the head"
             );
         }
@@ -3798,7 +4031,7 @@ mod tests {
         // 次側パケット seq 1001 の delivery_time = 500_000 + 200_000 + 120_000 = 820_000
         // now = 2_000_000 > 820_000 + 1_000_000 = 1_820_000 なので削除される
         let dropped = buf.drop_too_late(Timestamp::from_micros(2_000_000));
-        assert_eq!(dropped, vec![1000]);
+        assert_eq!(dropped, vec![loss_range(1000, 1000)]);
     }
 
     /// Like libsrt's receiver (`CUDT::tsbpd`, which drops up to the first
@@ -3818,7 +4051,7 @@ mod tests {
         assert!(buf.drop_too_late(before).is_empty());
         assert!(buf.pop_ready(before).is_none());
 
-        assert_eq!(buf.drop_too_late(due), vec![1000]);
+        assert_eq!(buf.drop_too_late(due), vec![loss_range(1000, 1000)]);
         assert_eq!(
             buf.pop_ready(due).map(|packet| packet.sequence_number),
             Some(1001)
@@ -3844,8 +4077,12 @@ mod tests {
         let dropped = buf.drop_too_late(Timestamp::from_micros(2_000_000));
 
         assert_eq!(
-            FxHashSet::from_iter(dropped),
-            FxHashSet::from_iter([1000, 1001, 1003, 1005])
+            dropped,
+            vec![
+                loss_range(1000, 1001),
+                loss_range(1003, 1003),
+                loss_range(1005, 1005)
+            ]
         );
         assert!(buf.loss_list.is_empty());
         assert_eq!(buf.expected_sequence(), 1007);
@@ -3882,7 +4119,7 @@ mod tests {
 
         // TLPKTDROP で 1000 を諦める。
         let dropped = buf.drop_too_late(Timestamp::from_micros(2_000_000));
-        assert_eq!(dropped, vec![1000]);
+        assert_eq!(dropped, vec![loss_range(1000, 1000)]);
 
         // 修正前は expected_seq が 1000 に張り付いたままだった。
         // 1000 (諦めた) と 1001 (受信済み) の両方を追い越して 1002 まで
@@ -3923,7 +4160,7 @@ mod tests {
         // now = 2_200_000: 1000 は超過、1001 は未到達 → 1000 のみ削除 (1000 は loss_list にないので削除されない)
         // now = 2_400_000: 両方超過 → 1001 が削除される
         let dropped = buf.drop_too_late(Timestamp::from_micros(2_400_000));
-        assert_eq!(dropped, vec![1001]);
+        assert_eq!(dropped, vec![loss_range(1001, 1001)]);
         assert!(buf.loss_list.is_empty());
     }
 
@@ -4148,7 +4385,7 @@ mod tests {
 
         // drop_too_late で期限切れの穴 (0x7FFF_FFFE) を loss_list から除去する。
         let dropped = buf.drop_too_late(late_now);
-        assert_eq!(dropped, vec![0x7FFF_FFFE]);
+        assert_eq!(dropped, vec![loss_range(0x7FFF_FFFE, 0x7FFF_FFFE)]);
 
         // 穴が消えた後、後続が循環順で配信される。
         let mut popped = Vec::new();
@@ -4279,7 +4516,11 @@ mod tests {
 
         let after = Timestamp::from_micros(4_296_788_000);
         let dropped = buf.drop_too_late(after);
-        assert_eq!(dropped, vec![1001], "閾値超過で削除されるはず");
+        assert_eq!(
+            dropped,
+            vec![loss_range(1001, 1001)],
+            "閾値超過で削除されるはず"
+        );
     }
 
     #[test]
@@ -4513,7 +4754,7 @@ mod tests {
         }
 
         assert_eq!(buf.loss_detection_frontier, DEFAULT_FLOW_WINDOW - 1);
-        assert_eq!(buf.loss_detection_steps(), 1);
+        assert_eq!(buf.total_lost, 1);
         assert_eq!(buf.stats().total_lost, 1);
         assert_eq!(
             buf.generate_periodic_nak().unwrap().loss_ranges,
@@ -4532,12 +4773,12 @@ mod tests {
             Some(loss_range(100, 101))
         );
         assert_eq!(buf.receive(make_packet(101, 2), now), None);
-        assert_eq!(buf.loss_detection_steps(), 2);
+        assert_eq!(buf.total_lost, 2);
         assert_eq!(
             buf.receive(make_packet(104, 3), now),
             Some(loss_range(103, 103))
         );
-        assert_eq!(buf.loss_detection_steps(), 3);
+        assert_eq!(buf.total_lost, 3);
         assert_eq!(buf.loss_detection_frontier, 104);
         assert_eq!(
             buf.generate_periodic_nak().unwrap().loss_ranges,
@@ -4559,7 +4800,7 @@ mod tests {
         assert_eq!(buf.receive(make_packet(1, 2), now), None);
         assert_eq!(buf.receive(make_packet(0x7FFF_FFFF, 3), now), None);
         assert_eq!(buf.loss_detection_frontier, 1);
-        assert_eq!(buf.loss_detection_steps(), 2);
+        assert_eq!(buf.total_lost, 2);
         assert_eq!(
             buf.generate_periodic_nak().unwrap().loss_ranges,
             vec![loss_range(0x7FFF_FFFE, 0x7FFF_FFFE)]
@@ -4596,7 +4837,7 @@ mod tests {
             buf.receive(make_packet(106, 1), now),
             Some(loss_range(105, 105))
         );
-        assert_eq!(buf.loss_detection_steps(), 1);
+        assert_eq!(buf.total_lost, 1);
         assert_eq!(
             buf.generate_periodic_nak().unwrap().loss_ranges,
             vec![loss_range(105, 105)]
@@ -4711,7 +4952,7 @@ mod tests {
         assert_eq!(error.kind, crate::error::ErrorKind::InvalidData);
         assert_eq!(buf.expected_sequence(), 100);
         assert_eq!(buf.loss_detection_frontier, 99);
-        assert_eq!(buf.loss_detection_steps(), 0);
+        assert_eq!(buf.total_lost, 0);
         assert_eq!(buf.stats().total_lost, 0);
         assert_eq!(buf.stats().total_dropped, 0);
     }
@@ -4866,7 +5107,7 @@ mod tests {
         let mut buf = ReceiverBuffer::new(0, 120, Timestamp::from_micros(0), 0);
         buf.set_tsbpd_enabled(false);
         buf.receive(make_packet(DEFAULT_FLOW_WINDOW - 1, 1), now);
-        assert_eq!(buf.loss_list.len(), (DEFAULT_FLOW_WINDOW - 1) as usize);
+        assert_eq!(buf.loss_list.len(), DEFAULT_FLOW_WINDOW - 1);
 
         let summary = buf
             .drop_range(0, DEFAULT_FLOW_WINDOW - 1)
@@ -4947,6 +5188,132 @@ mod tests {
                 }
             }
             proptest::prop_assert_eq!(head, timestamps.len());
+        }
+    }
+
+    /// One receive-side entry point the bounded-work proptest drives, with
+    /// window-relative arguments (fractions of the window, in 1/65,536ths).
+    #[derive(Debug, Clone)]
+    enum WorkAction {
+        Receive { ahead: u16, timestamp: u32 },
+        Duplicate,
+        Drop { behind: u16, width: u16 },
+        Tick { elapsed: u32 },
+        Advance { ahead: u16 },
+        Release,
+        Pop,
+    }
+
+    fn work_action() -> impl proptest::strategy::Strategy<Value = WorkAction> {
+        use proptest::prelude::*;
+        prop_oneof![
+            4 => (any::<u16>(), 0..400_000u32)
+                .prop_map(|(ahead, timestamp)| WorkAction::Receive { ahead, timestamp }),
+            1 => Just(WorkAction::Duplicate),
+            1 => (any::<u16>(), any::<u16>())
+                .prop_map(|(behind, width)| WorkAction::Drop { behind, width }),
+            2 => (0..300_000u32).prop_map(|elapsed| WorkAction::Tick { elapsed }),
+            1 => any::<u16>().prop_map(|ahead| WorkAction::Advance { ahead }),
+            1 => Just(WorkAction::Release),
+            1 => Just(WorkAction::Pop),
+        ]
+    }
+
+    /// `fraction` (in 1/65,536ths) of `window`.
+    fn window_share(window: u32, fraction: u16) -> u32 {
+        ((u64::from(window) * u64::from(fraction)) >> 16) as u32
+    }
+
+    /// Per-call work limits every receive-side entry point stays within at
+    /// every window: one release visit (256 units) plus a constant of slot
+    /// probes, one TLPKTDROP visit's 64 gaps of successor, deadline and
+    /// bitmap work, and never a loss enumeration or pending-key scan.
+    const ENTRY_SLOT_LIMIT: u64 = 2 * 256 + 2 * 64 + 32;
+    const ENTRY_GAP_LIMIT: u64 = MAX_EXPIRED_GAPS_PER_VISIT as u64 + 2;
+    const ENTRY_BITMAP_WORD_LIMIT: u64 = 24 * (MAX_EXPIRED_GAPS_PER_VISIT as u64 + 2);
+    const ENTRY_FRONTIER_STEP_LIMIT: u64 = 2;
+
+    /// Apply one action to `buf` and return the work it did.
+    fn apply_work_action(
+        buf: &mut ReceiverBuffer,
+        action: &WorkAction,
+        window: u32,
+        clock: &mut u64,
+        last: &mut Option<DataPacket>,
+    ) -> WorkCounters {
+        let expected = buf.expected_sequence();
+        let now = Timestamp::from_micros(*clock);
+        let ((), work) = WorkCounters::measure(|| match *action {
+            WorkAction::Receive { ahead, timestamp } => {
+                let sequence = expected.wrapping_add(window_share(window, ahead)) & SEQUENCE_MASK;
+                let packet = make_packet(sequence, timestamp);
+                *last = Some(packet.clone());
+                let _ = buf.receive(packet, now);
+            }
+            WorkAction::Duplicate => {
+                if let Some(packet) = last.clone() {
+                    let _ = buf.receive(packet, now);
+                }
+            }
+            WorkAction::Drop { behind, width } => {
+                let first = expected.wrapping_sub(window_share(window, behind) / 2) & SEQUENCE_MASK;
+                let width = window_share(window, width).min(window - 1);
+                let _ = buf.drop_range(first, first.wrapping_add(width) & SEQUENCE_MASK);
+            }
+            WorkAction::Tick { elapsed } => {
+                *clock += u64::from(elapsed);
+                let _ = buf.drop_too_late(Timestamp::from_micros(*clock));
+            }
+            WorkAction::Advance { ahead } => {
+                let target = expected.wrapping_add(window_share(window, ahead)) & SEQUENCE_MASK;
+                buf.advance_expected_sequence(target);
+            }
+            WorkAction::Release => {
+                buf.release_retired_packets();
+            }
+            WorkAction::Pop => {
+                let _ = buf.pop_ready(now);
+            }
+        });
+        work
+    }
+
+    fn within_entry_limits(work: &WorkCounters) -> bool {
+        work.packet_slot_probes + work.released_chunks <= ENTRY_SLOT_LIMIT
+            && work.successor_probes <= ENTRY_GAP_LIMIT
+            && work.deadline_probes <= ENTRY_GAP_LIMIT
+            && work.bitmap_words() <= ENTRY_BITMAP_WORD_LIMIT
+            && work.frontier_steps <= ENTRY_FRONTIER_STEP_LIMIT
+            && work.loss_entries_visited == 0
+            && work.pending_keys_visited == 0
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+
+        /// Random receive-side streams -- sequence wrap, non-monotone
+        /// timestamps, duplicates, wide gaps, DROPREQs reaching behind the
+        /// span, TLPKTDROP ticks, a lagging group member's forced advances,
+        /// release visits and deliveries -- keep every call's work within
+        /// the same window-independent limits at W = 32 / 8,192 / 65,536.
+        #[test]
+        fn receive_entry_points_do_window_independent_work(
+            initial in (SEQUENCE_MASK - 64)..=SEQUENCE_MASK,
+            actions in proptest::collection::vec(work_action(), 1..96),
+        ) {
+            for window in WORK_BOUND_WINDOWS {
+                let mut buf =
+                    ReceiverBuffer::with_buffer_size(initial, 120, Timestamp::default(), 0, window);
+                let mut clock = 1;
+                let mut last = None;
+                for action in &actions {
+                    let work = apply_work_action(&mut buf, action, window, &mut clock, &mut last);
+                    proptest::prop_assert!(
+                        within_entry_limits(&work),
+                        "window {}: {:?} did {:?}", window, action, work
+                    );
+                }
+            }
         }
     }
 }
