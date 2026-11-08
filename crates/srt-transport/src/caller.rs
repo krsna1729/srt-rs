@@ -10,6 +10,7 @@ use srt_proto::{
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::id_hash::IdHashMap;
+use crate::keyed_queue::KeyedQueue;
 
 /// Default maximum number of logical callers held by one table.
 ///
@@ -427,7 +428,7 @@ pub struct CallerTable {
     /// at the moment a leg is quarantined, so its length can never exceed the
     /// number of quarantined legs and there is no capacity to overflow: the
     /// retirement token for a quarantined leg is always discoverable.
-    protocol_failure_index: VecDeque<(LogicalCallerId, u32)>,
+    protocol_failure_index: KeyedQueue<(LogicalCallerId, u32)>,
     /// Reusable per-pass scratch for records produced by the drain path
     /// before the table stores them on the leg they belong to. `Option` so a
     /// pass can move it into its `DrainSink` borrow; always `Some` otherwise.
@@ -437,14 +438,14 @@ pub struct CallerTable {
     /// exact fault lives on its session) and its entry is removed when the
     /// caller is, so the length never exceeds the live caller count -- churn
     /// (collide, retire, repeat) cannot grow it, and no fault is dropped.
-    group_fault_index: VecDeque<LogicalCallerId>,
+    group_fault_index: KeyedQueue<LogicalCallerId>,
     /// Exact index of attempts whose protocol state left "establishing"
     /// (connected, rejected, closing or disconnected): each live caller is
     /// appended at most once, at the state transition, and its entry is
     /// removed with the caller. Bounded by the live caller count, so a pool
     /// releases a resolved attempt's permit from this queue instead of
     /// rescanning its in-flight population.
-    resolved_attempts: VecDeque<LogicalCallerId>,
+    resolved_attempts: KeyedQueue<LogicalCallerId>,
     /// Test-only: how many attempt-status probes ran, to prove maintenance
     /// never walks the in-flight population.
     #[cfg(test)]
@@ -821,7 +822,7 @@ impl CallerSession {
         id: LogicalCallerId,
         now: Timestamp,
         sink: &mut DrainSink<'_, S>,
-        failure_index: &mut VecDeque<(LogicalCallerId, u32)>,
+        failure_index: &mut KeyedQueue<(LogicalCallerId, u32)>,
     ) -> (DrainOne, bool) {
         match self {
             Self::Direct(leg) => {
@@ -987,10 +988,10 @@ impl CallerTable {
             deadlines: LogicalDueIndex::new(bounded),
             sched: IdHashMap::with_capacity_and_hasher(bounded, Default::default()),
             due_scratch: Vec::with_capacity(bounded.min(MAX_DUE_PER_VISIT)),
-            protocol_failure_index: VecDeque::new(),
+            protocol_failure_index: KeyedQueue::default(),
             protocol_failure_scratch: Some(Vec::new()),
-            group_fault_index: VecDeque::new(),
-            resolved_attempts: VecDeque::new(),
+            group_fault_index: KeyedQueue::default(),
+            resolved_attempts: KeyedQueue::default(),
             #[cfg(test)]
             status_probes: std::cell::Cell::new(0),
             next_logical_caller: 1,
@@ -1330,6 +1331,15 @@ impl CallerTable {
         ReadyVisit::Live(id)
     }
 
+    /// Drop stale ready entries once they dominate the queue: O(1) amortized
+    /// per push or detach, not bounded per call. The pass runs only when the
+    /// queue holds over 64 entries and over four times the live sessions,
+    /// and leaves at most one entry per live session. So of the entries a
+    /// pass visits, at most a quarter are live, and every other one was
+    /// pushed since the previous pass or belongs to a session detached since
+    /// then. A keyed queue would bound the pass itself, but it would tax
+    /// every `enqueue_ready` on the data path, which this queue keeps at one
+    /// `VecDeque` push.
     fn maybe_compact_ready_queue(&mut self) {
         if self.ready_queue.len() > 64 && self.ready_queue.len() > self.sessions.len() * 4 {
             self.ready_queue.retain(|id| {
@@ -1339,6 +1349,8 @@ impl CallerTable {
         }
     }
 
+    /// The event-ready twin of [`Self::maybe_compact_ready_queue`], with the
+    /// same amortized bound.
     fn maybe_compact_event_ready_queue(&mut self) {
         if self.event_ready_queue.len() > 64
             && self.event_ready_queue.len() > self.sessions.len() * 4
@@ -1926,22 +1938,30 @@ impl CallerTable {
     }
 
     fn detach_session(&mut self, id: LogicalCallerId) -> Option<CallerSession> {
-        // A retired session takes its undrained failure record with it, so the
-        // index entry must go too: without this, churn (fault, retire, repeat)
-        // accumulates keys for sessions that no longer exist and the index is
-        // no longer bounded by the quarantined population.
-        self.protocol_failure_index
-            .retain(|(index_id, _)| *index_id != id);
-        // Same for an undrained peer-group fault: it dies with its caller.
-        self.group_fault_index.retain(|index_id| *index_id != id);
+        let session = self.sessions.remove(&id)?;
+        // A retired session takes its undrained failure records with it, so
+        // the index entries must go too: without this, churn (fault, retire,
+        // repeat) accumulates keys for sessions that no longer exist and the
+        // index is no longer bounded by the quarantined population. Every
+        // entry is removed by its exact key (session, leg), and every route
+        // by the leg's own socket ID: the work is per leg, never a pass over
+        // other sessions' entries.
+        self.group_fault_index.remove(&id);
         // ...and an unconsumed resolution signal, so a stale id can never be
         // mistaken for a later caller and the index cannot outgrow the table.
-        self.resolved_attempts.retain(|index_id| *index_id != id);
-        let session = self.sessions.remove(&id)?;
-        self.routes.retain(|_, route| match route {
-            CallerRoute::Direct(caller) => *caller != id,
-            CallerRoute::Group { caller, .. } => *caller != id,
-        });
+        self.resolved_attempts.remove(&id);
+        match &session {
+            CallerSession::Direct(leg) => {
+                self.protocol_failure_index.remove(&(id, 0));
+                self.remove_route(leg.connection.socket_id());
+            }
+            CallerSession::Group(group) => {
+                for member in group.group.members() {
+                    self.protocol_failure_index.remove(&(id, member.id()));
+                    self.remove_route(member.connection().socket_id());
+                }
+            }
+        }
         // Exact removal from the indexed heap: O(log N), no scan, no stale
         // residue. A removed-then-re-added caller gets a fresh heap node;
         // monotonic ids mean the old node can never alias the new one.
@@ -2030,10 +2050,20 @@ impl CallerTable {
 
     /// Fold one relinquished connection's SRT receiver counters into this
     /// table's retired ledger. Called on every retirement path, before the
-    /// connection leaves the table.
+    /// connection leaves the table. Reads the protocol's scalar counters,
+    /// not its buffer-walking statistics, so a retirement costs the same
+    /// whatever the connection's receive window holds.
     fn add_receiver_totals(&mut self, connection: &SrtConnection) {
         self.retired_rcv
-            .observe(connection.receiver_stats().as_ref());
+            .observe_counters(connection.receiver_loss_counters());
+    }
+
+    /// Forget a retiring leg's route. A leg's socket ID is fixed for the
+    /// session's life and routes only ever name the leg that registered
+    /// them, so the route to remove is known exactly.
+    fn remove_route(&mut self, socket_id: u32) {
+        count_work!(RetirementProbes);
+        self.routes.remove(&socket_id);
     }
 
     /// SRT-level receive totals across this table: the retired ledger plus a
@@ -3398,6 +3428,95 @@ mod tests {
         let mut failures = Vec::new();
         table.poll_output_failures(1024, &mut failures);
         assert!(failures.is_empty(), "no records survive their sessions");
+    }
+
+    /// `population` direct callers, each quarantined with an undrained
+    /// failure record and holding one route.
+    fn quarantined_callers(table: &mut CallerTable, population: u32) {
+        for i in 0..population {
+            let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 30_000 + i as u16));
+            table
+                .add_direct(CallerLeg {
+                    peer,
+                    connection: caller_connection(ConnectionOptions {
+                        socket_id: 0x50_000 + i,
+                        ..ConnectionOptions::default()
+                    }),
+                })
+                .expect("admitted");
+        }
+        let mut short = ShortBufferSink {
+            acquisitions: 0,
+            committed: Vec::new(),
+            last_attribution: None,
+            short_by: 8,
+        };
+        let budget = OutputDrainBudget::new(1 << 16, 1 << 16, 1 << 28);
+        let _ = table.poll_outbound_bounded_to(Timestamp::from_micros(10_000), budget, &mut short);
+        assert_eq!(table.output_failures_pending(), population as usize);
+    }
+
+    /// F15: retiring one caller removes its failure, fault and resolution
+    /// entries and its routes by the keys it is known by: one probe per
+    /// index per leg, the same beside 8 or 512 quarantined callers.
+    #[test]
+    fn retiring_a_caller_does_work_independent_of_the_population() {
+        for population in [8, 64, 512] {
+            let mut table = CallerTable::new();
+            quarantined_callers(&mut table, population);
+            let direct = table
+                .add_direct(CallerLeg {
+                    peer: "127.0.0.2:9000".parse().expect("address"),
+                    connection: caller_connection(ConnectionOptions {
+                        socket_id: 0x60_001,
+                        ..ConnectionOptions::default()
+                    }),
+                })
+                .expect("admitted");
+            let group = table
+                .add_group(
+                    srt_proto::handshake::SRTGROUP_MASK | 79,
+                    srt_proto::GroupMode::Broadcast,
+                    [0x60_002, 0x60_003].map(|socket_id| {
+                        CallerGroupLeg::new(
+                            socket_id,
+                            1,
+                            "127.0.0.2:9001".parse().expect("address"),
+                            caller_connection(ConnectionOptions {
+                                socket_id,
+                                ..ConnectionOptions::default()
+                            }),
+                        )
+                    }),
+                )
+                .expect("group admitted");
+            // Quarantine the retiring callers' legs too, so each retirement
+            // has records of its own to take along.
+            let mut short = ShortBufferSink {
+                acquisitions: 0,
+                committed: Vec::new(),
+                last_attribution: None,
+                short_by: 8,
+            };
+            let budget = OutputDrainBudget::new(64, 64, 1 << 20);
+            let _ =
+                table.poll_outbound_bounded_to(Timestamp::from_micros(10_000), budget, &mut short);
+            assert_eq!(table.output_failures_pending(), population as usize + 3);
+
+            let (removed, direct_work) =
+                crate::work::WorkCounters::measure(|| table.remove(direct));
+            assert!(removed.is_some());
+            let (removed, group_work) = crate::work::WorkCounters::measure(|| table.remove(group));
+            assert!(removed.is_some());
+            // Failure, group-fault and resolution queues, then the routes:
+            // one direct leg, then two group legs.
+            assert_eq!(
+                (direct_work.retirement_probes, group_work.retirement_probes),
+                (4, 6),
+                "population {population}"
+            );
+            assert_eq!(table.output_failures_pending(), population as usize);
+        }
     }
 
     /// The index must never exceed the number of live quarantined legs, even

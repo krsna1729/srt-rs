@@ -124,6 +124,7 @@ mod handoff;
 mod high_res_waiter;
 mod id_hash;
 mod indexed_heap;
+mod keyed_queue;
 mod owner_layout;
 mod retirement;
 mod reuseport_group;

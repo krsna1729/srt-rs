@@ -3144,8 +3144,19 @@ impl SrtConnection {
     }
 
     /// Get the receiver's statistics.
+    ///
+    /// Walks the receive buffer (buffered bytes and delivery span), so it
+    /// costs O(packets buffered). [`Self::receiver_loss_counters`] reads the
+    /// cumulative loss and duplicate counts in O(1).
     pub fn receiver_stats(&self) -> Option<crate::srt_receiver::ReceiverStats> {
         self.receiver.as_ref().map(|r| r.stats())
+    }
+
+    /// The receiver's cumulative loss and duplicate counts, in O(1). `None`
+    /// before the connection has a receive direction.
+    #[must_use]
+    pub fn receiver_loss_counters(&self) -> Option<crate::srt_receiver::ReceiverLossCounters> {
+        self.receiver.as_ref().map(|r| r.loss_counters())
     }
 
     /// Return a non-clearing snapshot of cumulative and instantaneous

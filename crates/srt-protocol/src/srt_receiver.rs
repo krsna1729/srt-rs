@@ -2147,6 +2147,18 @@ impl ReceiverBuffer {
         self.total_undecryptable = self.total_undecryptable.saturating_add(1);
     }
 
+    /// The cumulative loss and duplicate counts, read from the counters the
+    /// receiver maintains. O(1): unlike [`Self::stats`], it does not walk
+    /// the receive buffer, so a transport can fold a retiring connection
+    /// into its ledger without work that grows with the window.
+    #[must_use]
+    pub fn loss_counters(&self) -> ReceiverLossCounters {
+        ReceiverLossCounters {
+            total_lost: self.total_lost,
+            total_duplicates: self.total_duplicates,
+        }
+    }
+
     /// Get statistics.
     pub fn stats(&self) -> ReceiverStats {
         // Calculate the packet loss rate (percent * 100).
@@ -2215,6 +2227,16 @@ impl ReceiverBuffer {
             tsbpd_delay_micros: self.tsbpd_delay_us,
         }
     }
+}
+
+/// A receiver's cumulative loss and duplicate counts: the scalar part of
+/// [`ReceiverStats`], available without a buffer walk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReceiverLossCounters {
+    /// Total packets lost; equals [`ReceiverStats::total_lost`].
+    pub total_lost: u64,
+    /// Total duplicate packets; equals [`ReceiverStats::total_duplicates`].
+    pub total_duplicates: u64,
 }
 
 /// Receiver statistics.

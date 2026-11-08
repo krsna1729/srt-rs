@@ -599,9 +599,27 @@ impl RcvTotals {
     /// Crate-internal because it exists so a table can sample live sessions and
     /// its retired ledger through the same rule; the public aggregate surface
     /// stays [`Self::accumulate`] and [`Self::merge`].
+    ///
+    /// The snapshot walks the connection's receive buffer (the work counted
+    /// as receiver-stat entries); a retirement folds
+    /// [`Self::observe_counters`] instead.
     pub(crate) fn observe(&mut self, stats: Option<&srt_proto::receiver::ReceiverStats>) {
         if let Some(stats) = stats {
+            count_work!(ReceiverStatEntries, stats.packets_in_buffer);
             self.accumulate(stats.total_lost, stats.total_duplicates);
+        }
+    }
+
+    /// Fold one connection's loss and duplicate counters in: O(1), with no
+    /// receive-buffer walk, so retiring a session costs the same whatever
+    /// its window holds. `None` (no receive direction yet) contributes
+    /// nothing.
+    pub(crate) fn observe_counters(
+        &mut self,
+        counters: Option<srt_proto::receiver::ReceiverLossCounters>,
+    ) {
+        if let Some(counters) = counters {
+            self.accumulate(counters.total_lost, counters.total_duplicates);
         }
     }
 }

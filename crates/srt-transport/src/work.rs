@@ -19,9 +19,11 @@ pub(crate) enum Counter {
     HeapEntriesVisited,
     HeapEntriesCloned,
     PromotedSlotProbes,
+    RetirementProbes,
+    ReceiverStatEntries,
 }
 
-const COUNTERS: usize = Counter::PromotedSlotProbes as usize + 1;
+const COUNTERS: usize = Counter::ReceiverStatEntries as usize + 1;
 
 thread_local! {
     static WORK: [Cell<u64>; COUNTERS] = const { [const { Cell::new(0) }; COUNTERS] };
@@ -47,6 +49,12 @@ pub(crate) struct WorkCounters {
     pub heap_entries_cloned: u64,
     /// Promoted-socket slots examined for receive readiness or drained.
     pub promoted_slot_probes: u64,
+    /// Index entries a retirement examined or removed to forget one session:
+    /// failure, fault and resolution queue entries and routes.
+    pub retirement_probes: u64,
+    /// Receive-buffer entries walked to sample a connection's receiver
+    /// counters.
+    pub receiver_stat_entries: u64,
 }
 
 impl WorkCounters {
@@ -61,6 +69,8 @@ impl WorkCounters {
                 heap_entries_visited: get(Counter::HeapEntriesVisited),
                 heap_entries_cloned: get(Counter::HeapEntriesCloned),
                 promoted_slot_probes: get(Counter::PromotedSlotProbes),
+                retirement_probes: get(Counter::RetirementProbes),
+                receiver_stat_entries: get(Counter::ReceiverStatEntries),
             }
         })
     }
@@ -75,6 +85,8 @@ impl WorkCounters {
             heap_entries_visited: now.heap_entries_visited - before.heap_entries_visited,
             heap_entries_cloned: now.heap_entries_cloned - before.heap_entries_cloned,
             promoted_slot_probes: now.promoted_slot_probes - before.promoted_slot_probes,
+            retirement_probes: now.retirement_probes - before.retirement_probes,
+            receiver_stat_entries: now.receiver_stat_entries - before.receiver_stat_entries,
         }
     }
 

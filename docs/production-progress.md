@@ -771,14 +771,24 @@ population or the arena size. Each is now bounded per call.
   a ready queue filled by per-socket wakers instead of walking every promoted
   slot each wait and visit. A retired socket leaves at most one stale entry,
   skipped once.
+- Retirement (F15). Detaching a listener peer, a bonded group or a caller
+  session removes its failure, fault and resolution entries and its caller
+  routes by their exact keys, a constant number per leg: the failure, fault
+  and resolution indexes are keyed FIFOs (O(log n) removal), and routes are
+  removed by each leg's own socket ID. The retired-counter ledger reads the
+  protocol's scalar loss and duplicate counters, not `receiver_stats`, which
+  walks the receive buffer. These used to be a `retain` over every other
+  session's entries plus an O(window) buffer walk. The caller table's stale
+  ready-queue compaction stays amortized: it runs only once stale entries
+  outnumber live sessions three to one, so it is O(1) per push or detach, and
+  a keyed queue there would tax every `enqueue_ready` on the data path.
 
-Not yet bounded: detach paths still filter the failure and caller-route
-queues and sample `receiver_stats` (F15), and the key-derivation limiter
-prunes its source map with a full `retain` past its threshold (F18). Both run
-once per session lifecycle or per pruning threshold, not per steady-state
-datagram.
+Not yet bounded: the key-derivation limiter prunes its source map with a full
+`retain` past its threshold (F18). It runs once per pruning threshold, not per
+steady-state datagram.
 
 Evidence. `WorkCounters` (unit tests only) count arena slot probes, route
-index probes, heap entries visited or cloned, and promoted slot probes. Each
-finding has a test at three sizes; before/after counts and mutations are in
-each commit message.
+index probes, heap entries visited or cloned, promoted slot probes,
+retirement index probes and receiver-stat entries walked. Each finding has a
+test at three sizes; before/after counts and mutations are in each commit
+message.

@@ -1057,7 +1057,7 @@ pub struct PeerTable {
     /// quarantine, so its length cannot exceed the quarantined population and
     /// there is no capacity to overflow: a quarantined peer's retirement token
     /// is always discoverable.
-    protocol_failure_index: VecDeque<PeerFailureKey>,
+    protocol_failure_index: crate::keyed_queue::KeyedQueue<PeerFailureKey>,
     /// Reusable per-pass scratch for records produced by the peer drain paths
     /// before they are stored on the peer/leg they belong to.
     protocol_failure_scratch: Vec<ProtocolOutputFailure>,
@@ -1253,7 +1253,7 @@ impl PeerTable {
             established_peers: 0,
             window_memory_bytes: 0,
             retired_protocols: crate::retirement::RetiredProtocols::new(config.max_peers),
-            protocol_failure_index: VecDeque::new(),
+            protocol_failure_index: crate::keyed_queue::KeyedQueue::default(),
             protocol_failure_scratch: Vec::new(),
             half_open_deadlines: DueIndex::default(),
             key_derivations_due_micros: 0,
@@ -4264,11 +4264,14 @@ impl PeerTable {
         let slot_idx = self.slot_index_for_key(&peer)?;
         // A retired peer takes its undrained failure record with it, so the
         // index entry must go too: otherwise churn (fault, retire, repeat)
-        // accumulates keys for peers that no longer exist.
-        self.protocol_failure_index.retain(|key| match key {
-            PeerFailureKey::Direct(slot_id) => slot_id.slot_idx as usize != slot_idx,
-            PeerFailureKey::Group { .. } => true,
-        });
+        // accumulates keys for peers that no longer exist. The key is exact
+        // (slot and current generation), so this is one keyed removal, not
+        // a pass over every other peer's record.
+        self.protocol_failure_index
+            .remove(&PeerFailureKey::Direct(PeerSlotId {
+                slot_idx: slot_idx as u32,
+                generation: self.slots.slot_generation(slot_idx),
+            }));
         self.purge_physical_indexes(peer);
         let slot = if relocating {
             self.slots.lend_by_slot(slot_idx)?
@@ -4307,12 +4310,6 @@ impl PeerTable {
     }
 
     fn detach_group(&mut self, key: srt_lifecycle::LogicalGroupKey) -> Option<InboundGroup> {
-        // Purge this group's index entries with the group itself; see
-        // `remove_direct`.
-        self.protocol_failure_index.retain(|entry| match entry {
-            PeerFailureKey::Group { key: ready, .. } => ready.key != key,
-            PeerFailureKey::Direct(_) => true,
-        });
         let group = self.groups.remove(&key)?;
         self.logical_peers.remove(&group.logical_peer);
         let token = GroupReadyKey {
@@ -4320,6 +4317,12 @@ impl PeerTable {
             generation: group.generation,
         };
         for (member_id, leg) in &group.legs {
+            // Purge each leg's failure record with the group itself, by its
+            // exact key; see `detach_direct`.
+            self.protocol_failure_index.remove(&PeerFailureKey::Group {
+                key: token.clone(),
+                member: *member_id,
+            });
             self.group_deadlines.remove(&GroupDeadlineKey {
                 group: token.clone(),
                 member_id: *member_id,
@@ -4366,10 +4369,12 @@ impl PeerTable {
 
     /// Fold one relinquished connection's SRT receiver counters into this
     /// table's retired ledger. Called on every retirement path, before the
-    /// connection leaves the table.
+    /// connection leaves the table. Reads the protocol's scalar counters,
+    /// not its buffer-walking statistics, so a retirement costs the same
+    /// whatever the connection's receive window holds.
     fn add_receiver_totals(&mut self, connection: &SrtConnection) {
         self.retired_rcv
-            .observe(connection.receiver_stats().as_ref());
+            .observe_counters(connection.receiver_loss_counters());
     }
 
     /// SRT-level receive totals across this table: the retired ledger plus a
@@ -7027,6 +7032,193 @@ pub(crate) mod tests {
             let physical = table.physical_for_address(peer).expect("physical peer");
             table.remove_physical(physical).expect("retired");
             assert_eq!(table.output_failures_pending(), 0, "round {round}: purged");
+        }
+    }
+
+    /// `population` established peers, each quarantined with an undrained
+    /// failure record.
+    fn quarantined_peers(table: &mut PeerTable, population: u16, telemetry: &IngressTelemetry) {
+        let options = AdmissionOptions::basic(0x9600, 20, false);
+        for i in 0..population {
+            let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 30_000 + i));
+            established_peer_with_queued_output(
+                table,
+                peer,
+                0x9600 + u32::from(i),
+                &options,
+                telemetry,
+            );
+        }
+        let mut short = ShortPeerSink {
+            committed: Vec::new(),
+            attributions: Vec::new(),
+            short_by: 8,
+            failing: None,
+        };
+        let budget = OutputDrainBudget::new(1 << 16, 1 << 16, 1 << 28);
+        let _ =
+            table.poll_outbound_bounded_to(Timestamp::from_micros(3_000_000), budget, &mut short);
+        assert_eq!(table.output_failures_pending(), usize::from(population));
+    }
+
+    /// One established peer holding `window` DATA packets in its receive
+    /// buffer: the caller's first packet never arrives, so every later one
+    /// waits behind the gap.
+    fn peer_buffering(
+        table: &mut PeerTable,
+        peer: std::net::SocketAddr,
+        window: usize,
+        telemetry: &IngressTelemetry,
+    ) -> LogicalPeerId {
+        let options = AdmissionOptions::basic(0x9700, 120, false);
+        let (mut caller, conclusion) =
+            admit_up_to_conclusion(table, peer, 0x9701, &options, telemetry);
+        admit_conclusion(table, peer, &mut caller, &conclusion, &options, telemetry);
+        let now = Timestamp::from_micros(4);
+        let mut data = Vec::new();
+        for _ in 0..=window {
+            caller.send(b"buffered", now).expect("caller sends");
+            while let Some(output) = caller.poll_output().expect("output materializes") {
+                if let ConnectionOutput::SendPacket(packet) = output
+                    && packet[0] & 0x80 == 0
+                {
+                    data.push(packet);
+                }
+            }
+        }
+        for packet in &data[1..] {
+            let admitted = table.admit(peer, packet, now, &options, 0, 1, telemetry);
+            assert_eq!(admitted, Admit::Fed);
+        }
+        let slot_idx = table.peer_slot_index_for_test(peer).expect("peer slot");
+        let entry = table
+            .direct_peer_mut_for_test(slot_idx)
+            .expect("direct peer");
+        let buffered = entry
+            .conn
+            .receiver_stats()
+            .expect("receiver")
+            .packets_in_buffer;
+        assert_eq!(buffered as usize, window, "packets held behind the gap");
+        entry.logical_peer
+    }
+
+    /// F15: retiring one peer forgets its failure record and routes by the
+    /// keys it is known by and folds its receive counters from scalars, so
+    /// the work is the same whether 8 or 512 other peers hold failure
+    /// records and whether the retiring peer buffers 4 or 512 packets.
+    #[test]
+    fn retiring_a_peer_does_work_independent_of_population_and_window() {
+        for (population, window) in [(8, 4), (64, 64), (512, 512)] {
+            let telemetry = IngressTelemetry::new();
+            let mut table = PeerTable::new();
+            quarantined_peers(&mut table, population, &telemetry);
+            let peer = std::net::SocketAddr::from(([127, 0, 0, 2], 40_000));
+            let logical = peer_buffering(&mut table, peer, window, &telemetry);
+            let before = table.receiver_totals();
+
+            let (removed, work) = crate::work::WorkCounters::measure(|| table.remove(logical));
+            assert!(removed.is_some(), "the peer is retired");
+            assert_eq!(
+                (work.retirement_probes, work.receiver_stat_entries),
+                (1, 0),
+                "population {population}, window {window}: one keyed removal, no buffer walk"
+            );
+            assert_eq!(
+                table.receiver_totals(),
+                before,
+                "its counters stay in the ledger"
+            );
+            assert_eq!(table.output_failures_pending(), usize::from(population));
+        }
+    }
+
+    /// A one-leg bonded group whose leg is quarantined with its failure key
+    /// indexed, as the group drain leaves it.
+    fn quarantined_group(table: &mut PeerTable) -> srt_lifecycle::LogicalGroupKey {
+        let address: std::net::SocketAddr = "127.0.0.3:9300".parse().expect("address");
+        let (physical, slot_idx) = insert_test_peer(table, address, 0);
+        let key = srt_lifecycle::LogicalGroupKey {
+            group_id: 3,
+            stream_id: None,
+        };
+        let mut group = srt_proto::SrtGroup::new(
+            srt_proto::handshake::SRTGROUP_MASK | 3,
+            srt_proto::GroupMode::Broadcast,
+        )
+        .expect("valid group");
+        let connection = SrtConnection::new_listener(ConnectionOptions::default());
+        table.window_memory_bytes += connection.window_memory_bound_bytes();
+        group.add_member(1, 1, connection).expect("member added");
+        if let Some(slot) = table.slots.get_by_slot_mut(slot_idx) {
+            *slot.value = PeerSlotTarget::GroupLeg(GroupMemberHandle {
+                key: key.clone(),
+                member_id: 1,
+            });
+        }
+        table.sync_route(slot_idx);
+        let leg = InboundGroupLeg {
+            output_faulted: true,
+            output_failure: None,
+            physical,
+            timers: ManualTimerStore::new(),
+            pending_outputs: VecDeque::new(),
+        };
+        let logical_peer = table.allocate_logical_peer(LogicalPeerTarget::Group(key.clone()));
+        let generation = table.allocate_group_generation();
+        table.groups.insert(
+            key.clone(),
+            InboundGroup {
+                group,
+                legs: HashMap::from([(1, leg)]),
+                leg_order: vec![1],
+                ready_legs: VecDeque::new(),
+                ready_legs_queued: HashSet::new(),
+                representative_peer: address,
+                logical_peer,
+                generation,
+                connected: true,
+                stream_deadline: None,
+                ever_connected: true,
+                data_events: 0,
+                last_data_at: Instant::now(),
+                torn_down: false,
+                logical_payloads_received: 0,
+                logical_payload_bytes_received: 0,
+                logical_payloads_sent: 0,
+                logical_payload_bytes_sent: 0,
+            },
+        );
+        table
+            .protocol_failure_index
+            .push_back(PeerFailureKey::Group {
+                key: GroupReadyKey {
+                    key: key.clone(),
+                    generation,
+                },
+                member: 1,
+            });
+        key
+    }
+
+    /// F15, bonded: retiring a group removes each leg's failure key by its
+    /// exact key, whatever the number of other quarantined peers.
+    #[test]
+    fn retiring_a_group_removes_its_failure_keys_without_a_population_pass() {
+        for population in [8, 64, 512] {
+            let telemetry = IngressTelemetry::new();
+            let mut table = PeerTable::new();
+            quarantined_peers(&mut table, population, &telemetry);
+            let key = quarantined_group(&mut table);
+            assert_eq!(table.output_failures_pending(), usize::from(population) + 1);
+
+            let (removed, work) = crate::work::WorkCounters::measure(|| table.remove_group(key));
+            assert!(removed.is_some(), "the group is retired");
+            assert_eq!(
+                work.retirement_probes, 1,
+                "population {population}: one per leg"
+            );
+            assert_eq!(table.output_failures_pending(), usize::from(population));
         }
     }
 
