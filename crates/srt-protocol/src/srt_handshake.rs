@@ -65,11 +65,10 @@ pub const IP_UDP_HEADER_SIZE_IPV6: u32 = 48;
 ///
 /// The handshake MSS field is an IP-layer MTU, so turning it into an SRT
 /// datagram budget needs the path's IP + UDP header size. The handshake
-/// itself does not say which family the path uses (its peer-address field is
-/// advisory: this implementation writes the unspecified IPv4 address there,
-/// and libsrt's own `MinimumMSS` keys off the socket's `peer.family()`, not
-/// that field), so the transport, which knows the socket address, sets it
-/// with `SrtConnection::set_ip_family`.
+/// itself does not say which family the path uses (libsrt's own `MinimumMSS`
+/// keys off the socket's `peer.family()`, not the peer-IP field), so the
+/// transport, which knows the socket address, sets it with
+/// `SrtConnection::set_peer_address`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum IpFamily {
     /// IPv4 path (28 bytes of IP + UDP). The default when unset.
@@ -1158,40 +1157,46 @@ pub struct HsExtensionData {
     pub send_tsbpd_delay: u16,
 }
 
-/// Parse a peer IP.
-fn parse_peer_ip(bytes: &[u8]) -> IpAddr {
-    if bytes.len() < 16 {
-        return IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+/// libsrt copies an address into four native 32-bit words
+/// (`CIPAddress::ntop`, `common.cpp:162-175`) and byte-swaps every control
+/// word onto the wire (`CPacket::toNetworkByteOrder`, `packet.cpp:435-446`),
+/// so on the little-endian hosts it runs on each 4-byte group of the
+/// address arrives reversed: 192.0.2.1 is sent as `01 02 00 c0`.
+fn swap_peer_ip_words(bytes: [u8; 16]) -> [u8; 16] {
+    let mut swapped = [0u8; 16];
+    for (out, word) in swapped.chunks_exact_mut(4).zip(bytes.chunks_exact(4)) {
+        out.copy_from_slice(&[word[3], word[2], word[1], word[0]]);
     }
+    swapped
+}
 
-    // IPv4 case: the first 4 bytes are the IP, the rest are 0.
-    let is_ipv4 = bytes[4..16].iter().all(|&b| b == 0);
-
-    if is_ipv4 {
+/// Parse a peer IP in libsrt's layout ([`swap_peer_ip_words`]).
+fn parse_peer_ip(bytes: &[u8]) -> IpAddr {
+    let Some(wire) = bytes.get(..16).and_then(|b| <[u8; 16]>::try_from(b).ok()) else {
+        return IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+    };
+    let octets = swap_peer_ip_words(wire);
+    // IPv4 case: the first word is the IP, the rest are 0.
+    if octets[4..].iter().all(|&b| b == 0) {
         IpAddr::V4(std::net::Ipv4Addr::new(
-            bytes[0], bytes[1], bytes[2], bytes[3],
+            octets[0], octets[1], octets[2], octets[3],
         ))
     } else {
-        let mut octets = [0u8; 16];
-        octets.copy_from_slice(bytes);
         IpAddr::V6(std::net::Ipv6Addr::from(octets))
     }
 }
 
-/// Encode a peer IP.
+/// Encode a peer IP in libsrt's layout ([`swap_peer_ip_words`]).
 fn encode_peer_ip(ip: &IpAddr, buf: &mut Vec<u8>) {
-    match ip {
+    let octets = match ip {
         IpAddr::V4(ipv4) => {
-            write_bytes(buf, &ipv4.octets());
-            // The remaining 12 bytes are 0.
-            for _ in 0..12 {
-                write_u8(buf, 0);
-            }
+            let mut octets = [0u8; 16];
+            octets[..4].copy_from_slice(&ipv4.octets());
+            octets
         }
-        IpAddr::V6(ipv6) => {
-            write_bytes(buf, &ipv6.octets());
-        }
-    }
+        IpAddr::V6(ipv6) => ipv6.octets(),
+    };
+    write_bytes(buf, &swap_peer_ip_words(octets));
 }
 
 /// Handshake state.
@@ -1546,6 +1551,30 @@ pub fn peek_handshake(datagram: &[u8]) -> Option<HandshakePacket> {
 mod tests {
     use super::*;
     use crate::crypto_impl::KeyFlag;
+
+    /// The peer-IP field uses libsrt's layout on its little-endian hosts:
+    /// each 32-bit word of the address byte-reversed (`CIPAddress::ntop`
+    /// then `CPacket::toNetworkByteOrder`).
+    #[test]
+    fn peer_ip_uses_libsrts_word_swapped_layout() {
+        let cases: [(IpAddr, [u8; 16]); 2] = [
+            (
+                "192.0.2.1".parse().unwrap(),
+                [1, 2, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            ),
+            (
+                "2001:db8::1".parse().unwrap(),
+                [0xb8, 0x0d, 0x01, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
+            ),
+        ];
+        for (ip, wire) in cases {
+            let mut handshake = HandshakePacket::new_induction_request(1);
+            handshake.peer_ip = ip;
+            let packet = handshake.encode(0, 0);
+            assert_eq!(packet.control_info[32..48], wire, "{ip}");
+            assert_eq!(HandshakePacket::decode(&packet).unwrap().peer_ip, ip);
+        }
+    }
 
     /// Deterministic fixture salt for wire-format tests.
     ///

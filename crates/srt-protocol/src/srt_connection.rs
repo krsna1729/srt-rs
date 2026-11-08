@@ -783,6 +783,9 @@ pub struct SrtConnection {
     /// Address family of the UDP path, set by the transport; it turns the
     /// peer's IP-layer MSS into a datagram budget.
     ip_family: IpFamily,
+    /// The peer's IP, set by the transport and emitted in this side's
+    /// handshakes' peer-IP field, as libsrt does (`core.cpp:3782`, `6011`).
+    peer_ip: std::net::IpAddr,
 
     /// Event queue.
     event_queue: VecDeque<ConnectionEvent>,
@@ -1317,6 +1320,7 @@ impl SrtConnection {
             assembler: MessageAssembler::new(),
             max_payload_size: DEFAULT_MTU as usize - SRT_HEADER_SIZE,
             ip_family: IpFamily::V4,
+            peer_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             event_queue: VecDeque::new(),
             key_refresh_notified: false,
             pending_data_events: 0,
@@ -1374,6 +1378,7 @@ impl SrtConnection {
             assembler: MessageAssembler::new(),
             max_payload_size: DEFAULT_MTU as usize - SRT_HEADER_SIZE,
             ip_family: IpFamily::V4,
+            peer_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             event_queue: VecDeque::new(),
             key_refresh_notified: false,
             pending_data_events: 0,
@@ -1640,22 +1645,27 @@ impl SrtConnection {
         Ok(())
     }
 
+    /// Set the peer's UDP address.
+    ///
+    /// The transport knows the socket address; the handshake does not carry
+    /// the path family reliably. It must be set before the peer's CONCLUSION
+    /// is processed, because that is where the peer MSS becomes this
+    /// connection's datagram budget. Its IP is emitted in this side's
+    /// handshakes' peer-IP field, which a libsrt peer records as its own
+    /// local address (`srt_getsockname` on an accepted socket, the group
+    /// member's `agent`; `core.cpp:4983`, `6055-6057`, `api.cpp:798-805`).
+    /// Unset, the path is taken to be IPv4 and the field is `0.0.0.0`.
+    pub fn set_peer_address(&mut self, peer: std::net::SocketAddr) {
+        self.ip_family = IpFamily::of(&peer);
+        self.peer_ip = peer.ip();
+    }
+
     /// Configure retry spacing and the deadline for the whole handshake.
     ///
     /// Jitter is added only after `retry_interval_micros`, so a retry is
     /// never scheduled earlier than the requested cadence. Both values are
     /// clamped to at least one microsecond and the whole-attempt timeout is
     /// clamped to at least the retry interval.
-    /// Set the address family of this connection's UDP path.
-    ///
-    /// The transport knows the socket address; the handshake does not carry
-    /// the path family reliably. It must be set before the peer's CONCLUSION
-    /// is processed, because that is where the peer MSS becomes this
-    /// connection's datagram budget. Unset, the path is taken to be IPv4.
-    pub fn set_ip_family(&mut self, family: IpFamily) {
-        self.ip_family = family;
-    }
-
     pub fn set_handshake_timing(&mut self, retry_interval_micros: u64, timeout_micros: u64) {
         self.handshake_retry_interval_micros = retry_interval_micros.max(1);
         self.handshake_timeout_micros = timeout_micros
@@ -4815,6 +4825,7 @@ impl SrtConnection {
         let mut hs = HandshakePacket::new_induction_request(self.options.socket_id);
         hs.initial_packet_seq = self.initial_seq;
         hs.flow_window = self.flight_capacity_packets();
+        hs.peer_ip = self.peer_ip;
         let pkt = hs.encode(self.relative_timestamp(now), 0);
         self.queue_handshake_control_packet(pkt, now);
     }
@@ -4944,6 +4955,7 @@ impl SrtConnection {
         );
         hs.initial_packet_seq = request_isn;
         hs.flow_window = self.flight_capacity_packets();
+        hs.peer_ip = self.peer_ip;
         let pkt = hs.encode(self.relative_timestamp(now), self.peer_socket_id);
         self.queue_handshake_control_packet(pkt, now);
     }
@@ -5037,6 +5049,7 @@ impl SrtConnection {
         }
 
         // A CONCLUSION request is sent with dest_socket_id = 0 (libsrt compatibility).
+        hs.peer_ip = self.peer_ip;
         let pkt = hs.encode(self.relative_timestamp(now), 0);
         self.queue_handshake_control_packet(pkt, now);
         Ok(())
@@ -5080,6 +5093,7 @@ impl SrtConnection {
             hs.add_group_extension(group);
         }
 
+        hs.peer_ip = self.peer_ip;
         let pkt = hs.encode(self.relative_timestamp(now), self.peer_socket_id);
         self.queue_handshake_control_packet(pkt, now);
     }
@@ -5108,6 +5122,7 @@ impl SrtConnection {
         {
             hs.add_group_extension(group);
         }
+        hs.peer_ip = self.peer_ip;
         let packet = hs.encode(self.relative_timestamp(now), self.peer_socket_id);
         self.queue_handshake_control_packet(packet, now);
         self.terminate_handshake();
@@ -5810,6 +5825,52 @@ mod tests {
             rtt_before,
             "RTT sampled"
         );
+    }
+
+    /// Each handshake carries the peer's IP the transport set, as libsrt's
+    /// do (`core.cpp:3782`, `6011`); a libsrt peer records it as its own
+    /// local address (`core.cpp:4983`, `6055-6057`). A listener requiring a
+    /// passphrase answers the unencrypted caller with a KM failure response.
+    #[test]
+    fn handshakes_carry_the_peer_ip_the_transport_set() {
+        let listener_address: std::net::SocketAddr = "192.0.2.1:9000".parse().unwrap();
+        let caller_address: std::net::SocketAddr = "[2001:db8::2]:5000".parse().unwrap();
+        for passphrase in [None, Some("peer-ip-passphrase".into())] {
+            let mut caller = SrtConnection::new_caller(ConnectionOptions::default());
+            caller.set_peer_address(listener_address);
+            let mut listener = SrtConnection::new_listener(ConnectionOptions {
+                passphrase,
+                ..listener_options()
+            });
+            listener.set_peer_address(caller_address);
+
+            let now = Timestamp::from_micros(1_000);
+            caller.connect(Timestamp::from_micros(0)).unwrap();
+            let induction = next_wire(&mut caller);
+            listener.feed_recv_buf(&induction, now).unwrap();
+            let induction_response = next_wire(&mut listener);
+            caller.feed_recv_buf(&induction_response, now).unwrap();
+            let conclusion = next_wire(&mut caller);
+            // The passphrase listener refuses with its KM failure response.
+            let _ = listener.feed_recv_buf(&conclusion, now);
+            let conclusion_response = next_wire(&mut listener);
+            for (name, wire, ip) in [
+                ("induction", induction, listener_address.ip()),
+                (
+                    "induction response",
+                    induction_response,
+                    caller_address.ip(),
+                ),
+                ("conclusion", conclusion, listener_address.ip()),
+                (
+                    "conclusion response",
+                    conclusion_response,
+                    caller_address.ip(),
+                ),
+            ] {
+                assert_eq!(decode_handshake(&wire).0.peer_ip, ip, "{name}");
+            }
+        }
     }
 
     #[test]
@@ -10137,10 +10198,18 @@ mod tests {
         );
     }
 
+    /// A documentation-range peer address on `family`'s path.
+    fn path_address(family: IpFamily) -> std::net::SocketAddr {
+        match family {
+            IpFamily::V4 => "192.0.2.1:9000".parse().unwrap(),
+            IpFamily::V6 => "[2001:db8::1]:9000".parse().unwrap(),
+        }
+    }
+
     /// One handshake attempt in which the caller and the listener advertise
     /// `caller_mss` and `listener_mss` instead of their constructor defaults,
     /// and both connections are told their path is `family`, as a transport
-    /// does from its socket address (`SrtConnection::set_ip_family`).
+    /// does from its socket address (`SrtConnection::set_peer_address`).
     struct MssHandshake {
         caller: SrtConnection,
         listener: SrtConnection,
@@ -10319,8 +10388,8 @@ mod tests {
     ) -> MssHandshake {
         let mut caller = SrtConnection::new_caller(caller_options);
         let mut listener = SrtConnection::new_listener(listener_options);
-        caller.set_ip_family(caller_rewrite.family);
-        listener.set_ip_family(listener_rewrite.family);
+        caller.set_peer_address(path_address(caller_rewrite.family));
+        listener.set_peer_address(path_address(listener_rewrite.family));
         caller
             .connect(Timestamp::from_micros(0))
             .expect("caller starts");
@@ -10683,7 +10752,7 @@ mod tests {
                 socket_id: 1,
                 ..ConnectionOptions::default()
             });
-            caller.set_ip_family(v4);
+            caller.set_peer_address(path_address(v4));
             caller
                 .connect(Timestamp::from_micros(0))
                 .expect("caller starts");
@@ -10692,7 +10761,7 @@ mod tests {
             malformed.flow_window = Some(flow_window);
             let invalid_request = rewrite_handshake(&request, &malformed);
             let mut listener = SrtConnection::new_listener(listener_options());
-            listener.set_ip_family(v4);
+            listener.set_peer_address(path_address(v4));
             let error = listener
                 .feed_recv_buf(&invalid_request, Timestamp::from_micros(1_000))
                 .expect_err("unusable signed flow window is rejected");
@@ -10718,13 +10787,13 @@ mod tests {
             socket_id: 1,
             ..ConnectionOptions::default()
         });
-        caller.set_ip_family(v4);
+        caller.set_peer_address(path_address(v4));
         caller
             .connect(Timestamp::from_micros(0))
             .expect("caller starts");
         let request = take_one_rewritten_handshake(&mut caller, &plain);
         let mut listener = SrtConnection::new_listener(listener_options());
-        listener.set_ip_family(v4);
+        listener.set_peer_address(path_address(v4));
         listener
             .feed_recv_buf(&request, Timestamp::from_micros(1_000))
             .expect("listener accepts induction");
@@ -10802,13 +10871,13 @@ mod tests {
             socket_id: 1,
             ..ConnectionOptions::default()
         });
-        caller.set_ip_family(v4);
+        caller.set_peer_address(path_address(v4));
         caller
             .connect(Timestamp::from_micros(0))
             .expect("caller starts");
         let request = take_one_rewritten_handshake(&mut caller, &plain);
         let mut listener = SrtConnection::new_listener(listener_options());
-        listener.set_ip_family(v4);
+        listener.set_peer_address(path_address(v4));
         listener
             .feed_recv_buf(&request, Timestamp::from_micros(1_000))
             .expect("listener accepts induction");
@@ -10826,13 +10895,13 @@ mod tests {
             socket_id: 1,
             ..ConnectionOptions::default()
         });
-        caller.set_ip_family(v4);
+        caller.set_peer_address(path_address(v4));
         caller
             .connect(Timestamp::from_micros(0))
             .expect("caller starts");
         let request = take_one_rewritten_handshake(&mut caller, &plain);
         let mut listener = SrtConnection::new_listener(listener_options());
-        listener.set_ip_family(v4);
+        listener.set_peer_address(path_address(v4));
         listener
             .feed_recv_buf(&request, Timestamp::from_micros(1_000))
             .expect("listener accepts induction");

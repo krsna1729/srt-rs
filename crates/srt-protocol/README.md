@@ -231,6 +231,11 @@ Packets carry what libsrt 1.5.7 emits:
   message (`MN_XSIZE`). A libsrt receiver reassembles it, but its
   application must read with a buffer that holds the whole message, or the
   message arrives truncated. See VENDOR.md, "Message reassembly and DROPREQ".
+- The handshake peer-IP field carries the peer's IP, as libsrt's does; a
+  libsrt peer reports it as its own local address. Transports set it with
+  `SrtConnection::set_peer_address(SocketAddr)`, which replaces
+  `set_ip_family` and also sets the path family. The field uses libsrt's
+  layout: each 4-byte group of the address byte-reversed.
 
 ## Testing
 
