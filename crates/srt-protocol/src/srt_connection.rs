@@ -5686,6 +5686,7 @@ mod tests {
     };
     const SEQUENCE_MASK: u32 = 0x7FFF_FFFF;
     use crate::srt_sender::MAX_NAK_POSITIONS_PER_VISIT;
+    use crate::test_support::WorkCounters;
 
     /// Deterministic, non-secret KM salt for protocol test fixtures.
     fn test_km_salt() -> [u8; 16] {
@@ -8503,7 +8504,6 @@ mod tests {
                   outside Miri. Run in the miri-extended scheduled job."
     )]
     fn a_non_advancing_ack_does_not_rescan_queued_output() {
-        use crate::test_support::work::WorkCounters;
         let mut results = Vec::new();
         for window in WORK_BOUND_WINDOWS {
             let (mut caller, _listener) = connected_pair_with_window(window);
@@ -8558,6 +8558,209 @@ mod tests {
         for (window, queued, duplicates, advance) in results {
             assert_eq!(duplicates, 0, "window {window}");
             assert!(advance <= queued + 1, "window {window}");
+        }
+    }
+
+    /// A connected sender at `window` with `window - queued` packets
+    /// submitted and `queued` more accepted but still in the output queue.
+    fn sender_with_flight_and_queue(window: u32, queued: u32, now: Timestamp) -> SrtConnection {
+        let (mut caller, _listener) = connected_pair_with_window(window);
+        let mut datagram = [0u8; 1_500];
+        let mut sent = 0;
+        while sent < window - queued {
+            let burst = (window - queued - sent).min(4_096);
+            for _ in 0..burst {
+                caller.send(b"payload", now).expect("the window is open");
+            }
+            while caller
+                .poll_output_into(&mut datagram)
+                .expect("output materializes")
+                .is_some()
+            {}
+            sent += burst;
+        }
+        for _ in 0..queued {
+            caller.send(b"payload", now).expect("the window is open");
+        }
+        caller
+    }
+
+    /// One send-side entry point the bounded-work proptest drives, with
+    /// span-relative arguments (fractions in 1/65,536ths).
+    #[derive(Debug, Clone)]
+    enum SendWorkAction {
+        Send { share: u16 },
+        Poll { share: u16 },
+        DuplicateAck,
+        StaleAck { behind: u16 },
+        Ack { ahead: u16 },
+        Nak { at: u16, width: u16, overlap: bool },
+        Tick { timer: u8, elapsed: u32 },
+    }
+
+    fn send_work_action() -> impl proptest::strategy::Strategy<Value = SendWorkAction> {
+        use proptest::prelude::*;
+        let width = prop_oneof![Just(0u16), Just(u16::MAX), any::<u16>()];
+        prop_oneof![
+            2 => any::<u16>().prop_map(|share| SendWorkAction::Send { share }),
+            2 => any::<u16>().prop_map(|share| SendWorkAction::Poll { share }),
+            2 => Just(SendWorkAction::DuplicateAck),
+            1 => any::<u16>().prop_map(|behind| SendWorkAction::StaleAck { behind }),
+            2 => (0..4_096u16).prop_map(|ahead| SendWorkAction::Ack { ahead }),
+            4 => (any::<u16>(), width, any::<bool>())
+                .prop_map(|(at, width, overlap)| SendWorkAction::Nak { at, width, overlap }),
+            3 => (0..3u8, 0..400_000u32)
+                .prop_map(|(timer, elapsed)| SendWorkAction::Tick { timer, elapsed }),
+        ]
+    }
+
+    /// `fraction` (in 1/65,536ths) of `span`.
+    fn span_share(span: u32, fraction: u16) -> u32 {
+        ((u64::from(span) * u64::from(fraction)) >> 16) as u32
+    }
+
+    /// Per-call work limits every send-side entry point stays within at
+    /// every window: one purge of the bounded output queue (and an ACKACK
+    /// queued ahead of it); one retransmission visit's pops, one ACK or
+    /// tick's compaction step and two checks per position one NAK visit
+    /// queues; one NAK visit's positions (a report that validates within
+    /// the visit is also committed in it); `MAX_DROPREQ_PER_NAK` DROPREQs
+    /// per report a visit finishes; one RTO candidate step.
+    const SEND_OUTPUT_LIMIT: u64 = MAX_OUTPUT_QUEUE_ACTIONS as u64 + 1;
+    const SEND_LIST_LIMIT: u64 = (MAX_RETRANSMITS_PER_VISIT
+        * crate::srt_sender::MAX_STALE_RETRANSMITS_SKIPPED_PER_POP
+        + crate::srt_sender::STALE_RETRANSMITS_CHECKED_PER_CALL
+        + crate::srt_sender::STALE_RETRANSMITS_CHECKED_PER_PUSH
+            * MAX_NAK_POSITIONS_PER_VISIT as usize) as u64;
+    const SEND_NAK_LIMIT: u64 = 2 * MAX_NAK_POSITIONS_PER_VISIT as u64;
+    const SEND_DROPREQ_LIMIT: u64 =
+        (crate::srt_sender::MAX_DROPREQ_PER_NAK * MAX_NAK_POSITIONS_PER_VISIT as usize) as u64;
+    /// Binary-search steps over at most a window of drop records, per
+    /// position one visit validates.
+    const SEND_RECORD_LIMIT: u64 = 17 * MAX_NAK_POSITIONS_PER_VISIT as u64;
+
+    /// Send up to `count` packets, keeping the output queue clear of its
+    /// overflow limit.
+    fn send_up_to(conn: &mut SrtConnection, count: u32, now: Timestamp) {
+        let room = (MAX_OUTPUT_QUEUE_ACTIONS - 512).saturating_sub(conn.output_queue.len());
+        for _ in 0..(count as usize).min(room) {
+            if conn.send(b"payload", now).is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Poll up to `count` outputs.
+    fn poll_up_to(conn: &mut SrtConnection, count: u32) {
+        for _ in 0..count {
+            if conn.poll_output().expect("output materializes").is_none() {
+                return;
+            }
+        }
+    }
+
+    /// The loss list a NAK action names inside the submitted span
+    /// `oldest..oldest + span`: one range, or three overlapping ones.
+    fn work_nak_ranges(oldest: u32, span: u32, at: u16, width: u16, overlap: bool) -> Vec<u32> {
+        let last_offset = span.saturating_sub(1);
+        let first = span_share(last_offset, at);
+        let last = first + span_share(last_offset - first, width);
+        let (first, last) = (oldest.wrapping_add(first), oldest.wrapping_add(last));
+        let middle = first.wrapping_add(last.wrapping_sub(first) / 2);
+        let ranges = if overlap {
+            vec![first, middle, first, last, middle, middle]
+        } else {
+            vec![first, last]
+        };
+        ranges.into_iter().map(|s| s & SEQUENCE_MASK).collect()
+    }
+
+    /// Apply one action and return the work it did.
+    fn apply_send_work_action(
+        conn: &mut SrtConnection,
+        action: &SendWorkAction,
+        window: u32,
+        clock: &mut u64,
+    ) -> WorkCounters {
+        let socket_id = conn.socket_id();
+        let sender = conn.sender.as_ref().expect("connected sender");
+        let oldest = sender.oldest_unacked_sequence();
+        let span = sender.max_justified_ack_position().wrapping_sub(oldest) & SEQUENCE_MASK;
+        let ack = |position: u32| ack_datagram(socket_id, position & SEQUENCE_MASK, Some(window));
+        let now = Timestamp::from_micros(*clock);
+        let ((), work) = WorkCounters::measure(|| match *action {
+            SendWorkAction::Send { share } => send_up_to(conn, span_share(window, share), now),
+            SendWorkAction::Poll { share } => poll_up_to(conn, span_share(window, share)),
+            SendWorkAction::DuplicateAck => {
+                let _ = conn.feed_recv_buf(&ack(oldest), now);
+            }
+            SendWorkAction::StaleAck { behind } => {
+                let behind = span_share(window, behind).max(1);
+                let _ = conn.feed_recv_buf(&ack(oldest.wrapping_sub(behind)), now);
+            }
+            SendWorkAction::Ack { ahead } => {
+                let ahead = span_share(span, ahead).max(u32::from(span > 0));
+                let _ = conn.feed_recv_buf(&ack(oldest.wrapping_add(ahead)), now);
+            }
+            SendWorkAction::Nak { at, width, overlap } => {
+                let ranges = work_nak_ranges(oldest, span, at, width, overlap);
+                let _ = conn.feed_recv_buf(&nak_datagram(socket_id, &ranges), now);
+            }
+            SendWorkAction::Tick { timer, elapsed } => {
+                *clock += u64::from(elapsed);
+                let id = [
+                    TimerId::Ack,
+                    TimerId::SenderRto,
+                    TimerId::RetransmitContinue,
+                ][usize::from(timer)];
+                let _ = conn.handle_timer(id, Timestamp::from_micros(*clock));
+            }
+        });
+        work
+    }
+
+    fn within_send_limits(action: &SendWorkAction, work: &WorkCounters) -> bool {
+        let output = match action {
+            SendWorkAction::DuplicateAck | SendWorkAction::StaleAck { .. } => 0,
+            _ => SEND_OUTPUT_LIMIT,
+        };
+        work.output_queue_visits <= output
+            && work.retransmit_entries_visited <= SEND_LIST_LIMIT
+            && work.nak_positions_visited <= SEND_NAK_LIMIT
+            && work.dropreq_runs_visited <= SEND_DROPREQ_LIMIT
+            && work.sender_record_probes <= SEND_RECORD_LIMIT
+            && work.rto_candidate_steps <= 1
+    }
+
+    proptest::proptest! {
+        // Building a whole 65,536-packet flight is most of a case's cost, so
+        // a few long streams cover more than many short ones.
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(6))]
+
+        /// Random send-side streams -- duplicate and stale ACKs over a
+        /// large queued output, advancing ACKs, singleton, wide and
+        /// overlapping NAKs (into dropped messages once TLPKTDROP ticks
+        /// have run), output polling and ACK, RTO and retransmit timer
+        /// ticks -- keep every call's work within the same
+        /// window-independent limits at W = 32 / 8,192 / 65,536.
+        #[test]
+        #[cfg_attr(miri, ignore = "window-scale streams; the work bounds are not memory safety")]
+        fn send_entry_points_do_window_independent_work(
+            actions in proptest::collection::vec(send_work_action(), 1..160),
+        ) {
+            for window in WORK_BOUND_WINDOWS {
+                let mut clock = 1_000_000;
+                let queued = (window / 2).min(4_000);
+                let mut conn =
+                    sender_with_flight_and_queue(window, queued, Timestamp::from_micros(clock));
+                for action in &actions {
+                    let work = apply_send_work_action(&mut conn, action, window, &mut clock);
+                    proptest::prop_assert!(
+                        within_send_limits(action, &work),
+                        "window {}: {:?} did {:?}", window, action, work
+                    );
+                }
+            }
         }
     }
 
