@@ -5153,4 +5153,130 @@ mod tests {
             proptest::prop_assert_eq!(head, timestamps.len());
         }
     }
+
+    /// One receive-side entry point the bounded-work proptest drives, with
+    /// window-relative arguments (fractions of the window, in 1/65,536ths).
+    #[derive(Debug, Clone)]
+    enum WorkAction {
+        Receive { ahead: u16, timestamp: u32 },
+        Duplicate,
+        Drop { behind: u16, width: u16 },
+        Tick { elapsed: u32 },
+        Advance { ahead: u16 },
+        Release,
+        Pop,
+    }
+
+    fn work_action() -> impl proptest::strategy::Strategy<Value = WorkAction> {
+        use proptest::prelude::*;
+        prop_oneof![
+            4 => (any::<u16>(), 0..400_000u32)
+                .prop_map(|(ahead, timestamp)| WorkAction::Receive { ahead, timestamp }),
+            1 => Just(WorkAction::Duplicate),
+            1 => (any::<u16>(), any::<u16>())
+                .prop_map(|(behind, width)| WorkAction::Drop { behind, width }),
+            2 => (0..300_000u32).prop_map(|elapsed| WorkAction::Tick { elapsed }),
+            1 => any::<u16>().prop_map(|ahead| WorkAction::Advance { ahead }),
+            1 => Just(WorkAction::Release),
+            1 => Just(WorkAction::Pop),
+        ]
+    }
+
+    /// `fraction` (in 1/65,536ths) of `window`.
+    fn window_share(window: u32, fraction: u16) -> u32 {
+        ((u64::from(window) * u64::from(fraction)) >> 16) as u32
+    }
+
+    /// Per-call work limits every receive-side entry point stays within at
+    /// every window: one release visit (256 units) plus a constant of slot
+    /// probes, one TLPKTDROP visit's 64 gaps of successor, deadline and
+    /// bitmap work, and never a loss enumeration or pending-key scan.
+    const ENTRY_SLOT_LIMIT: u64 = 2 * 256 + 2 * 64 + 32;
+    const ENTRY_GAP_LIMIT: u64 = MAX_EXPIRED_GAPS_PER_VISIT as u64 + 2;
+    const ENTRY_BITMAP_WORD_LIMIT: u64 = 24 * (MAX_EXPIRED_GAPS_PER_VISIT as u64 + 2);
+    const ENTRY_FRONTIER_STEP_LIMIT: u64 = 2;
+
+    /// Apply one action to `buf` and return the work it did.
+    fn apply_work_action(
+        buf: &mut ReceiverBuffer,
+        action: &WorkAction,
+        window: u32,
+        clock: &mut u64,
+        last: &mut Option<DataPacket>,
+    ) -> WorkCounters {
+        let expected = buf.expected_sequence();
+        let now = Timestamp::from_micros(*clock);
+        let ((), work) = WorkCounters::measure(|| match *action {
+            WorkAction::Receive { ahead, timestamp } => {
+                let sequence = expected.wrapping_add(window_share(window, ahead)) & SEQUENCE_MASK;
+                let packet = make_packet(sequence, timestamp);
+                *last = Some(packet.clone());
+                let _ = buf.receive(packet, now);
+            }
+            WorkAction::Duplicate => {
+                if let Some(packet) = last.clone() {
+                    let _ = buf.receive(packet, now);
+                }
+            }
+            WorkAction::Drop { behind, width } => {
+                let first = expected.wrapping_sub(window_share(window, behind) / 2) & SEQUENCE_MASK;
+                let width = window_share(window, width).min(window - 1);
+                let _ = buf.drop_range(first, first.wrapping_add(width) & SEQUENCE_MASK);
+            }
+            WorkAction::Tick { elapsed } => {
+                *clock += u64::from(elapsed);
+                let _ = buf.drop_too_late(Timestamp::from_micros(*clock));
+            }
+            WorkAction::Advance { ahead } => {
+                let target = expected.wrapping_add(window_share(window, ahead)) & SEQUENCE_MASK;
+                buf.advance_expected_sequence(target);
+            }
+            WorkAction::Release => {
+                buf.release_retired_packets();
+            }
+            WorkAction::Pop => {
+                let _ = buf.pop_ready(now);
+            }
+        });
+        work
+    }
+
+    fn within_entry_limits(work: &WorkCounters) -> bool {
+        work.packet_slot_probes + work.released_chunks <= ENTRY_SLOT_LIMIT
+            && work.successor_probes <= ENTRY_GAP_LIMIT
+            && work.deadline_probes <= ENTRY_GAP_LIMIT
+            && work.bitmap_words() <= ENTRY_BITMAP_WORD_LIMIT
+            && work.frontier_steps <= ENTRY_FRONTIER_STEP_LIMIT
+            && work.loss_entries_visited == 0
+            && work.pending_keys_visited == 0
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+
+        /// Random receive-side streams -- sequence wrap, non-monotone
+        /// timestamps, duplicates, wide gaps, DROPREQs reaching behind the
+        /// span, TLPKTDROP ticks, a lagging group member's forced advances,
+        /// release visits and deliveries -- keep every call's work within
+        /// the same window-independent limits at W = 32 / 8,192 / 65,536.
+        #[test]
+        fn receive_entry_points_do_window_independent_work(
+            initial in (SEQUENCE_MASK - 64)..=SEQUENCE_MASK,
+            actions in proptest::collection::vec(work_action(), 1..96),
+        ) {
+            for window in WORK_BOUND_WINDOWS {
+                let mut buf =
+                    ReceiverBuffer::with_buffer_size(initial, 120, Timestamp::default(), 0, window);
+                let mut clock = 1;
+                let mut last = None;
+                for action in &actions {
+                    let work = apply_work_action(&mut buf, action, window, &mut clock, &mut last);
+                    proptest::prop_assert!(
+                        within_entry_limits(&work),
+                        "window {}: {:?} did {:?}", window, action, work
+                    );
+                }
+            }
+        }
+    }
 }
