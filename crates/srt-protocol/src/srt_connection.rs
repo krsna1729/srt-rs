@@ -884,11 +884,43 @@ pub struct SrtConnection {
     handshake_started_at: Option<Timestamp>,
     handshake_retry_interval_micros: u64,
     handshake_timeout_micros: u64,
+    /// Strict wire checker installed by a test fixture
+    /// ([`Self::install_wire_checker`]); absent from production builds.
+    #[cfg(any(test, feature = "test-support"))]
+    wire_checker: Option<Box<crate::test_support::wire_checker::WireChecker>>,
 }
 
 impl Drop for SrtConnection {
     fn drop(&mut self) {
         self.clear_config_secrets();
+        #[cfg(any(test, feature = "test-support"))]
+        self.finish_wire_check();
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl SrtConnection {
+    /// Close the strict wire transcript: sequence skips must have been
+    /// announced by a DROPREQ sent or still queued. Skipped while the test
+    /// is already failing, so the first failure is the one reported.
+    fn finish_wire_check(&self) {
+        let Some(checker) = self.wire_checker.as_deref() else {
+            return;
+        };
+        if std::thread::panicking() {
+            return;
+        }
+        let queued: Vec<(u32, u32)> = self
+            .output_queue
+            .iter()
+            .filter_map(|output| match output {
+                QueuedOutput::Datagram(pkt) => dropreq_range(pkt),
+                _ => None,
+            })
+            .collect();
+        if let Err(violation) = checker.finish(&queued) {
+            panic!("{violation}");
+        }
     }
 }
 
@@ -1353,6 +1385,8 @@ impl SrtConnection {
             handshake_started_at: None,
             handshake_retry_interval_micros: DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS,
             handshake_timeout_micros: DEFAULT_HANDSHAKE_TIMEOUT_MICROS,
+            #[cfg(any(test, feature = "test-support"))]
+            wire_checker: None,
         }
     }
 
@@ -1411,6 +1445,8 @@ impl SrtConnection {
             handshake_started_at: None,
             handshake_retry_interval_micros: DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS,
             handshake_timeout_micros: DEFAULT_HANDSHAKE_TIMEOUT_MICROS,
+            #[cfg(any(test, feature = "test-support"))]
+            wire_checker: None,
         }
     }
 
@@ -1660,6 +1696,49 @@ impl SrtConnection {
         self.peer_ip = peer.ip();
     }
 
+    /// Install a strict wire checker
+    /// ([`crate::test_support::wire_checker`]) on this connection: every
+    /// datagram [`Self::poll_output_into`] materializes is checked against
+    /// libsrt's wire rules, and every datagram fed in is recorded as peer
+    /// input. A violation panics. Test-only (`test-support` feature).
+    ///
+    /// The fixture must also report the peer's address
+    /// ([`Self::set_peer_address`]), which libsrt always puts in the
+    /// handshake.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the handshake has already started: the transcript must
+    /// begin with the first datagram.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn install_wire_checker(&mut self) {
+        assert_eq!(
+            self.handshake_state,
+            HandshakeState::Initial,
+            "a strict wire transcript starts before the handshake"
+        );
+        self.wire_checker = Some(Box::new(
+            crate::test_support::wire_checker::WireChecker::new(self.role),
+        ));
+    }
+
+    /// The installed strict wire checker, if any. Test-only
+    /// (`test-support` feature).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn wire_checker_mut(
+        &mut self,
+    ) -> Option<&mut crate::test_support::wire_checker::WireChecker> {
+        self.wire_checker.as_deref_mut()
+    }
+
+    /// Report `peer` as the transport address unless the test set one.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn default_peer_address(&mut self, peer: std::net::SocketAddr) {
+        if self.peer_ip.is_unspecified() {
+            self.set_peer_address(peer);
+        }
+    }
+
     /// Configure retry spacing and the deadline for the whole handshake.
     ///
     /// Jitter is added only after `retry_interval_micros`, so a retry is
@@ -1814,6 +1893,10 @@ impl SrtConnection {
         if buf.len() < SRT_HEADER_SIZE {
             return Err(Error::insufficient_buffer());
         }
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(checker) = self.wire_checker.as_deref_mut() {
+            checker.record_received(buf);
+        }
         let packet = SrtPacket::decode(buf)?;
         self.feed_decoded(packet, now)
     }
@@ -1827,6 +1910,10 @@ impl SrtConnection {
         self.check_output_queue()?;
         if buf.len() < SRT_HEADER_SIZE {
             return Err(Error::insufficient_buffer());
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(checker) = self.wire_checker.as_deref_mut() {
+            checker.record_received(&buf);
         }
         let packet = SrtPacket::decode_bytes(&buf)?;
         self.feed_decoded(packet, now)
@@ -2711,6 +2798,10 @@ impl SrtConnection {
             return Err(Error::invalid_state("sender buffer not initialized"));
         };
         if sender.synchronize_next_sequence_number(sequence_number) {
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(checker) = self.wire_checker.as_deref_mut() {
+                checker.note_send_sequence_override(sequence_number);
+            }
             Ok(())
         } else {
             Err(Error::invalid_state("sender buffer has in-flight packets"))
@@ -2872,6 +2963,14 @@ impl SrtConnection {
                 }
                 let written = pkt.encode_into(self.crypto.as_deref(), dst)?;
                 debug_assert_eq!(written, wire_len);
+                // Test-only strict wire check of exactly the bytes that leave
+                // the protocol, before any fixture loss or rewrite.
+                #[cfg(any(test, feature = "test-support"))]
+                crate::test_support::wire_checker::observe_emitted(
+                    self.wire_checker.as_deref_mut(),
+                    &dst[..written],
+                    self.peer_ip,
+                );
                 let released = match pkt {
                     PendingDatagram::Data(data) => data.crypto.map(|stamp| stamp.key_flag),
                     PendingDatagram::Control(_) => None,
@@ -5802,6 +5901,10 @@ mod tests {
             .as_mut()
             .unwrap()
             .seed_full_acks_sent_for_test(0x7FFF_FFFF);
+        listener
+            .wire_checker_mut()
+            .expect("connected_pair checks the wire")
+            .note_seeded_ack_number();
 
         let ack_time = start.add_micros(20_000);
         listener.handle_timer(TimerId::Ack, ack_time).unwrap();
@@ -5825,6 +5928,31 @@ mod tests {
             rtt_before,
             "RTT sampled"
         );
+    }
+
+    /// The message-number wrap reaches the wire as `0x03ff_ffff, 1`: libsrt's
+    /// `MsgNo` rolls from 1 (`packet.h:184`) and zero is the packet-filter
+    /// control identity. Checked end to end by the strict wire checker.
+    #[test]
+    fn message_numbers_wrap_to_one_on_the_wire() {
+        let (mut caller, mut listener) = connected_pair();
+        caller
+            .sender
+            .as_mut()
+            .expect("connected sender")
+            .seed_next_message_number_for_test(0x03FF_FFFF);
+        let now = Timestamp::from_micros(1_000_000);
+        let mut numbers = Vec::new();
+        for payload in [b"last".as_slice(), b"wrapped"] {
+            caller.send(payload, now).unwrap();
+            let wire = next_wire(&mut caller);
+            let Ok(SrtPacket::Data(data)) = SrtPacket::decode(&wire) else {
+                panic!("a DATA packet");
+            };
+            numbers.push(data.message_number);
+            listener.feed_recv_buf(&wire, now).unwrap();
+        }
+        assert_eq!(numbers, [0x03FF_FFFF, 1]);
     }
 
     /// Each handshake carries the peer's IP the transport set, as libsrt's
@@ -6248,9 +6376,22 @@ mod tests {
         assert_eq!(caller.initial_seq, 0x11);
     }
 
+    /// Record a DATA packet a test injects below the connection's receive
+    /// entry points as the checker's peer input, so rules judged against
+    /// received DATA (ACK and NAK frontiers) see it.
+    fn record_peer_data(conn: &mut SrtConnection, packet: &DataPacket) {
+        let mut wire = vec![0u8; packet.encoded_size()];
+        packet.encode_into(&mut wire).expect("fixture DATA encodes");
+        if let Some(checker) = conn.wire_checker_mut() {
+            checker.record_received(&wire);
+        }
+    }
+
     /// Drive a full caller/listener handshake to `Connected` on both ends,
-    /// for tests that only care about post-handshake send behavior.
+    /// for tests that only care about post-handshake send behavior. Both
+    /// ends run under the strict wire checker.
     fn drive_handshake_to_connected(caller: &mut SrtConnection, listener: &mut SrtConnection) {
+        crate::test_support::wire_checker::check_pair(caller, listener);
         caller
             .connect(Timestamp::from_micros(0))
             .expect("caller starts");
@@ -7404,6 +7545,10 @@ mod tests {
     fn gcm_wire_packets_never_exceed_the_datagram_budget() {
         let (mut caller, _listener) = connected_pair();
         while caller.poll_output().unwrap().is_some() {}
+        // The cipher is installed behind the handshake's back, so the KK
+        // field has no negotiated key material behind it: not a wire state
+        // a peer could observe, so the strict checker stays out.
+        caller.wire_checker = None;
         caller.crypto = Some(Box::new(
             CryptoContext::new_sender(
                 "test_passphrase",
@@ -7553,10 +7698,13 @@ mod tests {
         let listener = &mut attempt.listener;
         let first = listener.initial_seq;
         let gap_end = (first + 2) & SEQUENCE_MASK;
-        listener.receiver.as_mut().expect("receiver").receive(
-            DataPacket::new(gap_end, 1, 1, 0, Vec::new().into()),
-            Timestamp::from_micros(10_000),
-        );
+        let gap_data = DataPacket::new(gap_end, 1, 1, 0, Vec::new().into());
+        record_peer_data(listener, &gap_data);
+        listener
+            .receiver
+            .as_mut()
+            .expect("receiver")
+            .receive(gap_data, Timestamp::from_micros(10_000));
         drain_outputs(listener);
 
         listener
@@ -10390,6 +10538,9 @@ mod tests {
         let mut listener = SrtConnection::new_listener(listener_options);
         caller.set_peer_address(path_address(caller_rewrite.family));
         listener.set_peer_address(path_address(listener_rewrite.family));
+        // Pristine emissions are checked before the rewrite; the receiving
+        // side records the rewritten packets as its peer input.
+        crate::test_support::wire_checker::check_pair(&mut caller, &mut listener);
         caller
             .connect(Timestamp::from_micros(0))
             .expect("caller starts");

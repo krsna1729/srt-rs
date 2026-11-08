@@ -1,4 +1,5 @@
 use srt_proto::group::GroupPacket;
+use srt_proto::test_support::wire_checker::check_pair;
 use srt_proto::wire::{ControlPacket, ControlType, SrtPacket};
 use srt_proto::{
     ConnectionOptions, ConnectionOutput, ConnectionState, GroupMemberState, GroupMode,
@@ -56,6 +57,7 @@ fn establish_pair_with_options(options: ConnectionOptions) -> (SrtConnection, Sr
         tsbpd_delay: 0,
         ..options
     });
+    check_pair(&mut caller, &mut listener);
     caller.connect(ts(0)).expect("caller should connect");
     // A zero-transit handshake: the listener's TSBPD base comes from the
     // CONCLUSION timestamp, so it must see the same transit as DATA.

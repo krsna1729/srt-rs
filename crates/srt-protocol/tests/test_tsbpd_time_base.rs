@@ -1,5 +1,6 @@
 //! Regression tests for the caller-side TSBPD time base (spec §4.5.1.1).
 
+use srt_proto::test_support::wire_checker::check_pair;
 use srt_proto::wire::{ControlType, SrtPacket};
 use srt_proto::{
     ConnectionEvent, ConnectionOptions, ConnectionOutput, SrtConnection, TimerId, Timestamp,
@@ -40,6 +41,7 @@ fn listener_conclusion_response_carries_session_timestamp() {
         ..Default::default()
     });
 
+    check_pair(&mut caller, &mut listener);
     caller.connect(ts(0)).expect("caller connects");
     transfer(&mut caller, &mut listener, ts(0));
     transfer(&mut listener, &mut caller, ts(ONE_WAY_US));
@@ -107,6 +109,7 @@ fn caller_data_and_keepalive_continue_the_handshake_epoch() {
         ..Default::default()
     });
 
+    check_pair(&mut caller, &mut listener);
     caller.connect(ts(0)).expect("caller connects");
     transfer(&mut caller, &mut listener, ts(HANDSHAKE_DELAY_US));
     transfer(

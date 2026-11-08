@@ -42,6 +42,10 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 criterion = "0.8"
 loom = "0.7"
 proptest = "1.11"
+# `test-support`: the strict wire checker the deterministic simulation and
+# tail-recovery fixtures install (`srt_proto::test_support::wire_checker`).
+# Path-only, so it is stripped on publish.
+srt_proto = { package = "srt-proto", path = "../srt-protocol", features = ["test-support"] }
 
 [[example]]
 name = "mio_owner_echo"

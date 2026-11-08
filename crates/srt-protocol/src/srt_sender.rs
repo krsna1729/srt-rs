@@ -595,6 +595,13 @@ impl SenderBuffer {
         self.next_msg
     }
 
+    /// Seed the next message number, so a connection test can reach the
+    /// message-number wrap on the wire.
+    #[cfg(test)]
+    pub(crate) fn seed_next_message_number_for_test(&mut self, next: u32) {
+        self.next_msg = next;
+    }
+
     /// Remaining new-DATA credit, in packets: the distance from the next
     /// unset sequence to the peer's advertised window end, capped by what is
     /// left of the handshake-negotiated window.
