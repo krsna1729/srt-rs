@@ -1,11 +1,12 @@
-//! Per-thread counters of loop work done by receive-side entry points.
+//! Per-thread counters of loop work done by protocol entry points.
 //!
 //! Each counter is incremented inside the loop that does the work, once per
-//! iteration, so a test can bound what one `feed_recv_*`, `handle_timer` or
-//! group poll did by taking a [`WorkCounters::snapshot`] before and after it.
-//! Counters are thread-local, so parallel tests do not interfere. Take the
-//! snapshot before calling a statistics method: statistics walk retained
-//! state on purpose and are not part of any bounded path.
+//! iteration, so a test can bound what one `feed_recv_*`, `handle_timer`,
+//! `poll_output_into`, `send` or group poll did by taking a
+//! [`WorkCounters::snapshot`] before and after it. Counters are
+//! thread-local, so parallel tests do not interfere. Take the snapshot
+//! before calling a statistics method: statistics walk retained state on
+//! purpose and are not part of any bounded path.
 //!
 //! The counting sites expand to nothing unless the crate is built for its own
 //! unit tests: benches and dependents' tests run the uncounted code.
@@ -24,9 +25,16 @@ pub(crate) enum Counter {
     FrontierSteps,
     PendingKeysVisited,
     ReleasedChunks,
+    SenderSlotProbes,
+    SenderRecordProbes,
+    OutputQueueVisits,
+    RetransmitEntriesVisited,
+    RtoCandidateSteps,
+    NakPositionsVisited,
+    DropreqRunsVisited,
 }
 
-const COUNTERS: usize = Counter::ReleasedChunks as usize + 1;
+const COUNTERS: usize = Counter::DropreqRunsVisited as usize + 1;
 
 thread_local! {
     static WORK: [Cell<u64>; COUNTERS] = const { [const { Cell::new(0) }; COUNTERS] };
@@ -61,6 +69,20 @@ pub struct WorkCounters {
     pub pending_keys_visited: u64,
     /// Retained payloads physically released.
     pub released_chunks: u64,
+    /// Send packet-window slots read or written inside a loop.
+    pub sender_slot_probes: u64,
+    /// Dropped-message records inspected.
+    pub sender_record_probes: u64,
+    /// Queued output actions inspected.
+    pub output_queue_visits: u64,
+    /// Retransmission-list entries popped or checked for staleness.
+    pub retransmit_entries_visited: u64,
+    /// Candidates the sender RTO probe stepped over.
+    pub rto_candidate_steps: u64,
+    /// Peer loss-report positions validated or committed.
+    pub nak_positions_visited: u64,
+    /// Tombstone runs one loss report found, inspected to pick its DROPREQs.
+    pub dropreq_runs_visited: u64,
 }
 
 impl WorkCounters {
@@ -79,6 +101,13 @@ impl WorkCounters {
                 frontier_steps: get(Counter::FrontierSteps),
                 pending_keys_visited: get(Counter::PendingKeysVisited),
                 released_chunks: get(Counter::ReleasedChunks),
+                sender_slot_probes: get(Counter::SenderSlotProbes),
+                sender_record_probes: get(Counter::SenderRecordProbes),
+                output_queue_visits: get(Counter::OutputQueueVisits),
+                retransmit_entries_visited: get(Counter::RetransmitEntriesVisited),
+                rto_candidate_steps: get(Counter::RtoCandidateSteps),
+                nak_positions_visited: get(Counter::NakPositionsVisited),
+                dropreq_runs_visited: get(Counter::DropreqRunsVisited),
             }
         })
     }
@@ -102,6 +131,14 @@ impl WorkCounters {
             frontier_steps: now.frontier_steps - before.frontier_steps,
             pending_keys_visited: now.pending_keys_visited - before.pending_keys_visited,
             released_chunks: now.released_chunks - before.released_chunks,
+            sender_slot_probes: now.sender_slot_probes - before.sender_slot_probes,
+            sender_record_probes: now.sender_record_probes - before.sender_record_probes,
+            output_queue_visits: now.output_queue_visits - before.output_queue_visits,
+            retransmit_entries_visited: now.retransmit_entries_visited
+                - before.retransmit_entries_visited,
+            rto_candidate_steps: now.rto_candidate_steps - before.rto_candidate_steps,
+            nak_positions_visited: now.nak_positions_visited - before.nak_positions_visited,
+            dropreq_runs_visited: now.dropreq_runs_visited - before.dropreq_runs_visited,
         }
     }
 

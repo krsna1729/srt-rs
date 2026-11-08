@@ -19,6 +19,7 @@ root [README](../../README.md) and [SECURITY.md](../../SECURITY.md).
 - [What was trimmed from the upstream tree](#what-was-trimmed-from-the-upstream-tree)
 - [Local patches](#local-patches)
 - [Protocol compliance remediation](#protocol-compliance-remediation)
+- [Sender-side work bounds](#sender-side-work-bounds)
 - [Intentional compatibility differences](#intentional-compatibility-differences)
 - [Documentation language](#documentation-language)
 - [Crypto backend: pure-Rust RustCrypto stack, not aws-lc-rs](#crypto-backend-pure-rust-rustcrypto-stack-not-aws-lc-rs)
@@ -189,6 +190,7 @@ patch guidance. The executable cross-implementation scenarios are in
 | Outbound GROUP validity | libsrt's `interpretGroup` refuses a GROUP whose type is not below `SRT_GTYPE_E_END` (`SRT_REJ_GROUP`) or whose ID lacks `SRTGROUP_MASK` (`SRT_REJ_ROGUE`) (core.cpp:3317-3331). An outbound GROUP must pass `GroupExtensionData::is_valid_for_libsrt`: `connect`, `set_group_extension` (now fallible) and `set_listener_group_extension` refuse another, and a listener configured with one through `ConnectionOptions` refuses bonded callers with `SRT_REJ_GROUP` (15) instead of emitting it; direct callers are unaffected. Received values are still decoded raw (`GroupType::Unknown`) for admission policy. Covered by `outbound_groups_libsrt_refuses_are_configuration_errors`, `listener_refuses_bonded_callers_when_its_own_group_is_invalid`, and `bonded_inputs_reject_unknown_group_type_with_bad_mode` (now crafting the unknown type on the wire). |
 | Message reassembly and DROPREQ | Multi-packet message reassembly is implemented: `send_message` fragments payloads exceeding the negotiated MTU, and the receiver's `MessageAssembler` buffers fragments and delivers complete messages. In live (TSBPD) mode this is an srt-rs extension libsrt 1.5.7 never emits: its sender refuses a message over one packet with `MN_XSIZE` (core.cpp:7003-7011). A libsrt receiver accepts it: no receive path checks the boundary flags against TSBPD (core.cpp), `CRcvBuffer::updateNonreadPos` makes only whole PB_FIRST..PB_LAST messages readable, `isRcvDataReady` times the message by its first packet, and `readMessage` copies fragments until PB_LAST (buffer_rcv.cpp:393-495, 708-730, 824-855). The reading application's buffer must hold the whole message; a smaller one (live apps commonly read `SRT_LIVE_MAX_PLSIZE`, 1456 bytes) gets a truncated copy and an error log (buffer_rcv.cpp:489-493). This is established from source, not exercised against libsrt. `DROPREQ` is fully implemented: the sender emits it when TLPKTDROP drops a message, and the receiver processes it by purging the affected sequence range and any in-progress reassembly. Sender-side TLPKTDROP is message-aware (drops all fragments of a message together). Covered by `send_message_fragments_and_reassembles`, `dropreq_drops_receiver_message`, property tests (`fragmentation_reassembly_roundtrip`), and fuzz targets (`fuzz_message_reassembly`, `fuzz_connection_feed`). |
 | Receive-side work bounds | Each receive entry point does work independent of the receive window (up to 65,536 packets). The loss list is a three-level lazy bitset, so classifying a wide gap or clearing a range costs a constant number of words. The expected sequence is the first loss or the frontier + 1, libsrt's ACK rule (core.cpp:8318-8358): a DROPREQ hole no longer pins the ACK. TLPKTDROP inspects only the head gap, like `CUDT::tsbpd` (core.cpp:5673-5703), with one successor lookup and one deadline per gap and at most `MAX_EXPIRED_GAPS_PER_VISIT` (64) gaps per visit. A capped visit continues on `DeliveryContinue`. With non-monotone timestamps a later gap whose packet is due no longer goes before an earlier one that is not. `drop_too_late` returns `Vec<LossRange>`. A DROPREQ retires its packets by page and 64-page block; the retired storage is released at most `MAX_RETIRED_RELEASED_PER_VISIT` (256) work units per visit, on each DATA, drop, forced advance and ACK tick (`release_retired_packets`). A DROPREQ reaching behind the retained span is clipped to it. The group receiver finds its oldest pending payload in two ordered lookups. Covered by the per-finding tests named in docs/production-progress.md and by `receive_entry_points_do_window_independent_work`. |
+| Send-side work bounds | Every send entry point a peer can trigger repeatedly does work independent of the send window (up to 65,536 packets); retirement, expiry, DROPREQ submission and overflow teardown are amortized O(1) per submitted packet. TLPKTDROP keeps a sequence-ordered record of each message it gave up until the cumulative ACK retires it, so a NAK into any fragment of a dropped message is answered by binary search over the records instead of a walk of the message's tombstones; libsrt answers a stale range from its reported bounds without reconstructing the message (core.cpp:9155-9207). The full list is [Sender-side work bounds](#sender-side-work-bounds). |
 | DATA message numbers | Normal message numbers roll `0x03ff_ffff` -> 1 on both the single-packet and fragmented send paths, never 0: libsrt's `MsgNo` rolling domain has minimum 1 (`packet.h:184`, `buffer_snd.cpp:234`), and message number 0 is the packet-filter control identity (`core.cpp:11082-11108`, `packetfilter.cpp`). Covered by `message_numbers_wrap_to_one_never_zero`. |
 | Handshake peer-IP field | libsrt fills it with the address of the handshake's recipient (`CIPAddress::ntop`, core.cpp:3782 for the caller, 6011 for the listener) and a peer records the received value as its own local address, reported by `srt_getsockname` on an accepted socket and as the group member's `agent` (core.cpp:4983, 6055-6057, 3486; api.cpp:798-805); it never validates it. `SrtConnection::set_peer_address(SocketAddr)` replaces `set_ip_family`: the transport passes the peer's address, which sets the path family and fills the field of every INDUCTION, CONCLUSION and KM-failure handshake (rejections stay `0.0.0.0`; unset, the field is `0.0.0.0` as before). The field now uses libsrt's byte layout: four native words byte-swapped by `CPacket::toNetworkByteOrder` (packet.cpp:435-446), so on its little-endian hosts each 4-byte group is reversed (192.0.2.1 is sent as `01 02 00 c0`); srt-rs previously wrote and read plain octets. Covered by `handshakes_carry_the_peer_ip_the_transport_set` and `peer_ip_uses_libsrts_word_swapped_layout`. |
 | Backup failover | Like libsrt (`group.cpp` `sendBackup_CheckIdleTime`, `sendBackupRexmit`), a Backup group keeps the carrier's unacknowledged sends (at most `MAX_BACKUP_HISTORY`) and replays them, at their sequences, onto the member that takes over, before new payload; a takeover that cannot replay the whole flight (history bound exceeded, or the standby's window too small) is refused with `InvalidState` instead of leaving a silent hole. An active with unacknowledged data that hears nothing from its peer for `max(60 ms, 2·SRTT+4·RTTVar)` is demoted to Unstable while a connected standby exists. Unlike libsrt, replayed packets carry the takeover time rather than their original source time, so a receiver does not drop them as too late. Covered by `backup_failover_replays_the_unacknowledged_prefix`, `backup_active_without_response_fails_over_after_stability_timeout`, `backup_failover_refuses_when_the_standby_cannot_hold_the_flight` and `backup_failover_refuses_when_the_history_bound_dropped_part_of_the_flight`. |
@@ -207,6 +209,41 @@ already states the precise design direction) — the cost of patching now is
 low and the cost of shipping with an open, self-identified Critical crypto
 bug is not a tradeoff worth making for the sake of staying byte-identical
 to upstream.
+
+## Sender-side work bounds
+
+A peer sends ACKs and NAKs as often as it likes, so every send-side path it
+can make run once per datagram does work independent of the send window
+(32 to 65,536 packets). `WorkCounters` (unit tests only) counts each loop;
+the tests compare W = 32 / 8,192 / 65,536.
+
+| Repeatable path | Work per call | Tests |
+|---|---|---|
+| NAK into a dropped message (F02) | Binary search over the sender's drop records (at most 17 probes at the maximum window); the message's tombstones are not walked. | `a_singleton_nak_into_a_dropped_message_does_window_independent_work`, `a_nak_into_a_partly_acknowledged_dropped_message_names_its_retained_part` |
+| Duplicate or non-advancing ACK (F03) | No visit of the output queue: only an ACK that retired something (or a TLPKTDROP drop) purges stale DATA from it. A purge is one in-place pass, at most `MAX_OUTPUT_QUEUE_ACTIONS` (8,192) visits, never one shift per removal. | `a_non_advancing_ack_does_not_rescan_queued_output` |
+| Stale retransmission entries (F17) | Entries the cumulative ACK or TLPKTDROP made stale are compacted in place, a bounded pass per call: an ACK or tick checks 256, a NAK visit two per entry it queues, so the pass outruns the pushes and reaches the end (whole-window NAK/ACK cycles that nothing pops keep the list within two windows plus 1,024). `pop_retransmit` inspects at most 64 entries per call. | `a_nak_storm_then_acks_and_pops_does_window_independent_list_work`, `unpopped_nak_and_ack_cycles_keep_the_retransmission_list_bounded`, `retransmit_list_compaction_keeps_fifo_order`, `stale_retransmit_queue_is_compacted_at_a_bounded_threshold` |
+| DROPREQ answer to a NAK (F17) | At most `MAX_DROPREQ_PER_NAK` (16) of the report's tombstone runs, picked by index from a rotating cursor; the rest are not rotated. | `a_nak_over_many_dropped_messages_picks_its_dropreqs_by_index` |
+| NAK validation and commit | At most `MAX_NAK_POSITIONS_PER_VISIT` (4,096) positions to validate per visit (a report that validates within the visit also commits in it); a larger report continues on `RetransmitContinue`. | `a_large_nak_is_validated_then_queued_across_bounded_visits` |
+| RTO probe | One candidate step: the probe runs only while something submitted is live and nothing is queued for retransmission, and TLPKTDROP tombstones only a prefix of the retained span, so the newest submitted packet is live. | `the_rto_probe_takes_one_candidate_step_under_adversarial_expiry_and_acks` |
+
+`send_entry_points_do_window_independent_work` replays random streams of
+sends, output polls, duplicate, stale and advancing ACKs, singleton, wide and
+overlapping NAKs (into dropped messages once TLPKTDROP has run) and ACK, RTO
+and retransmit timer ticks at all three windows against the same constants.
+
+Four paths are amortized instead: cumulative-ACK retirement, sender expiry
+(TLPKTDROP), DROPREQ submission and output-queue overflow teardown. Each
+costs O(1) per submitted packet, because a packet is retired, expired,
+reported dropped or released at teardown once; one call can still do Θ(K)
+for the K packets it settles, and a peer cannot make it repeat. libsrt is
+Θ(K) on the same operations: `CSndBuffer::ackData` and `dropLateData` step
+over every block they release (buffer_snd.cpp:549-575, 654-690), a dropped
+message's DROPREQ range is found by walking its blocks (`readData`,
+buffer_snd.cpp:469-500), and `~CSndBuffer` frees each block
+(buffer_snd.cpp:112-130). They are not indexed: settling a cumulative ACK
+from per-page mark populations instead of visiting each retired packet (F07)
+cost +13.9% instructions per steady-state packet, for work no peer can
+repeat, and was dropped.
 
 ## Intentional compatibility differences
 
