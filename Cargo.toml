@@ -8,7 +8,10 @@ members = [
     "crates/srt-bench",
     "crates/xtask",
 ]
-exclude = ["crates/srt-protocol/fuzz"]
+# Both build outside the default workspace: the fuzz crate needs nightly
+# cargo-fuzz, and srt-libsrt-diff compiles C++ from a libsrt checkout named by
+# LIBSRT_SRC (docs/live-interop-validation.md).
+exclude = ["crates/srt-protocol/fuzz", "crates/srt-libsrt-diff"]
 
 [workspace.metadata.reportcard]
 max_cyclomatic = 20

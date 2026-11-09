@@ -258,6 +258,14 @@ cargo bench -p srt-proto     # criterion benches:
 cargo test -p pbt             # property-based suites, one per core module
 ```
 
+The separate `crates/srt-libsrt-diff` package compares real libsrt 1.5.7
+receive-buffer code with `ReceiverBuffer` under the same synthetic packet
+and time streams. It checks readiness, exact delivery, cumulative ACK
+position, losses and TLPKTDROP after every action, including a final drain.
+It is excluded from ordinary workspace builds; see
+[`docs/live-interop-validation.md`](../../docs/live-interop-validation.md#deterministic-receiver-differential)
+for the pinned source, run command, profile boundaries and sanitizer check.
+
 `tests/allocation_guard.rs` asserts steady-state per-packet allocation
 count stays **bounded and flat** (not zero — wire encoding, receive-buffer
 insertion, and application-event ownership require bounded allocations;

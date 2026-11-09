@@ -189,6 +189,38 @@ jobs:
           srt-file-transmit -version
       - run: cargo test -p srt-bench --test libsrt_interop
 
+  receiver-differential:
+    name: Receiver differential (libsrt 1.5.7)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      LIBSRT_SRC: ${{ github.workspace }}/.libsrt-oracle
+      SRT_DIFF_REQUIRE_ORACLE: "1"
+      PROPTEST_CASES: "10000"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: Haivision/srt
+          ref: 899348d8318eb9a3c5a5b6ec43c4a1114288773a
+          path: .libsrt-oracle
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/srt-libsrt-diff -> target
+      - name: Run calibrated and randomized differential comparisons
+        run: cargo test --locked --manifest-path crates/srt-libsrt-diff/Cargo.toml
+      - name: Check the native boundary with ASan and UBSan
+        env:
+          CARGO_TARGET_DIR: target/diff-native-sanitized
+          CXXFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
+          RUSTFLAGS: -C link-arg=-lasan -C link-arg=-lubsan
+          PROPTEST_CASES: "1000"
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="env LD_PRELOAD=$(g++ -print-file-name=libasan.so)"
+          cargo test --locked --manifest-path crates/srt-libsrt-diff/Cargo.toml --target x86_64-unknown-linux-gnu
+
   fuzz-smoke:
     name: Fuzz build and smoke
     needs: quality

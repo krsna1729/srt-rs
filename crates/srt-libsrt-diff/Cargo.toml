@@ -1,0 +1,34 @@
+[package]
+name = "srt-libsrt-diff"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Differential tests of the srt-proto receiver against libsrt 1.5.7's receive buffer"
+build = "build.rs"
+links = "srt_libsrt_diff_oracle"
+
+# Not a member of the root workspace (see the root Cargo.toml `exclude`): it
+# compiles C++ from an external libsrt checkout, so plain
+# `cargo test --workspace --all-features` must neither build nor need it. Its
+# own empty [workspace] table detaches it the same way as the fuzz crate.
+[workspace]
+
+[dependencies]
+srt_proto = { package = "srt-proto", path = "../srt-protocol", features = ["test-support"] }
+
+[dev-dependencies]
+proptest = "1.11"
+
+[build-dependencies]
+cc = "1.2"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(libsrt_oracle)"] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+cognitive_complexity = "warn"
+undocumented_unsafe_blocks = "deny"
