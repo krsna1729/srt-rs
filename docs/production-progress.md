@@ -690,11 +690,12 @@ bounded by a constant (or by what it reports) at every receive window, up to
   plus one: libsrt's ACK rule (`core.cpp` 8318-8358). Filling the head hole
   and a forced advance no longer step through the retained packets or
   enumerate the loss list.
-- TLPKTDROP (F01) inspects only the head gap, as libsrt's TSBPD loop does
-  (`core.cpp` 5673-5703): one successor lookup and one deadline per gap, at
-  most `MAX_EXPIRED_GAPS_PER_VISIT` (64) gaps per visit, and the connection
-  continues a capped visit on the zero-delay `DeliveryContinue` timer.
-  `drop_too_late` returns the gaps as `LossRange`s.
+- TLPKTDROP (F01) inspects only a gap at the unread buffer head, as libsrt's
+  TSBPD loop does (`core.cpp` 5673-5703; `buffer_rcv.cpp` 677-692). It cannot
+  expire losses behind unread packets. `drop_too_late` returns
+  `Option<LossRange>`: one head gap per call. The connection alternates
+  delivery and expiry within the 64-packet/gap visit budgets and continues
+  a capped visit on the zero-delay `DeliveryContinue` timer.
 - DROPREQ (F10) retires the covered packets at once. The packet window
   marks whole pages, and whole 64-page blocks, retired; it removes only the
   two partial end pages value by value. The retired storage is released

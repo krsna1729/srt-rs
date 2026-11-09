@@ -231,9 +231,12 @@ Packets carry what libsrt 1.5.7 emits:
   message (`MN_XSIZE`). A libsrt receiver reassembles it, but its
   application must read with a buffer that holds the whole message, or the
   message arrives truncated. See VENDOR.md, "Message reassembly and DROPREQ".
-- TLPKTDROP gives up only the head gap, like libsrt's TSBPD loop: at most 64
-  gaps per visit, continued on the zero-delay `DeliveryContinue` timer.
-  `ReceiverBuffer::drop_too_late` returns the gaps as `LossRange`s. A DROPREQ
+- TLPKTDROP gives up only a gap at the unread buffer head, like libsrt's
+  TSBPD loop. An unread packet before a loss keeps it recoverable, even if
+  a later packet is due. The connection alternates delivery and expiry,
+  with at most 64 packets/gaps per visit and a zero-delay `DeliveryContinue`
+  when capped. `ReceiverBuffer::drop_too_late` returns `Option<LossRange>`
+  (at most one head gap per call), not a list. A DROPREQ
   makes its packets unreachable at once; their storage is released in visits
   of at most 256 work units (`ReceiverBuffer::release_retired_packets`, run on
   each DATA, drop and ACK tick). See VENDOR.md, "Receive-side work bounds".

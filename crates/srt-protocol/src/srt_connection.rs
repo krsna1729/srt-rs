@@ -2313,38 +2313,57 @@ impl SrtConnection {
     /// would see a message's deadline as "already due" and force-close
     /// instead of actually delivering it, purely because it happened to run
     /// before the next ACK tick.
+    ///
+    /// TLPKTDROP gives up only the gap at the head of the receiver
+    /// ([`ReceiverBuffer::drop_too_late`]), so expiry alternates with delivery
+    /// the way libsrt's TSBPD thread alternates with its reader
+    /// (core.cpp:5669-5703): deliver what is ready, give up the head gap if
+    /// its successor is due, deliver what that released, and so on. One
+    /// visit gives up at most `MAX_EXPIRED_GAPS_PER_VISIT` gaps and moves at
+    /// most `MAX_DELIVERY_PER_VISIT` packets; a visit cut by either budget
+    /// continues on a zero-delay `DeliveryContinue` instead of a tick later.
     fn service_receive_deadlines(&mut self, now: Timestamp) {
-        if self.tlpktdrop_enabled()
-            && let Some(receiver) = self.receiver.as_mut()
-        {
-            let dropped = receiver.drop_too_late(now);
-            if dropped.len() == MAX_EXPIRED_GAPS_PER_VISIT {
-                // More gaps may be due: continue at once rather than a tick
-                // later, as the uncapped walk did.
-                self.receive_expiry_continues = true;
-                self.queue_output(QueuedOutput::SetTimer {
-                    id: TimerId::DeliveryContinue,
-                    duration_micros: 0,
-                });
+        if !self.tlpktdrop_enabled() {
+            self.enqueue_ready_data(now);
+            return;
+        }
+        self.discard_assembly_behind_frontier();
+        self.reclaim_retired_assembly();
+        let mut budget = MAX_DELIVERY_PER_VISIT;
+        let mut gaps = 0;
+        loop {
+            budget -= self.pop_ready_data(now, budget);
+            if budget == 0 || gaps == MAX_EXPIRED_GAPS_PER_VISIT {
+                break;
             }
+            let Some(gap) = self
+                .receiver
+                .as_mut()
+                .and_then(|receiver| receiver.drop_too_late(now))
+            else {
+                break;
+            };
+            gaps += 1;
+            // Expiry also retires the positions from the sender's span.
             if let Some(sender) = self.sender.as_mut() {
-                for gap in dropped {
-                    sender.discard_acked_within(gap.first_seq, gap.last_seq);
-                }
+                sender.discard_acked_within(gap.first_seq, gap.last_seq);
             }
-            self.continue_acked_release_later();
+            self.discard_assembly_behind_frontier();
         }
-        if self.tlpktdrop_enabled()
-            && let Some(receiver) = self.receiver.as_ref()
-        {
-            // TLPKTDROP moves the receive frontier past positions that can
-            // never arrive, so a message whose first fragment is now behind
-            // that frontier can never be completed either: retire it instead
-            // of holding the connection open on it.
-            let expected = receiver.expected_sequence();
-            self.assembler.discard_before(expected);
+        self.continue_acked_release_later();
+        let cut = budget == 0 || gaps == MAX_EXPIRED_GAPS_PER_VISIT;
+        self.receive_expiry_continues |= cut;
+        self.continue_delivery_if_cut(cut);
+    }
+
+    /// TLPKTDROP moves the receive frontier past positions that can never
+    /// arrive, so a message whose first fragment is now behind that frontier
+    /// can never be completed either: retire it instead of holding the
+    /// connection open on it.
+    fn discard_assembly_behind_frontier(&mut self) {
+        if let Some(receiver) = self.receiver.as_ref() {
+            self.assembler.discard_before(receiver.expected_sequence());
         }
-        self.enqueue_ready_data(now);
     }
 
     fn handle_ack_timer(&mut self, now: Timestamp) {
@@ -3273,22 +3292,28 @@ impl SrtConnection {
     /// visit, so a local close delivers its whole buffered tail in the call
     /// that releases it -- once per connection.
     fn move_ready_data(&mut self, now: Timestamp, cap: usize) {
+        self.reclaim_retired_assembly();
+        let popped = self.pop_ready_data(now, cap);
+        self.continue_delivery_if_cut(popped == cap);
+    }
+
+    /// Release one visit's budget of a retired partial message.
+    fn reclaim_retired_assembly(&mut self) {
         if self.assembler.has_retired() {
             self.assembler.reclaim_retired(MAX_DELIVERY_PER_VISIT);
             self.sync_application_backlog();
         }
+    }
+
+    /// Pop up to `cap` ready packets into the application queue (never more
+    /// than it admits) and return how many were popped.
+    fn pop_ready_data(&mut self, now: Timestamp, cap: usize) -> usize {
         let available = self
             .options
             .delivery_queue_packets
             .saturating_sub(self.pending_data_events) as usize;
         if available == 0 {
-            if self.assembler.has_retired() && !self.event_overflowed {
-                self.queue_output(QueuedOutput::SetTimer {
-                    id: TimerId::DeliveryContinue,
-                    duration_micros: 0,
-                });
-            }
-            return;
+            return 0;
         }
 
         let visit = available.min(cap);
@@ -3320,9 +3345,15 @@ impl SrtConnection {
             }
         }
         self.sync_application_backlog();
-        // Cut by the visit cap, not by the queue or the receiver: continue.
-        // A spurious visit finds nothing ready and does nothing.
-        if (popped == cap || self.assembler.has_retired()) && !self.event_overflowed {
+        popped
+    }
+
+    /// Arm a zero-delay `DeliveryContinue` when a visit was cut by its cap
+    /// (not by the queue or the receiver) or a retired partial message is
+    /// still being released. A spurious visit finds nothing ready and does
+    /// nothing.
+    fn continue_delivery_if_cut(&mut self, cut: bool) {
+        if (cut || self.assembler.has_retired()) && !self.event_overflowed {
             self.queue_output(QueuedOutput::SetTimer {
                 id: TimerId::DeliveryContinue,
                 duration_micros: 0,
