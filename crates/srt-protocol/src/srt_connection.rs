@@ -2327,8 +2327,6 @@ impl SrtConnection {
             self.enqueue_ready_data(now);
             return;
         }
-        self.discard_assembly_behind_frontier();
-        self.reclaim_retired_assembly();
         let mut budget = MAX_DELIVERY_PER_VISIT;
         let mut gaps = 0;
         loop {
@@ -2350,6 +2348,7 @@ impl SrtConnection {
             }
             self.discard_assembly_behind_frontier();
         }
+        self.reclaim_retired_assembly();
         self.continue_acked_release_later();
         let cut = budget == 0 || gaps == MAX_EXPIRED_GAPS_PER_VISIT;
         self.receive_expiry_continues |= cut;
@@ -8305,6 +8304,68 @@ mod tests {
         assert_eq!(progress[..3], [gap, 2 * gap, 320]);
         assert_eq!(*progress.last().unwrap(), 320);
         assert_eq!(conn.receiver.as_ref().unwrap().stats().total_dropped, 160);
+    }
+
+    #[test]
+    fn tlpktdrop_continuations_preserve_a_message_larger_than_one_visit() {
+        assert_fragmented_message_survives_delivery_visits(false);
+    }
+
+    #[test]
+    fn tlpktdrop_shutdown_continuations_preserve_a_message_larger_than_one_visit() {
+        assert_fragmented_message_survives_delivery_visits(true);
+    }
+
+    fn assert_fragmented_message_survives_delivery_visits(peer_shutdown: bool) {
+        const PACKETS: u32 = 129;
+        let mut conn = SrtConnection::new_listener(ConnectionOptions {
+            tsbpd_delay: 120,
+            flow_window_packets: 256,
+            receive_buffer_packets: 256,
+            delivery_queue_packets: 256,
+            ..ConnectionOptions::default()
+        });
+        conn.peer_srt_flags = Some(srt_flags::TSBPDSND | srt_flags::TLPKTDROP);
+        conn.set_state(ConnectionState::Connected);
+        let _ = conn.poll_event();
+        conn.init_buffers(Timestamp::from_micros(0), 0, 0);
+        let arrived = Timestamp::from_micros(0);
+        for sequence in 0..PACKETS {
+            let mut packet = DataPacket::new(sequence, 7, 0, 0, vec![sequence as u8].into());
+            packet.position = match sequence {
+                0 => crate::srt_packet::PacketPosition::First,
+                n if n == PACKETS - 1 => crate::srt_packet::PacketPosition::Last,
+                _ => crate::srt_packet::PacketPosition::Middle,
+            };
+            conn.handle_data_packet(packet, arrived).expect("fragment");
+        }
+        if peer_shutdown {
+            conn.handle_shutdown(arrived).expect("peer shutdown");
+        }
+        let due = Timestamp::from_micros(120_000);
+        conn.handle_timer(TimerId::Ack, due)
+            .expect("delivery visit");
+        for _ in 0..3 {
+            conn.handle_timer(TimerId::DeliveryContinue, due)
+                .expect("delivery continuation");
+        }
+        let Some(ConnectionEvent::DataReceived {
+            payload,
+            packet_count,
+            ..
+        }) = conn.poll_event()
+        else {
+            panic!("complete fragmented message was not delivered");
+        };
+        assert_eq!(packet_count, PACKETS);
+        let delivered: Vec<u8> = payload
+            .chunks()
+            .flat_map(|chunk| chunk.iter().copied())
+            .collect();
+        assert_eq!(delivered, (0..PACKETS).map(|n| n as u8).collect::<Vec<_>>());
+        if peer_shutdown {
+            assert_peer_shutdown_terminal(&mut conn);
+        }
     }
 
     /// A local close releases the whole TSBPD-buffered tail in the call that

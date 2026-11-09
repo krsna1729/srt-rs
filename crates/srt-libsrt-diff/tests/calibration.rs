@@ -348,3 +348,26 @@ fn timestamps_cross_the_32_bit_wrap_without_early_delivery() {
     assert_eq!(trace.delivered[1].play_time_us, first_due + 11_000_001);
     assert_eq!(trace.delivered[2].play_time_us, first_due + 50_000_001);
 }
+
+#[test]
+fn an_empty_window_rejection_without_tlpktdrop_keeps_the_receiver_open() {
+    let profile = Profile {
+        tlpktdrop: false,
+        ..Profile::live(100, WINDOW)
+    };
+    let actions = [
+        Action::Insert(Packet::solo(100 + WINDOW, 1_000)),
+        Action::Insert(Packet::solo(100, 1_000)),
+        at(profile, profile.time_base_us, profile.deadline(1_000)),
+        Action::Read,
+    ];
+    let Some(trace) = agree(
+        "an_empty_window_rejection_without_tlpktdrop_keeps_the_receiver_open",
+        profile,
+        &actions,
+    ) else {
+        return;
+    };
+    assert_eq!(trace.admissions, [Admission::NoRoom, Admission::Accepted]);
+    assert_eq!(delivered_seqs(&trace), [100]);
+}

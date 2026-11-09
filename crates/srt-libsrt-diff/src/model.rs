@@ -9,8 +9,8 @@
 //!   core.cpp:10763); srt-rs counts both as duplicates
 //!   (`ReceiverBuffer::receive`, srt_receiver.rs). Both become
 //!   [`Admission::Old`]. A packet beyond the window is refused by both; on an
-//!   empty live buffer libsrt also closes the connection (core.cpp:10781-10805),
-//!   which ends the scenario ([`Receiver::closed`]).
+//!   empty live buffer with TLPKTDROP enabled, libsrt also closes the connection
+//!   (core.cpp:10781-10805), which ends the scenario ([`Receiver::closed`]).
 //! - **Loss ranges.** libsrt keeps one node per range in a linked list
 //!   (list.h:158-275); srt-rs reports numeric runs from a bitmap, split where
 //!   the 31-bit sequence wraps (`generate_periodic_nak`). Both are expanded to
