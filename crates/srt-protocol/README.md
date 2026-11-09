@@ -235,8 +235,11 @@ Packets carry what libsrt 1.5.7 emits:
   TSBPD loop. An unread packet before a loss keeps it recoverable, even if
   a later packet is due. The connection alternates delivery and expiry,
   with at most 64 packets/gaps per visit and a zero-delay `DeliveryContinue`
-  when capped. `ReceiverBuffer::drop_too_late` returns `Option<LossRange>`
-  (at most one head gap per call), not a list. A DROPREQ
+  when capped. Fragment assembly survives these delivery-only continuations;
+  only an actual expired gap invalidates an incomplete message. Retired
+  assembly storage is reclaimed once per visit, after gap expiry.
+  `ReceiverBuffer::drop_too_late` returns `Option<LossRange>` (at most one head
+  gap per call), not a list. A DROPREQ
   makes its packets unreachable at once; their storage is released in visits
   of at most 256 work units (`ReceiverBuffer::release_retired_packets`, run on
   each DATA, drop and ACK tick). See VENDOR.md, "Receive-side work bounds".

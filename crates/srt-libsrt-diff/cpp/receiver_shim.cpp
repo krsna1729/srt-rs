@@ -152,7 +152,7 @@ struct SrtDiffRx
 
         // core.cpp:10778-10816.
         if (bufidx >= int(buffer.capacity()))
-            return buffer.empty() ? SRT_DIFF_INSERT_DISCREPANCY : SRT_DIFF_INSERT_NO_ROOM;
+            return tlpktdrop && buffer.empty() ? SRT_DIFF_INSERT_DISCREPANCY : SRT_DIFF_INSERT_NO_ROOM;
 
         // core.cpp:10818-10828.
         const bool adding_successful = buffer.insert(u) >= 0;
