@@ -262,3 +262,64 @@ when they have installed a capable library.
 The automated suite is the reproducible form of the manual results. On a
 developer machine without the optional tools and development library, the
 corresponding scenarios skip; the CI image explicitly requires bonding.
+
+## Deterministic receiver differential
+
+`crates/srt-libsrt-diff` drives `ReceiverBuffer` and libsrt 1.5.7's real
+`CRcvBuffer`, `CTsbpdTime`, `CRcvLossList` and `CUnitQueue` with identical
+packet and synthetic-time streams. The C++ shim mirrors only the surrounding
+`CUDT` loss recording, live ACK-position calculation and head-gap TLPKTDROP
+service (`core.cpp:10738-10972,11200-11214,8318-8336,5669-5703,5856-5878`).
+No sockets, worker threads, sleeps or real-clock stream reads are used.
+
+Obtain the pinned [libsrt source](https://github.com/Haivision/srt/tree/899348d8318eb9a3c5a5b6ec43c4a1114288773a),
+then run from the repository root:
+
+```sh
+git clone https://github.com/Haivision/srt.git /tmp/libsrt-oracle
+git -C /tmp/libsrt-oracle checkout 899348d8318eb9a3c5a5b6ec43c4a1114288773a
+LIBSRT_SRC=/tmp/libsrt-oracle SRT_DIFF_REQUIRE_ORACLE=1 PROPTEST_CASES=10000 \
+  cargo test --locked --manifest-path crates/srt-libsrt-diff/Cargo.toml
+```
+
+A C++17 compiler is required. The build compiles the receive-side source
+closure with function/data sections and linker garbage collection; it does
+not download sources. Ordinary workspace builds exclude this package and
+remain native-dependency-free. Without `LIBSRT_SRC`, local differential
+tests explicitly report a skip; `SRT_DIFF_REQUIRE_ORACLE=1` turns that into
+a failure. CI sets both variables and checks out the exact revision above.
+Header changes in the source tree invalidate the native build too.
+
+The equality profile is live TSBPD with SOLO messages, no drift correction,
+and an application backlog held in the receiver rather than a separate
+delivery queue. Compare after every action:
+
+- exact delivered sequence, message number, bytes and absolute play time;
+- readiness at the same synthetic microsecond;
+- cumulative DATA ACK position and canonical circular loss/drop ranges.
+
+libsrt reserves one ring slot, so its physical ring is `W+1` for Rust's
+usable window `W`. Duplicate and belated admissions are both "old".
+Advertised free space is not equated: the implementations account
+acknowledged-but-unread data differently. libsrt's empty-buffer
+out-of-window disconnect ends a scenario explicitly; it is not counted as
+continued delivery agreement. No payload or deadline mismatch is ignored.
+Peer DROPREQ policy, fragmented-message assembly, ACKACK-driven drift and
+socket-level negotiation are outside this buffer profile; their existing
+protocol/property/live-interop tests remain necessary.
+
+Calibration covers non-monotone timestamps, missing and recovered heads,
+conflicting duplicates, window boundaries, DATA-sequence wrap and timestamp
+wrap. A self-test deliberately omits the C++ TLPKTDROP service and requires
+disagreement. Random streams include loss, replay, jitter, reads and deadline
+boundaries; a final bounded service/read tail checks eventual delivery.
+The separate CI job runs 10,000 cases and a 1,000-case native ASan/UBSan
+pass. Unknown divergences fail and shrink to a replayable action stream.
+
+The first finding was premature loss expiry behind an unread packet:
+`drop_too_late` could ACK beyond a recoverable loss when the successor was
+due but an earlier packet was not yet read. libsrt expires only a gap at
+the buffer head (`buffer_rcv.cpp:677-692`). The receiver now does the same;
+connection service alternates delivery and expiry within the existing
+visit budgets. `unread_head_keeps_a_later_loss_recoverable` pins this
+independently against libsrt.

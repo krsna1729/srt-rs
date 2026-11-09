@@ -362,10 +362,10 @@ fn tlpktdrop_expiry_advances_frontier_and_expected_seq() {
     let dropped = buf.drop_too_late(t_late);
     assert_eq!(
         dropped,
-        vec![LossRange {
+        Some(LossRange {
             first_seq: 0,
             last_seq: 0
-        }]
+        })
     );
     assert_eq!(buf.expected_sequence(), 6);
 
