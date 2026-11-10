@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794221153262,
+  "lastUpdate": 1794307540232,
   "repoUrl": "https://github.com/krsna1729/srt-rs",
   "entries": {
     "Benchmark": [
@@ -258,6 +258,43 @@ window.BENCHMARK_DATA = {
           {
             "name": "tokio",
             "value": 40554.6,
+            "unit": "pkt/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Saikrishna Edupuganti",
+            "username": "krsna1729",
+            "email": "6157640+krsna1729@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "ba833dd6b6521506e33b17075963a6103997e4c0",
+          "message": "Fix fragmented delivery across TLPKTDROP continuations (#192)\n\nIndependent review found that delivery-budget continuation invalidated a still-valid partial message against the cumulative receive frontier. Remove service-entry invalidation; invalidate only after actual head-gap expiry, then reclaim retired assembly once per visit so incomplete-message shutdown still completes.\n\nAlso match libsrt empty-buffer discrepancy handling only when TLPKTDROP is enabled, rather than silently ending disabled-drop differential scenarios.\n\nEvidence on vmi3423592 (AMD EPYC KVM, 6 vCPU): both 129-fragment production-connection regressions failed before, including peer shutdown; all 151 connection tests pass after. Disabled-drop calibration failed before with admissions [NoRoom] instead of [NoRoom, Accepted]; all 10 native libsrt calibration tests pass after. Commands: cargo test -p srt-proto --lib srt_connection::tests; LIBSRT_SRC=/tmp/srt-hunt/libsrt-1.5.7 SRT_DIFF_REQUIRE_ORACLE=1 cargo test --locked --manifest-path crates/srt-libsrt-diff/Cargo.toml --test calibration.",
+          "timestamp": "2026-11-09T03:20:39Z",
+          "url": "https://github.com/krsna1729/srt-rs/commit/ba833dd6b6521506e33b17075963a6103997e4c0"
+        },
+        "date": 1794307539315,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "compio",
+            "value": 26048.9,
+            "unit": "pkt/s"
+          },
+          {
+            "name": "mio",
+            "value": 63325.2,
+            "unit": "pkt/s"
+          },
+          {
+            "name": "tokio",
+            "value": 40635.2,
             "unit": "pkt/s"
           }
         ]
