@@ -166,6 +166,9 @@ struct SchedEntry {
 
 /// Coarse logical state of an outbound stream, independent of how many
 /// physical SRT legs currently carry it.
+///
+/// This is a protocol phase, not a writability guarantee. Use
+/// [`LogicalCallerMut::can_send`] to wait for key confirmation and capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogicalCallerState {
     Connecting,
