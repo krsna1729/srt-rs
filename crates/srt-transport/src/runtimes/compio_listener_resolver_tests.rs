@@ -164,7 +164,7 @@ fn stream_resolver(calls: &Arc<AtomicUsize>) -> ListenerAdmissionResolver {
 }
 
 /// Connect one direct caller (own Owner, own socket) and return the time it
-/// reached Connected, if it did.
+/// becomes writable, including directional-key confirmation, if it does.
 async fn connect_direct(
     listener: &mut Owner,
     addr: SocketAddr,
@@ -187,7 +187,11 @@ async fn connect_direct(
         1_000,
         rounds,
         |owners, now| {
-            if state(owners[1], &id) == Some(LogicalCallerState::Connected) {
+            if state(owners[1], &id) == Some(LogicalCallerState::Connected)
+                && owners[1]
+                    .logical_caller_mut(&id)
+                    .is_some_and(|mut caller| caller.can_send())
+            {
                 connected_at = Some(now);
                 true
             } else {

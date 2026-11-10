@@ -53,21 +53,13 @@ fn establish_pair(
     caller.connect(now).expect("caller connect");
 
     for _ in 0..10 {
-        let mut progress = false;
-        while let Some(out) = caller.poll_output().unwrap() {
-            progress = true;
-            if let ConnectionOutput::SendPacket(packet) = out {
-                let _ = listener.feed_recv_buf(&packet, now);
-            }
-        }
-        while let Some(out) = listener.poll_output().unwrap() {
-            progress = true;
-            if let ConnectionOutput::SendPacket(packet) = out {
-                let _ = caller.feed_recv_buf(&packet, now);
-            }
-        }
+        let caller_progress = forward_handshake_outputs(&mut caller, &mut listener, now);
+        let listener_progress = forward_handshake_outputs(&mut listener, &mut caller, now);
+        let progress = caller_progress || listener_progress;
         if caller.state() == ConnectionState::Connected
             && listener.state() == ConnectionState::Connected
+            && caller.can_send()
+            && listener.can_send()
         {
             break;
         }
@@ -79,13 +71,51 @@ fn establish_pair(
     assert_eq!(caller.state(), ConnectionState::Connected);
     assert_eq!(listener.state(), ConnectionState::Connected);
 
-    // Drain any remaining initial connection timer events
-    // Drain any remaining initial connection timer events and events
+    assert!(
+        caller.can_send() && listener.can_send(),
+        "directional keys confirmed"
+    );
+
+    // Drain remaining timer actions and connection events.
     while caller.poll_output().unwrap().is_some() {}
     while listener.poll_output().unwrap().is_some() {}
     while caller.poll_event().is_some() {}
     while listener.poll_event().is_some() {}
     (caller, listener)
+}
+
+fn forward_handshake_outputs(
+    sender: &mut SrtConnection,
+    receiver: &mut SrtConnection,
+    now: Timestamp,
+) -> bool {
+    let mut progress = false;
+    while let Some(out) = sender.poll_output().unwrap() {
+        progress = true;
+        if let ConnectionOutput::SendPacket(packet) = out {
+            receiver
+                .feed_recv_buf(&packet, now)
+                .expect("peer accepts handshake/KM");
+        }
+    }
+    progress
+}
+
+fn assert_received_payload(
+    receiver: &mut SrtConnection,
+    wire: &[u8],
+    now: Timestamp,
+    expected: &[u8],
+) {
+    receiver
+        .feed_recv_buf(wire, now)
+        .expect("receiver accepts DATA");
+    let event = receiver.poll_event().expect("receiver emits DATA");
+    assert!(
+        matches!(event, ConnectionEvent::DataReceived { payload, .. }
+        if payload.eq(expected)),
+        "receiver must decrypt the complete payload"
+    );
 }
 
 #[test]
@@ -224,7 +254,7 @@ fn wire_equivalence_plaintext() {
 #[test]
 fn wire_equivalence_ctr_modes() {
     for key_len in [KeyLength::Aes128, KeyLength::Aes192, KeyLength::Aes256] {
-        let (mut caller_a, _listener_a) =
+        let (mut caller_a, mut listener_a) =
             establish_pair(Some("shared_passphrase"), key_len, CipherMode::Ctr);
         let (mut caller_b, mut listener_b) =
             establish_pair(Some("shared_passphrase"), key_len, CipherMode::Ctr);
@@ -266,32 +296,16 @@ fn wire_equivalence_ctr_modes() {
             "the materialized length must be the datagram's wire length: {out:?}"
         );
 
-        assert_eq!(
-            packet_a, direct_buf,
-            "CTR {key_len:?} wire bytes must be byte-for-byte identical"
-        );
-
-        // Feed to receiver
-        listener_b
-            .feed_recv_buf(&direct_buf, now)
-            .expect("feed listener b");
-        let event = listener_b.poll_event().expect("event b");
-        if let ConnectionEvent::DataReceived {
-            payload: recv_payload,
-            ..
-        } = event
-        {
-            assert!(recv_payload.eq(payload.as_ref()));
-        } else {
-            panic!("unexpected event: {event:?}");
-        }
+        assert_eq!(&packet_a[..16], &direct_buf[..16], "CTR DATA headers");
+        assert_received_payload(&mut listener_a, &packet_a, now, &payload);
+        assert_received_payload(&mut listener_b, &direct_buf, now, &payload);
     }
 }
 
 #[test]
 fn wire_equivalence_gcm_modes() {
     for key_len in [KeyLength::Aes128, KeyLength::Aes256] {
-        let (mut caller_a, _listener_a) =
+        let (mut caller_a, mut listener_a) =
             establish_pair(Some("gcm_passphrase"), key_len, CipherMode::Gcm);
         let (mut caller_b, mut listener_b) =
             establish_pair(Some("gcm_passphrase"), key_len, CipherMode::Gcm);
@@ -331,32 +345,17 @@ fn wire_equivalence_gcm_modes() {
             "the materialized length must be the datagram's wire length: {out:?}"
         );
 
-        assert_eq!(
-            packet_a, direct_buf,
-            "GCM {key_len:?} wire bytes must be byte-for-byte identical"
-        );
-
-        listener_b
-            .feed_recv_buf(&direct_buf, now)
-            .expect("feed listener b");
-        let event = listener_b.poll_event().expect("event b");
-        if let ConnectionEvent::DataReceived {
-            payload: recv_payload,
-            ..
-        } = event
-        {
-            assert!(recv_payload.eq(payload.as_ref()));
-        } else {
-            panic!("unexpected event: {event:?}");
-        }
+        assert_eq!(&packet_a[..16], &direct_buf[..16], "GCM DATA headers");
+        assert_received_payload(&mut listener_a, &packet_a, now, &payload);
+        assert_received_payload(&mut listener_b, &direct_buf, now, &payload);
     }
 }
 
 #[test]
 fn wire_equivalence_retransmits() {
-    let (mut caller_a, _listener_a) =
+    let (mut caller_a, mut listener_a) =
         establish_pair(Some("retransmit_pass"), KeyLength::Aes128, CipherMode::Ctr);
-    let (mut caller_b, _listener_b) =
+    let (mut caller_b, mut listener_b) =
         establish_pair(Some("retransmit_pass"), KeyLength::Aes128, CipherMode::Ctr);
 
     let now = ts(300_000);
@@ -422,8 +421,15 @@ fn wire_equivalence_retransmits() {
         "the materialized length must be the datagram's wire length: {out:?}"
     );
 
-    // Retransmit wire bytes must match exactly
-    assert_eq!(retx_a, direct_buf);
+    assert_eq!(&retx_a[..16], &direct_buf[..16], "retransmission headers");
+    for (listener, original, retransmit) in [
+        (&mut listener_a, &pkts_a, &retx_a),
+        (&mut listener_b, &pkts_b, &direct_buf),
+    ] {
+        assert_received_payload(listener, &original[0], now, &[0; 50]);
+        assert_received_payload(listener, retransmit, now, &[1; 50]);
+        assert_received_payload(listener, &original[2], now, &[2; 50]);
+    }
 
     // Verify it is a DATA packet with R-bit set
     let parsed = SrtPacket::decode(&direct_buf).expect("valid srt packet");

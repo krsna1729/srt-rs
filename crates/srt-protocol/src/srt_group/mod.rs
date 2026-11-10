@@ -7,7 +7,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use bytes::Bytes;
 
 use crate::error::Error;
-use crate::srt_connection::{ConnectionEvent, ConnectionState, SrtConnection};
+use crate::srt_connection::{
+    ConnectionEvent, ConnectionState, GroupTime, MAX_DELIVERY_PER_VISIT, SrtConnection,
+};
 use crate::srt_handshake::{GroupType, SRTGROUP_MASK};
 use crate::srt_packet::sequence_less_than;
 use crate::time::Timestamp;
@@ -202,6 +204,14 @@ pub struct SrtGroup {
     members: Vec<SrtGroupMember>,
     next_send_sequence: Option<u32>,
     next_receive_sequence: Option<u32>,
+    /// First member's fixed TX origin and the logical receiver's current clock.
+    /// Membership changes can advance its wrap phase, never select its drift.
+    time: Option<GroupTime>,
+    /// Newest clock phase observed on accepted unique DATA, retained even if
+    /// its producer is removed. Published only when logical DATA progresses.
+    collected_time: Option<GroupTime>,
+    /// A bounded event collection stopped before reaching all queued work.
+    receive_continuation: bool,
     /// Complete payloads waiting behind a sequence gap, by sequence. Each is
     /// either in its member's `reserved` (that member holds a receive
     /// reservation for it) or in `owned`.
@@ -223,7 +233,7 @@ pub struct SrtGroup {
     /// Backup mode: what the carrier sent and its peer has not acknowledged,
     /// oldest first, so a standby that takes over replays it before new
     /// payload. Bounded by [`MAX_BACKUP_HISTORY`].
-    backup_history: VecDeque<(u32, Bytes)>,
+    backup_history: VecDeque<(u32, Bytes, Timestamp)>,
     /// The member that carried the last Backup send.
     backup_carrier: Option<u32>,
     /// The carrier has unacknowledged packets older than the history holds
@@ -256,6 +266,9 @@ impl SrtGroup {
             members: Vec::new(),
             next_send_sequence: None,
             next_receive_sequence: None,
+            time: None,
+            collected_time: None,
+            receive_continuation: false,
             pending: BTreeMap::new(),
             events: std::collections::VecDeque::new(),
             next_event_member: 0,
@@ -300,6 +313,25 @@ impl SrtGroup {
         Some(collision)
     }
 
+    /// A member may have released DATA before the group consumer polls it.
+    /// Membership changes retain only strictly newer wrap phases from that
+    /// physical progress; equal-phase drift belongs to logical DATA delivery.
+    fn refresh_receive_epoch(&mut self) {
+        let Some(time) = &mut self.time else {
+            return;
+        };
+        if let Some(collected) = self.collected_time {
+            time.advance_receive_epoch(collected);
+        }
+        for member in &self.members {
+            if member.peer_group_admitted
+                && let Some(advanced) = member.connection.group_time()
+            {
+                time.advance_receive_epoch(advanced);
+            }
+        }
+    }
+
     /// Bind the group to, or check the member against, the remote receiving
     /// group named by the member's handshake response. Returns `false` (and
     /// records the collision) when the member reports a different one. A
@@ -307,21 +339,23 @@ impl SrtGroup {
     /// handshake refuses it, as libsrt's `SRT_REJ_GROUP` does); a member that
     /// sent none has no identity to check.
     fn admit_peer_group(&mut self, index: usize) -> bool {
-        self.members[index].peer_group_admitted = true;
-        let Some(actual) = self.members[index]
+        // As in libsrt, the first connected member fixes the receive base
+        // before TLPKTDROP can make a later packet look like the prefix.
+        if self.next_receive_sequence.is_none() {
+            self.next_receive_sequence = self.members[index].connection.peer_initial_sequence();
+        }
+        let actual = self.members[index]
             .connection
             .peer_group_extension()
-            .map(|extension| extension.group_id)
-        else {
-            return true;
-        };
-        match self.peer_group_id {
-            None => {
+            .map(|extension| extension.group_id);
+        let admitted = match (self.peer_group_id, actual) {
+            (_, None) => true,
+            (None, Some(actual)) => {
                 self.peer_group_id = Some(actual);
                 true
             }
-            Some(expected) if expected == actual => true,
-            Some(expected) => {
+            (Some(expected), Some(actual)) if expected == actual => true,
+            (Some(expected), Some(actual)) => {
                 self.members[index].state = GroupMemberState::Broken;
                 self.collisions.push_back(PeerGroupCollision {
                     member_id: self.members[index].id,
@@ -330,7 +364,22 @@ impl SrtGroup {
                 });
                 false
             }
+        };
+        if admitted {
+            self.refresh_receive_epoch();
+            self.members[index].peer_group_admitted = true;
+            // libsrt synchronizeWithGroup/applyGroupTime: late members inherit
+            // the logical clock, not an idle physical leg's stale wrap epoch.
+            let time = self
+                .time
+                .or_else(|| self.members[index].connection.group_time());
+            if let Some(time) = time {
+                self.members[index].connection.inherit_group_time(time);
+                self.time = Some(time);
+                self.collected_time.get_or_insert(time);
+            }
         }
+        admitted
     }
 
     /// This group's ID, as carried on the wire.
@@ -367,7 +416,7 @@ impl SrtGroup {
         &mut self,
         member_id: u32,
         weight: u16,
-        connection: SrtConnection,
+        mut connection: SrtConnection,
     ) -> Result<(), Error> {
         if self.members.len() >= MAX_GROUP_MEMBERS {
             return Err(Error::invalid_state("group member limit reached"));
@@ -375,7 +424,11 @@ impl SrtGroup {
         if self.member(member_id).is_some() {
             return Err(Error::invalid_state("duplicate group member ID"));
         }
+        self.refresh_receive_epoch();
         let connected = connection.state() == ConnectionState::Connected;
+        if !connected && let Some(time) = self.time {
+            connection.inherit_group_time(time);
+        }
         let state = match self.mode {
             GroupMode::Broadcast => connected.then_some(GroupMemberState::Active),
             GroupMode::Backup => {
@@ -441,6 +494,7 @@ impl SrtGroup {
             .members
             .iter()
             .position(|member| member.id == member_id)?;
+        self.refresh_receive_epoch();
         let mut member = self.members.remove(index);
         self.next_event_member = self
             .next_event_member
@@ -522,6 +576,21 @@ impl SrtGroup {
         self.skipped_receive_packets
     }
 
+    /// Whether collected receive work remains: payloads, member-lifecycle
+    /// events, or a bounded collection that needs another visit. This does
+    /// not inspect uncollected physical connection queues; poll events until
+    /// they report no event before using it to finish logical teardown.
+    pub fn has_pending_data(&self) -> bool {
+        !self.pending.is_empty() || !self.events.is_empty() || self.receive_continuation
+    }
+
+    /// Whether the last event poll exhausted its bounded collection before
+    /// proving the physical queues empty. Unlike [`Self::has_pending_data`],
+    /// this requests immediate service, not waiting for a gap's deadline.
+    pub fn has_receive_continuation(&self) -> bool {
+        self.receive_continuation
+    }
+
     /// The oldest pending sequence, in wrapping order, in two ordered
     /// lookups. Pending sequences span less than half the sequence space,
     /// so either none lies half a space above the numerically first and that
@@ -574,6 +643,15 @@ impl SrtGroup {
         else {
             return false;
         };
+        // Terminal cores cannot recover a missing packet. The caller still
+        // has to drain their queued events before actually skipping it.
+        if self
+            .members
+            .iter()
+            .all(|member| member.connection.state() == ConnectionState::Disconnected)
+        {
+            return true;
+        }
         self.members
             .iter()
             .find(|member| member.id == packet.member_id)
@@ -590,18 +668,31 @@ impl SrtGroup {
         &mut self,
         next: u32,
         now: Timestamp,
+        budget: &mut usize,
     ) -> std::ops::ControlFlow<GroupEvent, u32> {
         use std::ops::ControlFlow::{Break, Continue};
-        if self.pending.contains_key(&next) || !self.gap_given_up(now) {
+        if self.pending.contains_key(&next) || self.receive_continuation || !self.gap_given_up(now)
+        {
             return Continue(next);
         }
+        let mut exhausted = true;
         for _ in 0..MAX_GROUP_MEMBERS {
-            if self.pending.contains_key(&next) || !self.collect_one_event() {
+            if self.receive_continuation
+                || self.pending.contains_key(&next)
+                || !self.collect_one_event(now, budget)
+            {
+                exhausted = false;
                 break;
             }
         }
+        self.receive_continuation |= exhausted && !self.pending.contains_key(&next);
         if let Some(event) = self.events.pop_front() {
             return Break(event);
+        }
+        // A queued sibling may still hold the missing prefix. A full visit
+        // is not proof of an empty queue, even after physical termination.
+        if self.receive_continuation {
+            return Continue(next);
         }
         match self.oldest_pending() {
             Some(oldest) if !self.pending.contains_key(&next) => {
@@ -631,14 +722,14 @@ impl SrtGroup {
         if limit == 0 {
             return GroupDataPoll {
                 packet: None,
-                continuation: !self.events.is_empty() || !self.pending.is_empty(),
+                continuation: self.has_pending_data(),
             };
         }
         for _ in 0..limit {
             let Some(event) = self.poll_event(now) else {
                 return GroupDataPoll {
                     packet: None,
-                    continuation: false,
+                    continuation: self.receive_continuation,
                 };
             };
             match event {
@@ -661,18 +752,21 @@ impl SrtGroup {
 
     /// Return the next member-lifecycle event or deduplicated group payload.
     pub fn poll_event(&mut self, now: Timestamp) -> Option<GroupEvent> {
+        self.receive_continuation = false;
         self.refresh_pending_states();
-        for _ in 0..MAX_GROUP_MEMBERS {
+        let mut delivery_budget = MAX_DELIVERY_PER_VISIT;
+        for visit in 0..MAX_GROUP_MEMBERS {
             if let Some(event) = self.events.pop_front() {
                 return Some(event);
             }
-            if !self.collect_one_event() {
+            if !self.collect_one_event(now, &mut delivery_budget) {
                 break;
             }
+            self.receive_continuation |= visit + 1 == MAX_GROUP_MEMBERS && self.pending.is_empty();
             if let Some(event) = self.events.pop_front() {
                 return Some(event);
             }
-            if !self.pending.is_empty() {
+            if self.receive_continuation || !self.pending.is_empty() {
                 break;
             }
         }
@@ -685,7 +779,7 @@ impl SrtGroup {
         let next = self
             .next_receive_sequence
             .or_else(|| self.oldest_pending())?;
-        let next = match self.skip_given_up_gap(next, now) {
+        let next = match self.skip_given_up_gap(next, now, &mut delivery_budget) {
             std::ops::ControlFlow::Continue(next) => next,
             std::ops::ControlFlow::Break(event) => return Some(event),
         };
@@ -698,26 +792,61 @@ impl SrtGroup {
             next.wrapping_add(1) & SEQUENCE_MASK,
             packet.packet_count.saturating_sub(1),
         );
-        for member in &mut self.members {
-            member.connection.advance_receive_sequence(following, now);
-        }
+        self.advance_member_receive_prefix(following, now);
         Some(GroupEvent::DataReceived(packet))
     }
 
-    fn collect_one_event(&mut self) -> bool {
+    fn advance_member_receive_prefix(&mut self, following: u32, now: Timestamp) {
+        if let (Some(time), Some(collected)) = (&mut self.time, self.collected_time) {
+            time.update_receive(collected);
+        }
+        for member in &mut self.members {
+            if let Some(time) = self.time
+                && (member.peer_group_admitted || member.state != GroupMemberState::Broken)
+            {
+                member.connection.inherit_group_time(time);
+            }
+            member.connection.advance_receive_sequence(following, now);
+            // Advancing the prefix can release queued DATA and finish a wrap.
+            // Only a newer phase can replace the logical producer's drift.
+            if member.peer_group_admitted
+                && let (Some(time), Some(advanced)) =
+                    (&mut self.time, member.connection.group_time())
+            {
+                time.advance_receive_epoch(advanced);
+            }
+        }
+        // No idle member may receive its first post-wrap packet in an old
+        // epoch. An already-ahead physical receiver never rewinds on inherit.
+        let Some(time) = self.time else {
+            return;
+        };
+        for member in &mut self.members {
+            if member.peer_group_admitted || member.state != GroupMemberState::Broken {
+                member.connection.inherit_group_time(time);
+            }
+        }
+    }
+
+    fn collect_one_event(&mut self, now: Timestamp, budget: &mut usize) -> bool {
         let len = self.members.len();
         if len == 0 {
             return false;
         }
         for offset in 0..len {
             let index = (self.next_event_member + offset) % len;
-            let event = self.members[index]
+            let (event, continuation) = self.members[index]
                 .connection
-                .poll_event_for_group()
-                .map(|event| (self.members[index].id, event));
-            let Some((member_id, event)) = event else {
+                .poll_event_for_group(now, budget);
+            self.receive_continuation |= continuation;
+            let Some(event) = event else {
+                if continuation {
+                    self.next_event_member = (index + 1) % len;
+                    return false;
+                }
                 continue;
             };
+            let member_id = self.members[index].id;
             self.next_event_member = (index + 1) % len;
             self.collect_member_event(index, member_id, event);
             return true;
@@ -795,6 +924,13 @@ impl SrtGroup {
         member.reserved.insert(packet.sequence_number);
         member.reserved_packets = member.reserved_packets.saturating_add(packet.packet_count);
         entry.insert(packet);
+        if let Some(time) = member.connection.group_time() {
+            if let Some(collected) = &mut self.collected_time {
+                collected.update_receive(time);
+            } else {
+                self.collected_time = Some(time);
+            }
+        }
         true
     }
 
@@ -903,6 +1039,7 @@ impl SrtGroup {
         for index in 0..self.members.len() {
             if self.members[index].state != GroupMemberState::Unstable
                 || self.members[index].connection.state() != ConnectionState::Connected
+                || !self.members[index].connection.can_send()
             {
                 continue;
             }

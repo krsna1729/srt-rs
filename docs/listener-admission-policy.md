@@ -214,6 +214,18 @@ resolver with `ListenerPeerPolicy { group: Set(Some(GroupConfig::new(id, mode)))
 - The receiving group id is independent of delivery mode; Broadcast and Backup
   behave alike.
 
+Inbound groups have the same `srt_proto::MAX_GROUP_MEMBERS` (64) member limit
+as outbound groups. A valid-cookie CONCLUSION that would exceed it receives
+`BAD_MODE` (1405) before establishment, rather than succeeding and failing
+during adoption. Concurrent half-open handshakes do not reserve slots: their
+CONCLUSIONs are serialized against the current membership. Established legs
+awaiting relocation do reserve their fallback capacity; relocation adoption
+rechecks the destination before taking ownership. Broken members retain their
+slots and receive-reservation ownership until group retirement, so replacement
+churn cannot bypass the limit. A destination that refuses a relocated leg
+returns its ownership through the existing failed-relocation path, as with
+other destination capacity limits.
+
 ## Reuseport and worker ownership
 
 For a single acceptor or shared listener loop, call `admit_with_resolver`

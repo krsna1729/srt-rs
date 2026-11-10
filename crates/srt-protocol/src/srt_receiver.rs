@@ -861,6 +861,22 @@ pub struct DropRangeSummary {
     pub losses_removed: u32,
 }
 
+/// The shared receive-clock state inherited by a newly connected group leg.
+/// Delay and RTT estimation remain properties of the individual connection.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GroupReceiveTime {
+    time_base: u64,
+    wrap_generation: u64,
+    wrapping: bool,
+    drift_us: i64,
+}
+
+impl GroupReceiveTime {
+    pub(crate) fn phase(self) -> (u64, bool) {
+        (self.wrap_generation, self.wrapping)
+    }
+}
+
 /// Receive buffer.
 #[derive(Debug)]
 pub struct ReceiverBuffer {
@@ -944,6 +960,8 @@ pub struct ReceiverBuffer {
 
     /// Whether the TSBPD wraparound period is active.
     wrapping_period_active: bool,
+    /// Counts completed timestamp carries independently of signed clock drift.
+    wrap_generation: u64,
 
     /// RTT (microseconds).
     rtt: u32,
@@ -1064,6 +1082,7 @@ impl ReceiverBuffer {
             first_rtt_sample: None,
             drift_tracer: TsbpdDriftTracer::default(),
             wrapping_period_active: false,
+            wrap_generation: 0,
             rtt: 100_000, // Initial RTT: 100ms
             rtt_var: 50_000,
             max_buffer_size,
@@ -1085,6 +1104,31 @@ impl ReceiverBuffer {
             rate_estimator: ReceivingRateEstimator::new(start_time),
             link_capacity_estimator: LinkCapacityEstimator::new(),
         }
+    }
+
+    pub(crate) fn group_time(&self) -> GroupReceiveTime {
+        GroupReceiveTime {
+            time_base: self.tsbpd_time_base,
+            wrap_generation: self.wrap_generation,
+            wrapping: self.wrapping_period_active,
+            drift_us: self.drift_tracer.drift_us(),
+        }
+    }
+
+    /// Changing a wrap epoch would reinterpret raw packets or losses that
+    /// can still be repaired in the old clock. Complete queued events are safe.
+    pub(crate) fn group_clock_drained(&self) -> bool {
+        self.packets.is_empty() && self.loss_list.is_empty()
+    }
+
+    pub(crate) fn inherit_group_time(&mut self, time: GroupReceiveTime) {
+        if time.phase() < self.group_time().phase() {
+            return;
+        }
+        self.tsbpd_time_base = time.time_base;
+        self.wrap_generation = time.wrap_generation;
+        self.wrapping_period_active = time.wrapping;
+        self.drift_tracer.drift_us = time.drift_us;
     }
 
     /// Enable/disable TSBPD.
@@ -1504,6 +1548,7 @@ impl ReceiverBuffer {
             let ts = entry.timestamp as u64;
             if (WRAPPING_PERIOD_END_MIN..=WRAPPING_PERIOD_END_MAX).contains(&ts) {
                 self.tsbpd_time_base += MAX_TIMESTAMP + 1;
+                self.wrap_generation += 1;
                 self.wrapping_period_active = false;
             }
         }
@@ -1541,6 +1586,11 @@ impl ReceiverBuffer {
         }
         let entry = self.packets.get(sequence)?;
         (!self.tsbpd_enabled || self.delivery_time(entry) <= now).then_some(sequence)
+    }
+
+    /// Whether the unread sequence head can be delivered without advancing it.
+    pub(crate) fn has_ready_data(&self, now: Timestamp) -> bool {
+        self.find_deliverable_seq(now).is_some()
     }
 
     /// The sequence [`Self::pop_ready`] would deliver at `now`, without

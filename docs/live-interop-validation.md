@@ -220,6 +220,10 @@ SRT_REQUIRE_BONDING=1 cargo test -p srt-bench --test libsrt_interop \
 uses that same switch in the cached sid image; developers opt into it only
 when they have installed a capable library.
 
+Native C fixtures try the canonical `-lsrt` before distro-specific library
+names, so the include, link and runtime paths above select the same SDK even
+when a distro `libsrt-gnutls` is also installed.
+
 ### Risks / decisions taken
 
 1. **stdin-epoll flake**: this sandbox saw "Failed to add FILE source to

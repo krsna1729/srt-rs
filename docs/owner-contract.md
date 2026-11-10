@@ -184,6 +184,11 @@ A bonded caller is ONE logical caller:
   the same `logical_caller`, `logical_caller_mut`, `retire_caller`, `remove_caller`,
   `poll_caller_events`, `poll_tx_failures`, `service`, `wait_for_activity` and
   `shutdown_and_drain` calls as a direct caller;
+* its event stream is bidirectional: one logical `Connected`, sequence-ordered
+  and deduplicated reverse `DataReceived`, then exactly one `Disconnected`.
+  Member failures remain internal while a sibling survives. Final termination
+  waits for every physical terminal event and the accepted group receive tail;
+  the bounded event drain counts suppressed physical lifecycle work as well;
 * it is one request to the bounded caller pool: one in-flight permit or one
   queue slot (`PoolOutcome::Admitted` / `Queued` / `Full`) however many legs it
   has, so `max_in_flight` and the queue bound count logical callers for direct

@@ -17,20 +17,24 @@ fn transfer(source: &mut SrtConnection, target: &mut SrtConnection, now: Timesta
 }
 
 fn establish_pair(options: ConnectionOptions) -> (SrtConnection, SrtConnection) {
-    let mut caller = SrtConnection::new_caller(ConnectionOptions {
-        tsbpd_delay: 0,
-        ..options.clone()
-    });
-    let mut listener = SrtConnection::new_listener(ConnectionOptions {
-        tsbpd_delay: 0,
-        ..options
-    });
-    caller.connect(ts(0)).expect("caller connects");
+    establish_pair_at(
+        ConnectionOptions {
+            tsbpd_delay: 0,
+            ..options
+        },
+        0,
+    )
+}
+
+fn establish_pair_at(options: ConnectionOptions, origin: u64) -> (SrtConnection, SrtConnection) {
+    let mut caller = SrtConnection::new_caller(options.clone());
+    let mut listener = SrtConnection::new_listener(options);
+    caller.connect(ts(origin)).expect("caller connects");
     // A zero-transit handshake: the listener's TSBPD base comes from the
     // CONCLUSION timestamp, so it must see the same transit as DATA.
     for _ in 0..10 {
-        transfer(&mut caller, &mut listener, ts(0));
-        transfer(&mut listener, &mut caller, ts(0));
+        transfer(&mut caller, &mut listener, ts(origin));
+        transfer(&mut listener, &mut caller, ts(origin));
         if caller.state() == ConnectionState::Connected
             && listener.state() == ConnectionState::Connected
         {
@@ -358,5 +362,70 @@ proptest! {
         let sent = if fitting == 0 { delivered } else { delivered + lost + fitting };
         let expected: Vec<Vec<u8>> = (0..sent).map(payload).collect();
         prop_assert_eq!(received, expected);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    #[test]
+    fn backup_replay_preserves_each_source_instant(
+        origin in 160_000u64..190_000,
+        spacing in 1u64..10_000,
+        count in 1usize..7,
+        initial_sequence in 0u32..=0x7fff_ffff,
+    ) {
+        let options = ConnectionOptions {
+            initial_seq: Some(initial_sequence),
+            tsbpd_delay: 120,
+            ..Default::default()
+        };
+        let (primary, primary_listener) = establish_pair_at(options.clone(), 0);
+        let mut sender = SrtGroup::new(0x4000_0063, GroupMode::Backup).unwrap();
+        sender.add_member(1, 100, primary).unwrap();
+        let mut receiver = SrtGroup::new(0x4000_0064, GroupMode::Backup).unwrap();
+        receiver.add_member(1, 100, primary_listener).unwrap();
+        prop_assert!(receiver.poll_data(ts(90_000)).is_none());
+
+        for index in 0..count {
+            let now = ts(100_000 + index as u64 * spacing);
+            prop_assert!(sender.can_send());
+            sender.send(&[index as u8], now).unwrap();
+            let _lost = drain(sender.member_mut(1).unwrap().connection_mut());
+        }
+        let (standby, listener) = establish_pair_at(options, origin);
+        sender.add_member(2, 1, standby).unwrap();
+        receiver.add_member(2, 1, listener).unwrap();
+        prop_assert!(receiver.poll_data(ts(origin)).is_none());
+        sender.mark_member_broken(1);
+        prop_assert!(sender.can_send());
+        sender.send(b"after", ts(200_000)).unwrap();
+        for packet in drain(sender.member_mut(2).unwrap().connection_mut()) {
+            receiver.member_mut(2).unwrap().connection_mut()
+                .feed_recv_buf(&packet, ts(200_000)).unwrap();
+        }
+        for index in 0..=count {
+            let source = if index == count { 200_000 } else { 100_000 + index as u64 * spacing };
+            let due = source + 120_000;
+            for at in [due - 1, due] {
+                let member = receiver.member_mut(2).unwrap().connection_mut();
+                member.handle_timer(TimerId::Ack, ts(at)).unwrap();
+                let _ = drain(member);
+                let packet = receiver.poll_data(ts(at));
+                if at < due {
+                    prop_assert!(packet.is_none());
+                } else {
+                    let packet = packet.expect("original source deadline");
+                    prop_assert_eq!(packet.source_time, ts(source));
+                    prop_assert_eq!(packet.sequence_number, initial_sequence.wrapping_add(index as u32) & 0x7fff_ffff);
+                    if index == count {
+                        prop_assert!(packet.payload.eq(&b"after"[..]));
+                    } else {
+                        prop_assert!(packet.payload.eq(&[index as u8][..]));
+                    }
+                }
+            }
+        }
+        prop_assert!(receiver.poll_data(ts(400_000)).is_none());
     }
 }

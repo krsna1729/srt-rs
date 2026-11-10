@@ -431,6 +431,8 @@ fn cache_gcm(sek: &[u8], key_length: KeyLength) -> Result<Option<CachedGcm>, Err
 /// How many replaced receive keys are remembered to refuse their
 /// reinstallation.
 const RX_RETIRED_CAPACITY: usize = 4;
+/// Reflection history has its own bound and holds no expanded schedules.
+const TX_RETIRED_CAPACITY: usize = 4;
 
 /// One receive-direction stream key: the SEK, the salt it was announced
 /// under (the IV/nonce input for DATA under this selector), and its cached
@@ -571,12 +573,13 @@ pub(crate) struct KeyStateForTest {
     pub rx_odd: Option<(Vec<u8>, [u8; 16])>,
     pub rx_kek_salt: Option<[u8; 16]>,
     pub rx_retired: Vec<Option<Vec<u8>>>,
+    pub tx_retired: Vec<Option<Vec<u8>>>,
 }
 
 /// Encryption context: the transmit keys (`kek` .. `gcm_odd`), which only
 /// local rotation changes, and the receive keys (`rx`), which only the
-/// peer's key material changes. The handshake's initial key seeds both
-/// directions as independent copies.
+/// peer's key material changes. The handshake initially seeds both; the
+/// connection replaces its local TX material before permitting DATA.
 pub struct CryptoContext {
     /// Key Encrypting Key (derived via PBKDF2).
     kek: Vec<u8>,
@@ -612,6 +615,9 @@ pub struct CryptoContext {
     passphrase: Zeroizing<Vec<u8>>,
     /// Receive-direction keys.
     rx: RxKeys,
+    /// Bounded reflection identities only, never retained cipher schedules.
+    tx_retired: [Option<Zeroizing<Vec<u8>>>; TX_RETIRED_CAPACITY],
+    tx_retired_next: usize,
 }
 
 // local patch (crates/srt-protocol/VENDOR.md, upstream issues
@@ -674,7 +680,9 @@ impl CryptoContext {
     /// `salt` and `sek` must be generated externally from a random source.
     /// The key is installed as the even transmit key and, as an independent
     /// copy, as the even receive key: HSv5's initial key material is
-    /// bidirectional.
+    /// bidirectional. `SrtConnection` establishes fresh local TX material
+    /// before DATA; low-level users must likewise avoid using this seeded
+    /// key/sequence space for transmission at both endpoints.
     pub fn new_sender(
         passphrase: &str,
         key_length: KeyLength,
@@ -767,10 +775,45 @@ impl CryptoContext {
             gcm_odd: None,
             passphrase: Zeroizing::new(passphrase.as_bytes().to_vec()),
             rx: RxKeys::default(),
+            tx_retired: Default::default(),
+            tx_retired_next: 0,
         };
         *ctx.rx.slot_mut(key_flag) = Some(rx_key);
         ctx.rebuild_cipher_cache()?;
         Ok(ctx)
+    }
+
+    /// Replace the unused handshake TX key with independent directional
+    /// material. The connection must announce it and gate DATA until KMRSP.
+    /// The handshake RX key remains available for legacy peers.
+    pub(crate) fn prepare_directional_tx(&mut self, sek: &[u8]) -> Result<(), Error> {
+        if sek.len() != self.key_length.len()
+            || sek.iter().all(|byte| *byte == 0)
+            || self.is_transmit_key(sek)
+            || self.rx.holds_elsewhere(sek)
+        {
+            return Err(Error::crypto_error("directional SEK must be fresh"));
+        }
+        self.remember_tx_key(self.current_key);
+        let target = match self.current_key {
+            KeyFlag::Even => &mut self.sek_even,
+            KeyFlag::Odd => &mut self.sek_odd,
+        };
+        target.zeroize();
+        target.clear();
+        target.extend_from_slice(sek);
+        self.rebuild_cipher_cache()
+    }
+
+    fn remember_tx_key(&mut self, flag: KeyFlag) {
+        let key = match flag {
+            KeyFlag::Even => &self.sek_even,
+            KeyFlag::Odd => &self.sek_odd,
+        };
+        if key.iter().any(|byte| *byte != 0) {
+            self.tx_retired[self.tx_retired_next] = Some(Zeroizing::new(key.clone()));
+            self.tx_retired_next = (self.tx_retired_next + 1) % TX_RETIRED_CAPACITY;
+        }
     }
 
     fn rebuild_cipher_cache(&mut self) -> Result<(), Error> {
@@ -1098,6 +1141,11 @@ impl CryptoContext {
                 .iter()
                 .map(|key| key.as_ref().map(|key| key.to_vec()))
                 .collect(),
+            tx_retired: self
+                .tx_retired
+                .iter()
+                .map(|key| key.as_ref().map(|key| key.to_vec()))
+                .collect(),
         }
     }
 
@@ -1126,6 +1174,7 @@ impl CryptoContext {
         }
 
         let new_key_flag = self.current_key.other();
+        self.remember_tx_key(new_key_flag);
 
         let target = match new_key_flag {
             KeyFlag::Even => &mut self.sek_even,
@@ -1191,6 +1240,7 @@ impl CryptoContext {
     pub fn decommission_old_key(&mut self) {
         // Zero the old key.
         let old_key = self.current_key.other();
+        self.remember_tx_key(old_key);
         match old_key {
             KeyFlag::Even => {
                 self.sek_even.fill(0);
@@ -1316,12 +1366,17 @@ impl CryptoContext {
         Ok(())
     }
 
-    /// Whether `sek` is in a transmit slot: the active key or the one being
-    /// announced. A decommissioned transmit key is zeroed, not remembered.
+    /// Whether `sek` is current, announced, or one of the last four
+    /// retired transmit keys. Retirement drops schedules, not this identity.
     fn is_transmit_key(&self, sek: &[u8]) -> bool {
         [&self.sek_even, &self.sek_odd]
             .into_iter()
             .any(|key| key.as_slice() == sek)
+            || self
+                .tx_retired
+                .iter()
+                .flatten()
+                .any(|key| key.as_slice() == sek)
     }
 }
 
