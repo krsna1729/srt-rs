@@ -334,6 +334,8 @@ fn setup_connected_pair(spec: CipherSpec, i: usize) -> (SrtConnection, SrtConnec
 
         if caller.state() == ConnectionState::Connected
             && listener.state() == ConnectionState::Connected
+            && caller.can_send()
+            && listener.can_send()
         {
             // Consume any immediately queued timer/control actions so timed
             // steady state does not inherit setup noise.

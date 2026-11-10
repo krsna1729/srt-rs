@@ -1011,6 +1011,97 @@ fn libsrt_live_caller_refreshes_key_with_rust_listener() {
     );
 }
 
+/// The caller sends with the handshake key immediately, while Rust confirms
+/// its independent listener TX key. Both directions use the same live socket
+/// and public APIs, rather than treating two one-way transfers as bidirectional.
+#[test]
+fn libsrt_encrypted_caller_and_rust_listener_exchange_bidirectional_data() {
+    let _guard = interop_test_lock();
+    let Some(binary) = compile_libsrt_fixture("libsrt_crypto_bidirectional") else {
+        return;
+    };
+    let socket = UdpSocket::bind(("127.0.0.1", 0)).expect("bind Rust listener");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let child = Command::new(binary)
+        .arg(socket.local_addr().unwrap().port().to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start encrypted bidirectional libsrt caller");
+    let start = Instant::now();
+    let mut buffer = [0; 2048];
+    let (size, address) = socket.recv_from(&mut buffer).expect("receive INDUCTION");
+    socket.connect(address).unwrap();
+    let mut listener = SrtConnection::new_listener(ConnectionOptions {
+        socket_id: 0x2000_0001,
+        syn_cookie: Some(7),
+        passphrase: Some("interop-passphrase".to_owned()),
+        key_length: KeyLength::Aes128,
+        ..ConnectionOptions::default()
+    });
+    listener
+        .feed_recv_buf(&buffer[..size], Timestamp::default())
+        .unwrap();
+    let payload = b"bidirectional encrypted payload";
+    let result = driver::run(
+        &mut listener,
+        &socket,
+        start,
+        Duration::from_secs(10),
+        Duration::from_secs(1),
+        |connection, _, now| {
+            assert!(
+                connection.can_send(),
+                "Connected must mean directional TX is confirmed"
+            );
+            connection
+                .send(payload, now)
+                .expect("send reverse encrypted DATA on Connected");
+        },
+    );
+    let output = wait_for_child(child, "encrypted bidirectional libsrt caller");
+    assert!(
+        output.status.success(),
+        "libsrt caller: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(result.connected, "listener events: {:?}", result.events);
+    assert_eq!(
+        output.stdout, payload,
+        "libsrt decrypts independent listener TX"
+    );
+    assert!(
+        received_payloads_match(&result.received_payloads, payload),
+        "listener events: {:?}",
+        result.events
+    );
+    let connected = result
+        .events
+        .iter()
+        .position(|event| event == "Connected")
+        .unwrap();
+    let received = result
+        .events
+        .iter()
+        .position(|event| event.starts_with("DataReceived("))
+        .unwrap();
+    assert!(
+        connected < received,
+        "early DATA overtook readiness: {:?}",
+        result.events
+    );
+    assert!(
+        result
+            .events
+            .iter()
+            .all(|event| !event.contains("error:") && !event.starts_with("Error:")),
+        "listener errors: {:?}",
+        result.events
+    );
+}
+
 /// Exercises real SRT ARQ end-to-end, rather than merely unit-testing NAK
 /// handling: a deterministic proxy drops every twentieth DATA packet on the
 /// libsrt-to-Rust path while forwarding all control traffic unchanged.
@@ -1579,7 +1670,7 @@ fn compile_libsrt_fixture(name: &str) -> Option<std::path::PathBuf> {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/{name}.c"));
     let output = scratch_dir("libsrt-bonding").join(name);
     let mut diagnostics = Vec::new();
-    for library in ["srt-gnutls", "srt-openssl", "srt"] {
+    for library in ["srt", "srt-gnutls", "srt-openssl"] {
         let result = Command::new("cc")
             .args(["-std=c11", "-Wall", "-Wextra", "-Werror"])
             .arg(&source)

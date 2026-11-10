@@ -103,6 +103,8 @@ fn setup_connected_pair_io(
         }
         if caller.state() == ConnectionState::Connected
             && listener.state() == ConnectionState::Connected
+            && caller.can_send()
+            && listener.can_send()
         {
             return (caller, caller_sock, listener, listener_sock, start);
         }

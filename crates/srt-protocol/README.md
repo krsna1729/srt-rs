@@ -151,6 +151,34 @@ clock. The older `sender_stats()` / `receiver_stats()` accessors remain
 available. Field semantics and the Restream/libSRT mapping are documented in
 [TELEMETRY.md](TELEMETRY.md).
 
+Bonded Broadcast and Backup receivers establish their logical receive base
+from the first connected member's peer handshake ISN. A first-collected leg
+that lost the prefix cannot discard a recoverable sibling copy, including
+across the 31-bit sequence wrap; collection and gap retirement remain bounded.
+Backup `can_send()` includes a standby able to retain the entire replay flight
+plus the next packet, so readiness-guarded sends can take over a full active
+window. `can_send_with_pacing(now)` also applies the existing stability timeout
+before checking the chosen carrier. Group legs inherit the first connected
+member's send-clock origin and the group's current receive timebase, wrap phase
+and drift. Explicit wrap generations prevent an idle member or removal order
+from regressing that clock. A member with unresolved raw packets, losses or a
+partial message defers a forward carry until that old-clock state is retired;
+complete queued messages already retain their converted source time. Takeover
+replay preserves source instants and spacing even when the new leg's handshake
+began later; admission service, pacing, RTO and key rotation use the current time.
+History bounds and refusal of an incomplete replay interval are unchanged.
+After every physical core is Disconnected, an unrecoverable group gap may be
+skipped to drain its accepted tail, but only after bounded collection proves
+no earlier member event or already-due raw DATA remains. Group polling refills
+freed application slots under one shared 64-action packet/retired-assembly
+budget; partial messages yield immediate continuation instead of proving an
+empty queue or requiring a separate ACK timer turn. Teardown adapters must drain
+`poll_event` and check `has_pending_data()` (including lifecycle events and
+bounded continuations) before emitting the logical terminal event; a Broken
+label or a physical Closing state alone is not terminal-drain proof.
+`has_receive_continuation()` distinguishes an immediate bounded-work requeue
+from a live pending payload that must wait for its normal gap deadline.
+
 ## Interop status
 
 Wire-compatible with real libsrt, verified both directions including
@@ -243,6 +271,12 @@ Packets carry what libsrt 1.5.7 emits:
   makes its packets unreachable at once; their storage is released in visits
   of at most 256 work units (`ReceiverBuffer::release_retired_packets`, run on
   each DATA, drop and ACK tick). See VENDOR.md, "Receive-side work bounds".
+- A peer-shutdown drain distinguishes due unread DATA from an incomplete,
+  unrecoverable tail. The inactivity timer cannot truncate a fully received
+  fragmented message merely because its first delivery visit ends before
+  the assembler emits an application event. A deferred inactivity decision
+  remains armed, so an incomplete tail exposed by continuation work still
+  closes instead of retaining the connection indefinitely.
 - The handshake peer-IP field carries the peer's IP, as libsrt's does; a
   libsrt peer reports it as its own local address. Transports set it with
   `SrtConnection::set_peer_address(SocketAddr)`, which replaces

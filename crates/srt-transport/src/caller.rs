@@ -59,7 +59,7 @@ impl LogicalCallerId {
     }
 }
 
-/// One logical event emitted by a direct caller (A05). The caller-side
+/// One logical event emitted by a direct or bonded caller. The caller-side
 /// counterpart to [`crate::AdmissionEvent`] -- no `representative_peer`
 /// field, since a caller's own configured remote address is already known
 /// to whoever holds its [`LogicalCallerId`].
@@ -364,6 +364,7 @@ impl LogicalCallerMut<'_> {
 
     /// Begin an orderly close. A bonded caller closes every physical leg.
     pub fn disconnect(&mut self, now: Timestamp) {
+        self.table.last_now = now;
         let exists = self.table.sessions.contains_key(&self.id);
         if !exists {
             return;
@@ -417,6 +418,8 @@ pub struct CallerTable {
     routes: IdHashMap<u32, CallerRoute>,
     ready_queue: VecDeque<LogicalCallerId>,
     event_ready_queue: VecDeque<LogicalCallerId>,
+    /// Latest packet/service/close time, used by the group's receive sequencer.
+    last_now: Timestamp,
     deadlines: LogicalDueIndex,
     sched: IdHashMap<LogicalCallerId, SchedEntry>,
     /// Table-owned reusable due scratch: `pop_due_ids` fills it, the fire
@@ -536,6 +539,9 @@ struct CallerGroupLegState {
     output_faulted: bool,
     /// Per-leg retirement token; see [`CallerLegState::output_failure`].
     output_failure: Option<ProtocolOutputFailure>,
+    connected: bool,
+    /// The member's terminal event has been consumed, after its DATA tail.
+    terminal: bool,
 }
 
 struct CallerGroupState {
@@ -544,6 +550,9 @@ struct CallerGroupState {
     leg_order: Vec<u32>,
     next_leg: usize,
     logical: GroupLogicalCounters,
+    connected_emitted: bool,
+    disconnected_emitted: bool,
+    disconnect_reason: Option<srt_proto::DisconnectReason>,
     /// The first peer-group collision of this logical caller, until drained.
     /// One collision already proves the bond spans receiving groups; further
     /// offending legs are still broken and disconnected but add no second
@@ -554,6 +563,128 @@ struct CallerGroupState {
 }
 
 impl CallerGroupState {
+    /// Translate physical lifecycle into one logical stream. In particular,
+    /// consuming a failed leg's event must not close a surviving sibling, and
+    /// terminal delivery waits until every leg's tail has crossed the group
+    /// deduplication/reservation boundary.
+    fn apply_event(&mut self, event: srt_proto::GroupEvent) -> Option<srt_proto::ConnectionEvent> {
+        use srt_proto::{ConnectionEvent, GroupEvent};
+        match event {
+            GroupEvent::MemberConnected { member_id } => {
+                self.legs
+                    .get_mut(&member_id)
+                    .expect("known group leg")
+                    .connected = true;
+                if self.connected_emitted {
+                    return None;
+                }
+                self.connected_emitted = true;
+                Some(ConnectionEvent::Connected)
+            }
+            GroupEvent::DataReceived(packet) => {
+                self.logical.payloads_received = self.logical.payloads_received.saturating_add(1);
+                self.logical.payload_bytes_received = self
+                    .logical
+                    .payload_bytes_received
+                    .saturating_add(packet.payload.len() as u64);
+                Some(ConnectionEvent::DataReceived {
+                    payload: packet.payload,
+                    sequence_number: packet.sequence_number,
+                    message_number: packet.message_number,
+                    timestamp: packet.timestamp,
+                    source_time: packet.source_time,
+                    packet_count: packet.packet_count,
+                })
+            }
+            GroupEvent::MemberDisconnected { member_id, reason } => {
+                self.legs
+                    .get_mut(&member_id)
+                    .expect("known group leg")
+                    .terminal = true;
+                self.disconnect_reason = Some(srt_proto::DisconnectReason::from_message(&reason));
+                None
+            }
+            GroupEvent::MemberError { member_id, error } => {
+                // Failed handshakes can terminate with Error alone. For live
+                // legs the following Disconnected event is the tail barrier.
+                if !self
+                    .legs
+                    .get(&member_id)
+                    .expect("known group leg")
+                    .connected
+                    && self.group.member(member_id).is_some_and(|member| {
+                        member.connection().state() == srt_proto::ConnectionState::Disconnected
+                    })
+                {
+                    self.legs
+                        .get_mut(&member_id)
+                        .expect("known group leg")
+                        .terminal = true;
+                }
+                self.disconnect_reason = Some(srt_proto::DisconnectReason::from_message(&error));
+                None
+            }
+        }
+    }
+
+    fn drain_events_bounded(
+        &mut self,
+        id: LogicalCallerId,
+        now: Timestamp,
+        max_events: usize,
+        group_work: &mut usize,
+        out: &mut Vec<CallerEvent>,
+    ) -> bool {
+        // Suppressed physical lifecycle events still cost work.
+        // One shared budget prevents a many-leg caller (or many
+        // such callers) from bypassing the bounded Owner drain.
+        while out.len() < max_events && *group_work < max_events {
+            let Some(event) = self.group.poll_event(now) else {
+                if let Some(event) = self.take_terminal_event() {
+                    out.push(CallerEvent { id, event });
+                }
+                break;
+            };
+            *group_work += 1;
+            if let Some(event) = self.apply_event(event) {
+                out.push(CallerEvent { id, event });
+            }
+        }
+        let terminal_work = self.has_event_continuation();
+        out.len() == max_events || *group_work == max_events || terminal_work
+    }
+
+    fn has_event_continuation(&self) -> bool {
+        self.group.has_receive_continuation()
+            || self.group.members().iter().any(|member| {
+                member.connection().state() == srt_proto::ConnectionState::Disconnected
+                    && !self
+                        .legs
+                        .get(&member.id())
+                        .expect("known group leg")
+                        .terminal
+            })
+            || (self.group.has_pending_data()
+                && self.group.members().iter().all(|member| {
+                    member.connection().state() == srt_proto::ConnectionState::Disconnected
+                }))
+    }
+
+    fn take_terminal_event(&mut self) -> Option<srt_proto::ConnectionEvent> {
+        if self.disconnected_emitted
+            || self.group.has_pending_data()
+            || !self.legs.values().all(|leg| leg.terminal)
+            || !self.group.members().iter().all(|member| {
+                member.connection().state() == srt_proto::ConnectionState::Disconnected
+            })
+        {
+            return None;
+        }
+        let reason = self.disconnect_reason.take()?;
+        self.disconnected_emitted = true;
+        Some(srt_proto::ConnectionEvent::Disconnected { reason })
+    }
+
     /// Disconnect every leg that answered from another receiving group and
     /// retain the caller's FIRST such collision as its one pending fault.
     /// Returns `true` when that fault is new (the caller must be indexed).
@@ -985,6 +1116,7 @@ impl CallerTable {
             routes: IdHashMap::with_capacity_and_hasher(bounded, Default::default()),
             ready_queue: VecDeque::with_capacity(bounded),
             event_ready_queue: VecDeque::with_capacity(bounded),
+            last_now: Timestamp::default(),
             deadlines: LogicalDueIndex::new(bounded),
             sched: IdHashMap::with_capacity_and_hasher(bounded, Default::default()),
             due_scratch: Vec::with_capacity(bounded.min(MAX_DUE_PER_VISIT)),
@@ -1480,6 +1612,8 @@ impl CallerTable {
                         pending: VecDeque::new(),
                         output_faulted: false,
                         output_failure: None,
+                        connected: false,
+                        terminal: false,
                     },
                 )
                 .is_some()
@@ -1518,6 +1652,9 @@ impl CallerTable {
                 leg_order,
                 next_leg: 0,
                 logical: GroupLogicalCounters::default(),
+                connected_emitted: false,
+                disconnected_emitted: false,
+                disconnect_reason: None,
                 peer_group_fault: None,
                 peer_group_fault_reported: false,
             })),
@@ -1534,6 +1671,7 @@ impl CallerTable {
         );
         self.sync_deadline(id);
         self.enqueue_ready(id);
+        self.enqueue_event_ready(id);
         Ok(id)
     }
     fn validate_socket_id(&self, connection: &SrtConnection) -> Result<u32, srt_proto::Error> {
@@ -1566,6 +1704,7 @@ impl CallerTable {
         data: &[u8],
         now: Timestamp,
     ) -> Result<bool, srt_proto::Error> {
+        self.last_now = now;
         let socket_id = srt_proto::wire::peek_destination_socket_id(data)?;
         let target_id = match self.routes.get(&socket_id).copied() {
             Some(route) => match route {
@@ -1731,6 +1870,7 @@ impl CallerTable {
         budget: OutputDrainBudget,
         sink: &mut S,
     ) -> (OutputDrainReport, usize) {
+        self.last_now = now;
         if budget.max_actions == 0 {
             return (
                 OutputDrainReport {
@@ -2158,7 +2298,7 @@ impl CallerTable {
         })
     }
 
-    /// Drain protocol events for every direct logical caller -- the
+    /// Drain protocol events for every logical caller -- the
     /// caller-side counterpart to [`crate::PeerTable::poll_events`]. The
     /// event-ready queue is populated by packet, timer, and lifecycle paths,
     /// so an idle table does not require a population scan.
@@ -2166,7 +2306,7 @@ impl CallerTable {
         let _ = self.poll_events_bounded(OutputDrainBudget::default().max_actions, out);
     }
 
-    /// Drain at most `max_events` direct caller events. Returns `true` when
+    /// Drain at most `max_events` caller events. Returns `true` when
     /// another event-ready caller remains queued. A zero limit is a useful
     /// probe and consumes nothing.
     pub fn poll_events_bounded(&mut self, max_events: usize, out: &mut Vec<CallerEvent>) -> bool {
@@ -2175,6 +2315,7 @@ impl CallerTable {
             return self.has_pending_events();
         }
         let mut visits = 0;
+        let mut group_work = 0;
         while visits < max_events && out.len() < max_events {
             let visit = self.pop_event_ready_visit();
             let EventReadyVisit::Live(id) = visit else {
@@ -2185,17 +2326,10 @@ impl CallerTable {
                 break;
             };
             visits += 1;
-            let filled = {
-                let Some(CallerSession::Direct(leg)) = self.sessions.get_mut(&id) else {
-                    continue;
-                };
-                while out.len() < max_events {
-                    let Some(event) = leg.connection.poll_event() else {
-                        break;
-                    };
-                    out.push(CallerEvent { id, event });
-                }
-                out.len() == max_events
+            let Some(filled) =
+                self.drain_caller_events_bounded(id, max_events, &mut group_work, out)
+            else {
+                continue;
             };
             // There is no protocol-side event-count accessor. If this visit
             // filled the caller-facing budget, leave a deduplicated marker so
@@ -2207,6 +2341,35 @@ impl CallerTable {
             }
         }
         self.has_pending_events()
+    }
+
+    fn drain_caller_events_bounded(
+        &mut self,
+        id: LogicalCallerId,
+        max_events: usize,
+        group_work: &mut usize,
+        out: &mut Vec<CallerEvent>,
+    ) -> Option<bool> {
+        match self.sessions.get_mut(&id)? {
+            CallerSession::Direct(leg) => {
+                while out.len() < max_events {
+                    let Some(event) = leg.connection.poll_event() else {
+                        break;
+                    };
+                    out.push(CallerEvent { id, event });
+                }
+                Some(out.len() == max_events)
+            }
+            CallerSession::Group(group) => {
+                let filled =
+                    group.drain_events_bounded(id, self.last_now, max_events, group_work, out);
+                // Delivery advances the members' receive prefixes and can
+                // generate ACK/timer work; use the same indexed output path.
+                self.sync_deadline(id);
+                self.enqueue_ready(id);
+                Some(filled)
+            }
+        }
     }
 
     /// Whether any event-ready queue entry remains. A stale entry is still
@@ -4000,6 +4163,239 @@ mod tests {
 
     #[test]
     #[expect(clippy::cognitive_complexity)]
+    fn inbound_broadcast_member_capacity_rejects_racing_and_churn_joins() {
+        let mut options = bonded_listener_options(0x2222);
+        let listener = options.connection_template.as_mut().expect("template");
+        listener.flow_window_packets = 64;
+        listener.receive_buffer_packets = 64;
+        listener.delivery_queue_packets = 64;
+        let telemetry = IngressTelemetry::new();
+        let mut table = PeerTable::new();
+        let caller_options = |index: u32| ConnectionOptions {
+            socket_id: 0x1000 + index,
+            initial_seq: Some(1234),
+            flow_window_packets: 64,
+            receive_buffer_packets: 64,
+            delivery_queue_packets: 64,
+            stream_id: Some("publish:capacity".to_string()),
+            group_extension: Some(srt_proto::handshake::GroupExtensionData {
+                group_id: srt_proto::handshake::SRTGROUP_MASK | 42,
+                group_type: srt_proto::handshake::GroupType::Broadcast,
+                flags: 0,
+                weight: 1,
+            }),
+            ..ConnectionOptions::default()
+        };
+        let address =
+            |index: usize| std::net::SocketAddr::from(([127, 0, 0, 1], 20_000 + index as u16));
+        let mut callers = Vec::new();
+        // Independent SRT handshakes, not an oversized BondedCallerConfig.
+        for index in 0..srt_proto::MAX_GROUP_MEMBERS - 1 {
+            let (mut caller, conclusion) = prepare_conclusion_with_options(
+                &mut table,
+                address(index),
+                caller_options(index as u32),
+                &options,
+                &telemetry,
+            );
+            finish_conclusion(
+                &mut table,
+                address(index),
+                &mut caller,
+                &conclusion,
+                &options,
+                &telemetry,
+            );
+            assert_eq!(caller.state(), srt_proto::ConnectionState::Connected);
+            callers.push(caller);
+        }
+        // Both contenders own valid cookies before either claims the last
+        // slot. The second CONCLUSION must recheck the now-full group.
+        let last = srt_proto::MAX_GROUP_MEMBERS - 1;
+        let (mut winner, winning_conclusion) = prepare_conclusion_with_options(
+            &mut table,
+            address(last),
+            caller_options(last as u32),
+            &options,
+            &telemetry,
+        );
+        let (mut excess, excess_conclusion) = prepare_conclusion_with_options(
+            &mut table,
+            address(last + 1),
+            caller_options((last + 1) as u32),
+            &options,
+            &telemetry,
+        );
+        finish_conclusion(
+            &mut table,
+            address(last),
+            &mut winner,
+            &winning_conclusion,
+            &options,
+            &telemetry,
+        );
+        callers.push(winner);
+        assert_eq!(
+            table.admit(
+                address(last + 1),
+                &excess_conclusion,
+                Timestamp::from_micros(2),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Rejected,
+            "valid 65th member is rejected before successful handshake/adoption"
+        );
+        let mut outbound = Vec::new();
+        table.poll_outbound(Timestamp::from_micros(2), &mut outbound);
+        let rejection = outbound
+            .iter()
+            .find(|(peer, _)| *peer == address(last + 1))
+            .expect("explicit rejection on the wire");
+        assert!(
+            excess
+                .feed_recv_buf(&rejection.1, Timestamp::from_micros(3))
+                .is_err()
+        );
+        assert_eq!(excess.state(), srt_proto::ConnectionState::Disconnected);
+        assert_eq!(table.established_count(), srt_proto::MAX_GROUP_MEMBERS);
+        assert_eq!(
+            table.bonded_stats()[0].connection.legs.len(),
+            srt_proto::MAX_GROUP_MEMBERS
+        );
+        let mut events = Vec::new();
+        let mut outbound_events = Vec::new();
+        for _ in 0..4 {
+            if !table.poll_events_bounded(64, &mut outbound_events) {
+                events.append(&mut outbound_events);
+                break;
+            }
+            events.append(&mut outbound_events);
+        }
+        assert_eq!(
+            events.len(),
+            1,
+            "one logical connection, no rejected leg event"
+        );
+        assert!(matches!(events[0].event, ConnectionEvent::Connected));
+        let logical_peer = events[0].logical_peer;
+
+        callers[0].disconnect(Timestamp::from_micros(4));
+        let shutdown = next_packet(&mut callers[0]);
+        assert_eq!(
+            table.admit(
+                address(0),
+                &shutdown,
+                Timestamp::from_micros(5),
+                &options,
+                0,
+                1,
+                &telemetry
+            ),
+            Admit::Fed,
+        );
+        table.poll_events(&mut events);
+        assert!(
+            events.is_empty(),
+            "one broken member does not terminate its sibling group"
+        );
+        assert!(
+            table.bonded_stats()[0]
+                .connection
+                .legs
+                .iter()
+                .any(|leg| leg.state == srt_proto::GroupMemberState::Broken)
+        );
+        let (mut replacement, conclusion) = prepare_conclusion_with_options(
+            &mut table,
+            address(last + 2),
+            caller_options((last + 2) as u32),
+            &options,
+            &telemetry,
+        );
+        assert_eq!(
+            table.admit(
+                address(last + 2),
+                &conclusion,
+                Timestamp::from_micros(6),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Rejected,
+            "retained broken member still owns capacity"
+        );
+        table.poll_outbound(Timestamp::from_micros(6), &mut outbound);
+        for (peer, packet) in &outbound {
+            if *peer == address(last + 2) {
+                assert!(
+                    replacement
+                        .feed_recv_buf(packet, Timestamp::from_micros(7))
+                        .is_err()
+                );
+            }
+        }
+        callers[1]
+            .send(b"survivor", Timestamp::from_micros(8))
+            .expect("existing leg sends");
+        let data = next_packet(&mut callers[1]);
+        assert_eq!(
+            table.admit(
+                address(1),
+                &data,
+                Timestamp::from_micros(9),
+                &options,
+                0,
+                1,
+                &telemetry
+            ),
+            Admit::Fed,
+        );
+        for _ in 0..32 {
+            table.poll_outbound(Timestamp::from_micros(125_000), &mut outbound);
+            table.poll_events(&mut outbound_events);
+            events.append(&mut outbound_events);
+            if !table.has_pending_output(Timestamp::from_micros(125_000))
+                && !table.has_pending_events()
+            {
+                break;
+            }
+        }
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].logical_peer, logical_peer);
+        assert!(matches!(&events[0].event,
+            ConnectionEvent::DataReceived { payload, .. } if payload.eq(b"survivor".as_slice())));
+
+        // Retirement releases capacity and invalidates old ready tokens.
+        drop(table.remove(logical_peer).expect("retire full group"));
+        let fresh_index = last + 3;
+        let (mut fresh, conclusion) = prepare_conclusion_with_options(
+            &mut table,
+            address(fresh_index),
+            caller_options(fresh_index as u32),
+            &options,
+            &telemetry,
+        );
+        finish_conclusion(
+            &mut table,
+            address(fresh_index),
+            &mut fresh,
+            &conclusion,
+            &options,
+            &telemetry,
+        );
+        table.poll_events(&mut events);
+        assert_eq!(events.len(), 1);
+        assert_ne!(events[0].logical_peer, logical_peer);
+        assert!(matches!(events[0].event, ConnectionEvent::Connected));
+        assert_eq!(table.bonded_stats()[0].connection.legs.len(), 1);
+    }
+
+    #[test]
+    #[expect(clippy::cognitive_complexity)]
     fn opted_in_bonded_inputs_share_one_logical_event_stream_and_telemetry() {
         let first = "127.0.0.1:10000".parse().expect("address");
         let second = "127.0.0.1:10001".parse().expect("address");
@@ -4430,6 +4826,179 @@ mod tests {
             }
         }
         (members, route, relocations, bind_failures)
+    }
+
+    fn assert_rejected_bond_caller_output(
+        source: &mut PeerTable,
+        peer: std::net::SocketAddr,
+        caller: &mut SrtConnection,
+    ) {
+        let mut outbound = Vec::new();
+        source.poll_outbound(Timestamp::from_micros(2), &mut outbound);
+        for (address, packet) in outbound {
+            if address == peer {
+                assert!(
+                    caller
+                        .feed_recv_buf(&packet, Timestamp::from_micros(3))
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    fn assert_pending_bond_relocation_ownership(
+        source: &mut PeerTable,
+        target: &mut PeerTable,
+        seed: &SrtConnection,
+    ) {
+        use crate::admission::PromotionWork;
+        let mut moved = Vec::new();
+        assert_eq!(
+            source.take_promotions(|_| Some(()), |work, ()| moved.push(work)),
+            0
+        );
+        let mut refused = Vec::new();
+        for work in moved {
+            let PromotionWork::Relocate(leg) = work else {
+                panic!("expected relocation")
+            };
+            if let Err(leg) = target.adopt(leg) {
+                refused.push(leg);
+            }
+        }
+        assert_eq!(
+            refused.len(),
+            1,
+            "destination independently enforces its own group cap"
+        );
+        assert_eq!(target.established_count(), srt_proto::MAX_GROUP_MEMBERS);
+        assert_eq!(
+            target.bonded_stats()[0].connection.legs.len(),
+            srt_proto::MAX_GROUP_MEMBERS
+        );
+        let returned = refused.pop().expect("owned refused leg");
+        assert_eq!(
+            returned.entry.conn.state(),
+            srt_proto::ConnectionState::Connected
+        );
+        assert!(
+            returned.entry.conn.peek_output().is_some(),
+            "successful session was not dropped"
+        );
+        // The Owner's usual failure path receives the intact session and can
+        // release its home slot once; a failed adopt charged no target memory.
+        assert!(
+            source.reclaim_lent_slot(source.slot_index_for_socket_id(returned.socket_id) as u32)
+        );
+        assert_eq!(source.lent_slot_count(), srt_proto::MAX_GROUP_MEMBERS - 1);
+        assert_eq!(
+            target.reserved_window_memory_bytes(),
+            srt_proto::MAX_GROUP_MEMBERS as u64 * seed.window_memory_bound_bytes()
+        );
+    }
+
+    #[test]
+    fn pending_bond_relocations_reserve_capacity_and_failed_adoption_returns_ownership() {
+        use crate::admission::TableRelocation;
+        let router: crate::admission::SharedWorkerRouter =
+            std::sync::Arc::new(std::sync::Mutex::new(srt_lifecycle::WorkerRouter::new(2)));
+        let make_table = |member| {
+            let mut table = PeerTable::with_partition(PeerTableConfig::default(), member, 2);
+            table.set_relocation(TableRelocation {
+                mode: srt_lifecycle::Promotion::Relocate,
+                member,
+                router: router.clone(),
+                exclusive: true,
+            });
+            table
+        };
+        let mut target = make_table(0);
+        let mut source = make_table(1);
+        let mut options = bonded_listener_options(0x2222);
+        let listener = options.connection_template.as_mut().expect("template");
+        listener.flow_window_packets = 64;
+        listener.receive_buffer_packets = 64;
+        listener.delivery_queue_packets = 64;
+        let caller_options = |index: u32| ConnectionOptions {
+            socket_id: 0x5000 + index,
+            initial_seq: Some(1234),
+            flow_window_packets: 64,
+            receive_buffer_packets: 64,
+            delivery_queue_packets: 64,
+            group_extension: Some(srt_proto::handshake::GroupExtensionData {
+                group_id: srt_proto::handshake::SRTGROUP_MASK | 83,
+                group_type: srt_proto::handshake::GroupType::Broadcast,
+                flags: 0,
+                weight: 1,
+            }),
+            ..ConnectionOptions::default()
+        };
+        let address =
+            |index: usize| std::net::SocketAddr::from(([127, 0, 0, 1], 30_000 + index as u16));
+        let telemetry = IngressTelemetry::new();
+        // First leg fixes the logical group's owner at member 1.
+        let (mut seed, conclusion) = prepare_conclusion_with_options(
+            &mut target,
+            address(0),
+            caller_options(0),
+            &options,
+            &telemetry,
+        );
+        finish_conclusion(
+            &mut target,
+            address(0),
+            &mut seed,
+            &conclusion,
+            &options,
+            &telemetry,
+        );
+        assert_eq!(target.bonded_stats()[0].connection.legs.len(), 1);
+        let mut callers = Vec::new();
+        for index in 1..=srt_proto::MAX_GROUP_MEMBERS {
+            let (mut caller, conclusion) = prepare_conclusion_with_options(
+                &mut source,
+                address(index),
+                caller_options(index as u32),
+                &options,
+                &telemetry,
+            );
+            finish_conclusion(
+                &mut source,
+                address(index),
+                &mut caller,
+                &conclusion,
+                &options,
+                &telemetry,
+            );
+            callers.push(caller);
+        }
+        assert!(
+            source.bonded_stats().is_empty(),
+            "all legs await relocation"
+        );
+        let excess_index = srt_proto::MAX_GROUP_MEMBERS + 1;
+        let (mut excess, conclusion) = prepare_conclusion_with_options(
+            &mut source,
+            address(excess_index),
+            caller_options(excess_index as u32),
+            &options,
+            &telemetry,
+        );
+        assert_eq!(
+            source.admit(
+                address(excess_index),
+                &conclusion,
+                Timestamp::from_micros(2),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ),
+            Admit::Rejected,
+            "pending legs must retain room for failed socket promotion"
+        );
+        assert_rejected_bond_caller_output(&mut source, address(excess_index), &mut excess);
+        assert_pending_bond_relocation_ownership(&mut source, &mut target, &seed);
     }
 
     #[test]

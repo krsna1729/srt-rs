@@ -56,7 +56,7 @@ impl SrtGroup {
         }
     }
 
-    /// Whether at least one active member can accept the next logical send.
+    /// Whether the group can accept the next logical send, including takeover.
     ///
     /// Broadcast attempts every active leg, but its logical send succeeds as
     /// soon as any member accepts the payload. A member whose sender window
@@ -65,28 +65,97 @@ impl SrtGroup {
     /// promotes a standby member while an unstable leg requalifies.
     pub fn can_send(&mut self) -> bool {
         self.refresh_states();
+        if self.mode == GroupMode::Backup {
+            return self.backup_send_ready(None);
+        }
         let active = self.active_indices();
         match self.mode {
             GroupMode::Broadcast => active
                 .iter()
                 .any(|&index| self.members[index].connection.can_send()),
-            GroupMode::Backup => active
-                .first()
-                .is_some_and(|&index| self.members[index].connection.can_send()),
+            GroupMode::Backup => unreachable!("Backup readiness handled above"),
         }
     }
 
     pub fn can_send_with_pacing(&mut self, now: Timestamp) -> bool {
         self.refresh_states();
+        if self.mode == GroupMode::Backup {
+            self.demote_stale_backup_carrier(now);
+            if !self.has_active_member() {
+                self.promote_backup_member();
+            }
+            return self.backup_send_ready(Some(now));
+        }
         let active = self.active_indices();
         match self.mode {
             GroupMode::Broadcast => active
                 .iter()
                 .any(|&index| self.members[index].connection.can_send_with_pacing(now)),
-            GroupMode::Backup => active
-                .first()
-                .is_some_and(|&index| self.members[index].connection.can_send_with_pacing(now)),
+            GroupMode::Backup => unreachable!("Backup readiness handled above"),
         }
+    }
+
+    /// Readiness includes the same pressure takeover that `send_backup`
+    /// attempts. Merely waiting for a full active window must not hide a
+    /// standby able to replay the complete retained flight plus a new packet.
+    fn backup_send_ready(&mut self, now: Option<Timestamp>) -> bool {
+        if let Some(carrier) = self
+            .backup_carrier
+            .and_then(|id| self.members.iter().position(|member| member.id == id))
+        {
+            self.trim_backup_history(carrier);
+        }
+        let Some(index) = self.members.iter().position(|member| {
+            member.state == GroupMemberState::Active
+                && member.connection.state() == ConnectionState::Connected
+        }) else {
+            return false;
+        };
+        if self.members[index].connection.can_send() {
+            return self.backup_member_ready(index, now);
+        }
+        // Match `promote_backup_member`'s priority, rather than advertising
+        // a lower-priority leg that the actual send would not choose.
+        self.members
+            .iter()
+            .enumerate()
+            .filter(|(_, member)| {
+                member.state == GroupMemberState::Standby
+                    && member.connection.state() == ConnectionState::Connected
+            })
+            .max_by_key(|(_, member)| (member.weight, std::cmp::Reverse(member.id)))
+            .is_some_and(|(index, _)| self.backup_member_ready(index, now))
+    }
+
+    fn backup_member_ready(&self, index: usize, now: Option<Timestamp>) -> bool {
+        let member = &self.members[index];
+        let connection = &member.connection;
+        if !now.map_or_else(
+            || connection.can_send(),
+            |now| connection.can_send_with_pacing(now),
+        ) {
+            return false;
+        }
+        let Some(sender) = connection.sender_buffer() else {
+            return false;
+        };
+        let takes_over = self.backup_carrier.is_some_and(|id| id != member.id);
+        let replay = if takes_over {
+            self.backup_history.len()
+        } else {
+            0
+        };
+        let sequence = self
+            .backup_history
+            .front()
+            .filter(|_| takes_over)
+            .map(|&(sequence, _, _)| sequence)
+            .or(self.next_send_sequence);
+        (!takes_over || replay == 0 || !self.backup_history_gap)
+            && (sender.remaining_window_packets() as usize) > replay
+            && sequence.is_none_or(|sequence| {
+                connection.next_sequence_number() == Some(sequence) || sender.is_empty()
+            })
     }
 
     pub fn time_until_send(&self, now: Timestamp) -> u64 {
@@ -165,7 +234,7 @@ impl SrtGroup {
                 .map_err(|_| Error::invalid_state("Backup promotion send failed"))?;
         }
         self.next_send_sequence = Some(sequence_number.wrapping_add(1) & 0x7FFF_FFFF);
-        self.record_backup_send(index, sequence_number, payload);
+        self.record_backup_send(index, sequence_number, payload, now);
         Ok(1)
     }
 
@@ -226,7 +295,7 @@ impl SrtGroup {
         let takes_over = self
             .backup_carrier
             .is_some_and(|carrier| carrier != member_id);
-        let Some(&(first, _)) = self.backup_history.front().filter(|_| takes_over) else {
+        let Some(&(first, _, _)) = self.backup_history.front().filter(|_| takes_over) else {
             return if self.next_send_sequence.is_some() {
                 self.align_member_sequence(member_id)
             } else {
@@ -250,21 +319,21 @@ impl SrtGroup {
         if (room as usize) <= self.backup_history.len() {
             return Err(refused());
         }
-        for (sequence, payload) in &self.backup_history {
+        for (sequence, payload, source_time) in &self.backup_history {
             connection
-                .send_shared_with_sequence(payload.clone(), *sequence, now)
+                .send_shared_with_sequence_at(payload.clone(), *sequence, *source_time, now)
                 .map_err(|_| refused())?;
         }
         Ok(())
     }
 
     /// Keep a sent payload until its carrier's peer acknowledges it.
-    fn record_backup_send(&mut self, index: usize, sequence: u32, payload: Bytes) {
+    fn record_backup_send(&mut self, index: usize, sequence: u32, payload: Bytes, now: Timestamp) {
         self.backup_carrier = Some(self.members[index].id);
         if self.backup_history.len() >= MAX_BACKUP_HISTORY {
             self.backup_history.pop_front();
         }
-        self.backup_history.push_back((sequence, payload));
+        self.backup_history.push_back((sequence, payload, now));
         self.trim_backup_history(index);
     }
 
@@ -282,14 +351,14 @@ impl SrtGroup {
         while self
             .backup_history
             .front()
-            .is_some_and(|&(front, _)| sequence_less_than(front, oldest))
+            .is_some_and(|&(front, _, _)| sequence_less_than(front, oldest))
         {
             self.backup_history.pop_front();
         }
         self.backup_history_gap = self
             .backup_history
             .front()
-            .is_some_and(|&(front, _)| sequence_less_than(oldest, front));
+            .is_some_and(|&(front, _, _)| sequence_less_than(oldest, front));
     }
 
     fn sequence_for_send(&self, active: &[usize]) -> Result<u32, Error> {

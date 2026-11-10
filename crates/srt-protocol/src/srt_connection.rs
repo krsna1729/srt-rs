@@ -27,10 +27,32 @@ use crate::srt_packet::{
     ControlPacket, ControlType, DataHeader, DataPacket, DatagramClass, PendingData,
     PendingDatagram, SRT_CMD_KMREQ, SRT_CMD_KMRSP, SRT_HEADER_SIZE, SrtPacket, sequence_less_than,
 };
-use crate::srt_receiver::{LossRange, MAX_EXPIRED_GAPS_PER_VISIT, ReceiverBuffer};
+use crate::srt_receiver::{
+    GroupReceiveTime, LossRange, MAX_EXPIRED_GAPS_PER_VISIT, ReceiverBuffer,
+};
 use crate::srt_sender::{NakReceipt, PeerRateFeedback, SenderBuffer};
 use crate::stats::ConnectionStats;
 use crate::time::Timestamp;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GroupTime {
+    start: Timestamp,
+    receive: GroupReceiveTime,
+}
+
+impl GroupTime {
+    pub(crate) fn update_receive(&mut self, time: Self) {
+        if time.receive.phase() >= self.receive.phase() {
+            self.receive = time.receive;
+        }
+    }
+
+    pub(crate) fn advance_receive_epoch(&mut self, time: Self) {
+        if time.receive.phase() > self.receive.phase() {
+            self.receive = time.receive;
+        }
+    }
+}
 
 const MAX_NAK_RECORD_SIZE: usize = 8;
 const NAK_CHUNK_INITIAL_CAPACITY: usize = 32;
@@ -234,7 +256,7 @@ const MAX_RETRANSMITS_PER_VISIT: usize = 32;
 /// plus event push) is cheaper than a retransmission (encrypt plus queue), so
 /// twice `MAX_RETRANSMITS_PER_VISIT` is a similar amount of work per visit;
 /// it also equals the transport's `OutputDrainBudget` action count.
-const MAX_DELIVERY_PER_VISIT: usize = 64;
+pub(crate) const MAX_DELIVERY_PER_VISIT: usize = 64;
 
 /// Hard fail-closed limits for protocol outputs retained by the sans-I/O
 /// core. The runtime normally drains these every pass; these limits protect
@@ -309,7 +331,7 @@ impl fmt::Display for DisconnectReason {
 /// A connection event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionEvent {
-    /// Connection established.
+    /// Application ready: handshake and initial TX key confirmation complete.
     Connected,
     /// One complete message, retaining packet chunks in order. Processing
     /// `payload.chunks()` preserves the message boundary without flattening.
@@ -729,6 +751,8 @@ enum KmRetryAction {
 struct KmControlState {
     /// Outgoing rotation awaiting acknowledgement (sender side).
     pending: Option<PendingKmRequest>,
+    /// Independent initial TX key still needs its runtime KMRSP.
+    initial_tx_pending: bool,
     acknowledged: KmHistory,
     /// Bound on the PBKDF2 work inbound KMREQs cause (receiver side).
     kek_derivations: KekDerivationBudget,
@@ -763,6 +787,8 @@ pub struct SrtConnection {
 
     /// Initial sequence number.
     initial_seq: u32,
+    /// Peer handshake ISN, retained even after the receive cursor advances.
+    peer_initial_seq: Option<u32>,
 
     /// Encryption context.
     /// Boxed: only encrypted sessions pay the context and expanded key
@@ -833,6 +859,9 @@ pub struct SrtConnection {
 
     /// Connection start time.
     start_time: Option<Timestamp>,
+    /// A pending group member must inherit RX time before its first DATA,
+    /// even if it arrives in the same ingress batch as CONCLUSION.
+    pending_group_receive_time: Option<GroupReceiveTime>,
 
     /// Last ACK send time.
     last_ack_time: Option<Timestamp>,
@@ -1360,6 +1389,7 @@ impl SrtConnection {
             peer_socket_id: 0,
             syn_cookie: 0,
             initial_seq,
+            peer_initial_seq: None,
             crypto: None,
             km_control: None,
             sender: None,
@@ -1383,6 +1413,7 @@ impl SrtConnection {
             output_overflowed: false,
             event_overflowed: false,
             start_time: None,
+            pending_group_receive_time: None,
             last_ack_time: None,
             last_nak_time: None,
             periodic_nak_resume: None,
@@ -1421,6 +1452,7 @@ impl SrtConnection {
             peer_socket_id: 0,
             syn_cookie: 0,
             initial_seq,
+            peer_initial_seq: None,
             crypto: None,
             km_control: None,
             sender: None,
@@ -1444,6 +1476,7 @@ impl SrtConnection {
             output_overflowed: false,
             event_overflowed: false,
             start_time: None,
+            pending_group_receive_time: None,
             last_ack_time: None,
             last_nak_time: None,
             periodic_nak_resume: None,
@@ -1793,7 +1826,9 @@ impl SrtConnection {
             .group_extension
             .map_or(Ok(()), ensure_libsrt_group)?;
 
-        self.start_time = Some(now);
+        if self.pending_group_receive_time.is_none() {
+            self.start_time = Some(now);
+        }
         self.handshake_started_at = Some(now);
         self.handshake_retry_sequence = 0;
         self.send_induction_request(now);
@@ -1850,6 +1885,7 @@ impl SrtConnection {
     /// `pacing_repay` only enables repay, the app must still signal waiting
     /// data via `set_pacing_demand`.
     fn init_buffers(&mut self, now: Timestamp, peer_initial_seq: u32, tsbpd_time_base: u64) {
+        self.peer_initial_seq = Some(peer_initial_seq & 0x7FFF_FFFF);
         let negotiated_window = self.negotiated_flow_window();
         let mut sender =
             SenderBuffer::new(self.initial_seq, negotiated_window, self.peer_tsbpd_delay);
@@ -1874,6 +1910,9 @@ impl SrtConnection {
             self.options.ack_interval_micros,
             self.options.light_ack_interval_packets,
         );
+        if let Some(time) = self.pending_group_receive_time.take() {
+            receiver.inherit_group_time(time);
+        }
         self.receiver = Some(receiver);
         self.last_ack_time = Some(now);
         self.last_nak_time = Some(now);
@@ -1937,6 +1976,7 @@ impl SrtConnection {
     }
 
     fn feed_decoded(&mut self, packet: SrtPacket, now: Timestamp) -> Result<(), Error> {
+        self.apply_pending_group_receive_time();
         let (dest_socket_id, is_handshake) = match &packet {
             SrtPacket::Data(packet) => (packet.dest_socket_id, false),
             SrtPacket::Control(packet) => (
@@ -2235,6 +2275,7 @@ impl SrtConnection {
 
     /// Process a timer event.
     pub fn handle_timer(&mut self, timer_id: TimerId, now: Timestamp) -> Result<(), Error> {
+        self.apply_pending_group_receive_time();
         match timer_id {
             TimerId::Handshake => self.handle_handshake_timer(now),
             TimerId::Keepalive => self.handle_keepalive_timer(now),
@@ -2488,13 +2529,23 @@ impl SrtConnection {
         if !self.peer_shutdown_pending {
             return;
         }
-        // Data was just delivered into the application's event queue above
-        // but not yet polled: that is progress, not a stalled drain, and
-        // must not be preempted by a terminal event. The periodic ACK tick
-        // (already running independently, far more frequently than this
-        // timer) keeps re-checking `finish_peer_shutdown_if_drained` as the
-        // application polls it down, so no explicit rearm is needed here.
-        if self.pending_data_events != 0 {
+        // A due unread head is also pending delivery, not an impossible
+        // tail: the visit budget may have stopped inside a complete
+        // fragmented message before it produced an application event.
+        // Queued application DATA is progress, not a stalled drain. Revisit
+        // expiry after continuation work or application polling: that work
+        // can expose an incomplete tail which ACK ticks cannot close.
+        if self.pending_data_events != 0
+            || self.receive_expiry_continues
+            || self
+                .receiver
+                .as_ref()
+                .is_some_and(|receiver| receiver.has_ready_data(now))
+        {
+            self.queue_output(QueuedOutput::SetTimer {
+                id: TimerId::Inactivity,
+                duration_micros: self.ack_timer_tick_micros(),
+            });
             return;
         }
         // A configured TSBPD delay can exceed the fixed inactivity timeout:
@@ -2553,7 +2604,7 @@ impl SrtConnection {
     /// Send shared payload data. Cheaply clones a reference-counted handle
     /// instead of deep-copying the payload — the fan-out path for proxies.
     pub fn send_shared(&mut self, payload: Bytes, now: Timestamp) -> Result<(), Error> {
-        self.send_shared_internal(payload, None, now)
+        self.send_shared_internal(payload, None, now, now)
     }
 
     /// Send shared payload with a caller-supplied SRT sequence number.
@@ -2563,7 +2614,19 @@ impl SrtConnection {
         sequence_number: u32,
         now: Timestamp,
     ) -> Result<(), Error> {
-        self.send_shared_internal(payload, Some(sequence_number), now)
+        self.send_shared_internal(payload, Some(sequence_number), now, now)
+    }
+
+    /// Replay group DATA with its original source time in this leg's clock,
+    /// while admission, pacing, encryption and service use the current time.
+    pub(crate) fn send_shared_with_sequence_at(
+        &mut self,
+        payload: Bytes,
+        sequence_number: u32,
+        source_time: Timestamp,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        self.send_shared_internal(payload, Some(sequence_number), source_time, now)
     }
 
     /// Send one message with a caller-supplied SRT sequence number.
@@ -2704,6 +2767,7 @@ impl SrtConnection {
         &mut self,
         payload: Bytes,
         sequence_number: Option<u32>,
+        source_time: Timestamp,
         now: Timestamp,
     ) -> Result<(), Error> {
         if self.state != ConnectionState::Connected {
@@ -2721,7 +2785,7 @@ impl SrtConnection {
             ));
         }
 
-        let timestamp = self.relative_timestamp(now);
+        let timestamp = self.relative_timestamp(source_time);
         let peer_socket_id = self.peer_socket_id;
 
         let packet = {
@@ -2730,10 +2794,14 @@ impl SrtConnection {
                 .as_mut()
                 .ok_or_else(|| Error::invalid_state("sender buffer not initialized"))?;
             match sequence_number {
-                Some(seq) => {
-                    sender.push_shared_with_sequence(payload, timestamp, peer_socket_id, now, seq)
-                }
-                None => sender.push_shared(payload, timestamp, peer_socket_id, now),
+                Some(seq) => sender.push_shared_with_sequence(
+                    payload,
+                    timestamp,
+                    peer_socket_id,
+                    source_time,
+                    seq,
+                ),
+                None => sender.push_shared(payload, timestamp, peer_socket_id, source_time),
             }
         };
 
@@ -2751,7 +2819,7 @@ impl SrtConnection {
                 "internal invariant violated: push_shared rejected an already-validated send",
             ));
         };
-        self.queue_first_transmission(header, payload, Some(now.as_micros()), now)?;
+        self.queue_first_transmission(header, payload, Some(source_time.as_micros()), now)?;
         if let Some(ref mut sender) = self.sender {
             sender.record_send_time(now);
         }
@@ -2780,6 +2848,11 @@ impl SrtConnection {
     /// gap must not become an accepted-then-silently-failed send that a
     /// plain `Err` return can't distinguish from an outright rejection).
     fn check_can_encrypt(&self) -> Result<(), Error> {
+        if self.initial_tx_pending() {
+            return Err(Error::invalid_state(
+                "directional encryption key is not confirmed",
+            ));
+        }
         if self
             .crypto
             .as_ref()
@@ -2813,6 +2886,11 @@ impl SrtConnection {
     /// Return the next sequence number assigned by the connection.
     pub fn next_sequence_number(&self) -> Option<u32> {
         self.sender.as_ref().map(SenderBuffer::next_sequence_number)
+    }
+
+    /// The receive base negotiated by the handshake, before any local drop.
+    pub(crate) fn peer_initial_sequence(&self) -> Option<u32> {
+        self.peer_initial_seq
     }
 
     /// The sender half, for a bonded group's Backup bookkeeping.
@@ -2862,16 +2940,24 @@ impl SrtConnection {
         }
     }
 
-    /// Whether sending is possible (checks window size only).
+    /// Whether sending is possible (window space and confirmed TX key).
     pub fn can_send(&self) -> bool {
-        self.sender.as_ref().is_some_and(|s| s.can_send())
+        !self.initial_tx_pending() && self.sender.as_ref().is_some_and(|s| s.can_send())
     }
 
     /// Whether sending is possible, including packet pacing.
     pub fn can_send_with_pacing(&self, now: Timestamp) -> bool {
-        self.sender
+        !self.initial_tx_pending()
+            && self
+                .sender
+                .as_ref()
+                .is_some_and(|s| s.can_send_with_pacing(now))
+    }
+
+    pub(crate) fn initial_tx_pending(&self) -> bool {
+        self.km_control
             .as_ref()
-            .is_some_and(|s| s.can_send_with_pacing(now))
+            .is_some_and(|state| state.initial_tx_pending)
     }
 
     /// Time to wait until the next send is possible (microseconds).
@@ -2916,8 +3002,39 @@ impl SrtConnection {
         self.poll_event_inner(false)
     }
 
-    pub(crate) fn poll_event_for_group(&mut self) -> Option<ConnectionEvent> {
-        self.poll_event_inner(true)
+    pub(crate) fn poll_event_for_group(
+        &mut self,
+        now: Timestamp,
+        budget: &mut usize,
+    ) -> (Option<ConnectionEvent>, bool) {
+        let event = self.poll_event_inner(true);
+        let live = matches!(
+            self.state,
+            ConnectionState::Connected | ConnectionState::Closing
+        );
+        if live {
+            // One budget covers every member's raw delivery and retired
+            // assembly, including refilling a slot freed by a duplicate.
+            let reclaimed = self.assembler.reclaim_retired(*budget);
+            *budget -= reclaimed;
+            if reclaimed != 0 {
+                self.sync_application_backlog();
+            }
+            *budget -= self.pop_ready_data(now, *budget);
+            self.continue_delivery_if_cut(*budget == 0);
+            self.apply_pending_group_receive_time();
+            self.finish_peer_shutdown_if_drained();
+        }
+        let event = event.or_else(|| self.poll_event_inner(true));
+        let continuation = live
+            && (self.assembler.has_retired()
+                || (!self.initial_tx_pending()
+                    && self.pending_data_events < self.options.delivery_queue_packets
+                    && self
+                        .receiver
+                        .as_ref()
+                        .is_some_and(|receiver| receiver.has_ready_data(now))));
+        (event, continuation)
     }
 
     fn poll_event_inner(&mut self, retain_data_reservation: bool) -> Option<ConnectionEvent> {
@@ -3261,6 +3378,38 @@ impl SrtConnection {
         }
     }
 
+    pub(crate) fn group_time(&self) -> Option<GroupTime> {
+        Some(GroupTime {
+            start: self.start_time?,
+            receive: self.receiver.as_ref()?.group_time(),
+        })
+    }
+
+    pub(crate) fn inherit_group_time(&mut self, time: GroupTime) {
+        self.start_time = Some(time.start);
+        if self
+            .pending_group_receive_time
+            .is_none_or(|pending| time.receive.phase() >= pending.phase())
+        {
+            self.pending_group_receive_time = Some(time.receive);
+        }
+        self.apply_pending_group_receive_time();
+    }
+
+    fn apply_pending_group_receive_time(&mut self) {
+        let (Some(time), Some(receiver)) = (self.pending_group_receive_time, &mut self.receiver)
+        else {
+            return;
+        };
+        if time.phase() > receiver.group_time().phase()
+            && (!receiver.group_clock_drained() || self.assembler.pending_packet_count() != 0)
+        {
+            return;
+        }
+        receiver.inherit_group_time(time);
+        self.pending_group_receive_time = None;
+    }
+
     fn relative_timestamp(&self, now: Timestamp) -> u32 {
         // Returns 0 only when the session clock has not been stamped yet.
         // Both handshake roles stamp start_time before sending any response
@@ -3294,6 +3443,7 @@ impl SrtConnection {
         self.reclaim_retired_assembly();
         let popped = self.pop_ready_data(now, cap);
         self.continue_delivery_if_cut(popped == cap);
+        self.apply_pending_group_receive_time();
     }
 
     /// Release one visit's budget of a retired partial message.
@@ -3307,6 +3457,9 @@ impl SrtConnection {
     /// Pop up to `cap` ready packets into the application queue (never more
     /// than it admits) and return how many were popped.
     fn pop_ready_data(&mut self, now: Timestamp, cap: usize) -> usize {
+        if self.initial_tx_pending() {
+            return 0;
+        }
         let available = self
             .options
             .delivery_queue_packets
@@ -3630,6 +3783,45 @@ impl SrtConnection {
         )?));
         self.km_control = Some(Box::new(KmControlState::default()));
         Ok(())
+    }
+
+    /// Either role must stop using the shared handshake key for TX:
+    /// a legacy peer may still use that key for its own DATA.
+    fn prepare_initial_directional_tx(&mut self, now: Timestamp) -> Result<(), Error> {
+        let Some(crypto) = self.crypto.as_deref_mut() else {
+            return Ok(());
+        };
+        let mut sek = Zeroizing::new(vec![0; crypto.key_length().len()]);
+        Self::random_bytes(&mut sek, "directional stream encryption key")?;
+        crypto.prepare_directional_tx(&sek)?;
+        let request = KmMessage::new(
+            crypto.current_key(),
+            crypto.key_length(),
+            *crypto.salt(),
+            crypto.wrap_sek(crypto.current_key())?,
+            crypto.cipher_mode(),
+        );
+        let state = self.km_control.get_or_insert_with(Box::default);
+        state.initial_tx_pending = true;
+        state.pending = Some(PendingKmRequest {
+            request,
+            next_retry: now.add_micros(KM_REQUEST_RETRY_INTERVAL_MICROS),
+            retries_left: Some(KM_REQUEST_MAX_RETRIES),
+        });
+        Ok(())
+    }
+
+    fn announce_initial_tx(&mut self, now: Timestamp) {
+        if let Some(request) = self
+            .km_control
+            .as_ref()
+            .and_then(|state| state.pending.as_ref())
+            .map(|pending| pending.request.clone())
+        {
+            self.send_km_request(&request, now);
+        } else {
+            self.queue_event(ConnectionEvent::Connected);
+        }
     }
 
     /// Reject peer versions this HSv5-only implementation cannot negotiate.
@@ -4010,6 +4202,7 @@ impl SrtConnection {
         );
 
         self.validate_caller_kmrsp(&hs)?;
+        self.prepare_initial_directional_tx(now)?;
 
         self.handshake_state = HandshakeState::Completed;
         self.handshake_started_at = None;
@@ -4027,7 +4220,7 @@ impl SrtConnection {
         });
         self.setup_connection_timers();
         self.clear_config_secrets();
-        self.queue_event(ConnectionEvent::Connected);
+        self.announce_initial_tx(now);
         Ok(())
     }
 
@@ -4199,6 +4392,7 @@ impl SrtConnection {
             };
             self.crypto = Some(Box::new(crypto));
             self.km_control = Some(Box::new(KmControlState::default()));
+            self.prepare_initial_directional_tx(now)?;
             self.received_km = Some(Box::new(km));
         } else if hs.get_km_request().is_some() {
             return Err(self.fail_listener_km(
@@ -4234,7 +4428,7 @@ impl SrtConnection {
         });
         self.setup_connection_timers();
         self.clear_config_secrets();
-        self.queue_event(ConnectionEvent::Connected);
+        self.announce_initial_tx(now);
     }
 
     fn handle_ack(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
@@ -4576,7 +4770,7 @@ impl SrtConnection {
     fn handle_user_defined(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
         match pkt.subtype {
             SRT_CMD_KMREQ => self.handle_km_request(&pkt.control_info, now),
-            SRT_CMD_KMRSP => self.handle_km_response(&pkt.control_info),
+            SRT_CMD_KMRSP => self.handle_km_response(&pkt.control_info, now),
             _ => {
                 // Ignore unknown UserDefined packets.
                 Ok(())
@@ -4632,7 +4826,8 @@ impl SrtConnection {
     /// Only the exact request that is outstanding completes the transaction:
     /// a duplicate acknowledgement is stale, and one for a different
     /// generation does not prove the peer installed *this* key.
-    fn handle_km_response(&mut self, control_info: &[u8]) -> Result<(), Error> {
+    /// A late response cannot announce readiness after terminal close.
+    fn handle_km_response(&mut self, control_info: &[u8], now: Timestamp) -> Result<(), Error> {
         // A one-word KMRSP is the peer reporting a key-material error state.
         // The reference recognises it during an established session and
         // ignores it without changing security state
@@ -4642,6 +4837,9 @@ impl SrtConnection {
             return KmError::from_state_bytes(state)
                 .map(|_| ())
                 .ok_or_else(|| Error::invalid_data("unknown KMRSP error code"));
+        }
+        if self.state != ConnectionState::Connected {
+            return Err(Error::invalid_data("KMRSP outside a connected session"));
         }
         let km = KmMessage::decode(control_info)?;
         let state = self
@@ -4662,6 +4860,10 @@ impl SrtConnection {
         }
         state.pending = None;
         state.acknowledged.remember(km);
+        if std::mem::take(&mut state.initial_tx_pending) {
+            self.queue_event(ConnectionEvent::Connected);
+            self.enqueue_ready_data(now);
+        }
         Ok(())
     }
 
@@ -6475,24 +6677,23 @@ mod tests {
             .expect("caller starts");
         for round in 0..4 {
             let now = Timestamp::from_micros(round * 10_000);
-            while let Some(ConnectionOutput::SendPacket(packet)) = caller.poll_output().unwrap() {
-                listener
-                    .feed_recv_buf(&packet, now)
-                    .expect("listener accepts packet");
-            }
-            while let Some(ConnectionOutput::SendPacket(packet)) = listener.poll_output().unwrap() {
-                caller
-                    .feed_recv_buf(&packet, now)
-                    .expect("caller accepts packet");
-            }
+            forward_handshake_round(caller, listener, now);
+            forward_handshake_round(listener, caller, now);
             if caller.state() == ConnectionState::Connected
                 && listener.state() == ConnectionState::Connected
+                && !listener.initial_tx_pending()
+                && !caller.initial_tx_pending()
             {
                 break;
             }
         }
         assert_eq!(caller.state(), ConnectionState::Connected);
         assert_eq!(listener.state(), ConnectionState::Connected);
+        assert!(!listener.initial_tx_pending(), "directional TX confirmed");
+        assert!(
+            !caller.initial_tx_pending(),
+            "caller directional TX confirmed"
+        );
     }
 
     /// Default-options caller/listener pair, already `Connected`.
@@ -8307,25 +8508,165 @@ mod tests {
     }
 
     #[test]
+    fn inactivity_preserves_expiry_work_after_a_fragment_budget_cut() {
+        let mut conn = SrtConnection::new_listener(ConnectionOptions {
+            tsbpd_delay: 8_000,
+            flow_window_packets: 128,
+            receive_buffer_packets: 128,
+            ..ConnectionOptions::default()
+        });
+        conn.peer_srt_flags = Some(srt_flags::TSBPDSND | srt_flags::TLPKTDROP);
+        conn.set_state(ConnectionState::Connected);
+        let _ = conn.poll_event();
+        let arrived = Timestamp::from_micros(0);
+        conn.init_buffers(arrived, 0, 0);
+        for sequence in 0..MAX_DELIVERY_PER_VISIT as u32 {
+            let mut packet = DataPacket::new(sequence, 7, 0, 0, vec![1].into());
+            packet.position = if sequence == 0 {
+                crate::srt_packet::PacketPosition::First
+            } else {
+                crate::srt_packet::PacketPosition::Middle
+            };
+            conn.handle_data_packet(packet, arrived).expect("fragment");
+        }
+        conn.handle_data_packet(
+            DataPacket::new(65, 8, 0, 0, b"tail".to_vec().into()),
+            arrived,
+        )
+        .expect("complete message after the missing last fragment");
+        conn.handle_shutdown(arrived).expect("peer shutdown");
+        let due = Timestamp::from_micros(8_000_000);
+        conn.handle_timer(TimerId::Inactivity, due)
+            .expect("deadline");
+        conn.handle_timer(TimerId::DeliveryContinue, due)
+            .expect("expiry continuation");
+        assert_delivered_payload(&mut conn, b"tail");
+        assert_peer_shutdown_terminal(&mut conn);
+    }
+
+    #[test]
+    fn deferred_inactivity_still_closes_an_incomplete_fragment_tail() {
+        for tlpktdrop in [false, true] {
+            assert_incomplete_tail_reaches_terminal(tlpktdrop);
+        }
+    }
+
+    fn assert_incomplete_tail_reaches_terminal(tlpktdrop: bool) {
+        let mut conn = SrtConnection::new_listener(ConnectionOptions {
+            tsbpd_delay: 8_000,
+            flow_window_packets: 128,
+            receive_buffer_packets: 128,
+            ..ConnectionOptions::default()
+        });
+        conn.peer_srt_flags =
+            Some(srt_flags::TSBPDSND | if tlpktdrop { srt_flags::TLPKTDROP } else { 0 });
+        conn.set_state(ConnectionState::Connected);
+        let now = Timestamp::default();
+        conn.init_buffers(now, 0, 0);
+        conn.setup_connection_timers();
+        for sequence in 0..=MAX_DELIVERY_PER_VISIT as u32 {
+            let mut packet = DataPacket::new(sequence, 7, 0, 0, vec![1].into());
+            packet.position = if sequence == 0 {
+                crate::srt_packet::PacketPosition::First
+            } else {
+                crate::srt_packet::PacketPosition::Middle
+            };
+            conn.handle_data_packet(packet, now)
+                .expect("incomplete fragment");
+        }
+        conn.handle_shutdown(now).expect("peer shutdown");
+        let mut timers = TestTimers::default();
+        for output in drain_outputs(&mut conn) {
+            timers.apply(&output, now);
+        }
+        // Drive only armed timers; inactivity wins ties at the playout
+        // deadline, before ACK or delivery continuation can finish the visit.
+        for _ in 0..4_096 {
+            let next = TimerId::ALL
+                .iter()
+                .filter_map(|&id| timers.deadlines[id.index()].map(|at| (id, at)))
+                .min_by_key(|(id, at)| (at.as_micros(), *id != TimerId::Inactivity, id.index()));
+            let Some((id, at)) = next.filter(|(_, at)| at.as_micros() <= 8_100_000) else {
+                break;
+            };
+            timers.deadlines[id.index()] = None;
+            conn.handle_timer(id, at).expect("armed timer");
+            for output in drain_outputs(&mut conn) {
+                timers.apply(&output, at);
+            }
+            if conn.state() == ConnectionState::Disconnected {
+                break;
+            }
+        }
+        assert_eq!(
+            conn.state(),
+            ConnectionState::Disconnected,
+            "a budget cut must not lose the incomplete-tail expiry; tlpktdrop={tlpktdrop}"
+        );
+        let events: Vec<_> = std::iter::from_fn(|| conn.poll_event()).collect();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ConnectionEvent::DataReceived { .. }))
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ConnectionEvent::Disconnected {
+                        reason: DisconnectReason::PeerShutdown
+                    }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn tlpktdrop_continuations_preserve_a_message_larger_than_one_visit() {
-        assert_fragmented_message_survives_delivery_visits(false);
+        assert_fragmented_message_survives_delivery_visits(false, TimerId::Ack, true, 256);
     }
 
     #[test]
     fn tlpktdrop_shutdown_continuations_preserve_a_message_larger_than_one_visit() {
-        assert_fragmented_message_survives_delivery_visits(true);
+        assert_fragmented_message_survives_delivery_visits(true, TimerId::Ack, true, 256);
     }
 
-    fn assert_fragmented_message_survives_delivery_visits(peer_shutdown: bool) {
+    #[test]
+    fn inactivity_at_playout_deadline_preserves_a_multi_visit_message() {
+        for tlpktdrop in [false, true] {
+            for queue in [1, 256] {
+                assert_fragmented_message_survives_delivery_visits(
+                    true,
+                    TimerId::Inactivity,
+                    tlpktdrop,
+                    queue,
+                );
+            }
+        }
+    }
+
+    fn assert_fragmented_message_survives_delivery_visits(
+        peer_shutdown: bool,
+        first_timer: TimerId,
+        tlpktdrop: bool,
+        queue: u32,
+    ) {
         const PACKETS: u32 = 129;
         let mut conn = SrtConnection::new_listener(ConnectionOptions {
-            tsbpd_delay: 120,
+            tsbpd_delay: if first_timer == TimerId::Inactivity {
+                8_000
+            } else {
+                120
+            },
             flow_window_packets: 256,
             receive_buffer_packets: 256,
-            delivery_queue_packets: 256,
+            delivery_queue_packets: queue,
             ..ConnectionOptions::default()
         });
-        conn.peer_srt_flags = Some(srt_flags::TSBPDSND | srt_flags::TLPKTDROP);
+        conn.peer_srt_flags =
+            Some(srt_flags::TSBPDSND | if tlpktdrop { srt_flags::TLPKTDROP } else { 0 });
         conn.set_state(ConnectionState::Connected);
         let _ = conn.poll_event();
         conn.init_buffers(Timestamp::from_micros(0), 0, 0);
@@ -8342,10 +8683,9 @@ mod tests {
         if peer_shutdown {
             conn.handle_shutdown(arrived).expect("peer shutdown");
         }
-        let due = Timestamp::from_micros(120_000);
-        conn.handle_timer(TimerId::Ack, due)
-            .expect("delivery visit");
-        for _ in 0..3 {
+        let due = Timestamp::from_micros(u64::from(conn.options.tsbpd_delay) * 1_000);
+        conn.handle_timer(first_timer, due).expect("delivery visit");
+        for _ in 0..PACKETS {
             conn.handle_timer(TimerId::DeliveryContinue, due)
                 .expect("delivery continuation");
         }
@@ -12574,7 +12914,14 @@ mod tests {
             let (_caller, mut listener) = quiet_encrypted_pair(cipher_mode, key_length);
             let len = key_length.len();
             let (current, next, after) = (
-                fixture_key_vec(0x5A, len),
+                listener
+                    .crypto
+                    .as_ref()
+                    .unwrap()
+                    .key_state_for_test()
+                    .rx_even
+                    .unwrap()
+                    .0,
                 fixture_key_vec(0x6C, len),
                 fixture_key_vec(0x7E, len),
             );
@@ -12719,10 +13066,10 @@ mod tests {
         let body = libsrt_km_body(0b01, salt, &[sek], cipher_mode);
         feed_kmreq_expect_echo(target, &body, now);
         assert!(receives_under(target, KeyFlag::Even, salt, sek));
-        // The target's own transmit direction still uses the handshake key.
+        // The target's independently confirmed TX material is unchanged.
         let reverse = capture_data_datagram(target, b"reverse", now.add_micros(1));
         peer.feed_recv_buf(&reverse, now.add_micros(2))
-            .expect("the peer still decrypts the target's handshake key");
+            .expect("the peer still decrypts the target's independent TX key");
     }
 
     /// A salt the handshake did not use.
@@ -12958,6 +13305,470 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "real CTR/GCM handshakes"
+    )]
+    fn initial_bidirectional_crypto_uses_distinct_confirmed_keys() {
+        for mode in [CipherMode::Ctr, CipherMode::Gcm] {
+            let options = |socket_id| ConnectionOptions {
+                socket_id,
+                syn_cookie: Some(7),
+                passphrase: Some(KM_FIXTURE_PASSPHRASE.to_owned()),
+                crypto_salt: Some(test_km_salt()),
+                crypto_sek: Some(fixture_key(0x5A).to_vec()),
+                cipher_mode: mode,
+                tsbpd_delay: 0,
+                ..ConnectionOptions::default()
+            };
+            let mut caller = SrtConnection::new_caller(options(1));
+            let mut listener = SrtConnection::new_listener(options(2));
+            let now = Timestamp::from_micros(1_000);
+            caller.connect(Timestamp::default()).unwrap();
+            listener
+                .feed_recv_buf(&next_wire(&mut caller), now)
+                .unwrap();
+            caller
+                .feed_recv_buf(&next_wire(&mut listener), now)
+                .unwrap();
+            listener
+                .feed_recv_buf(&next_wire(&mut caller), now)
+                .unwrap();
+            let (conclusion, request) = capture_initial_listener_key_outputs(&mut listener);
+            let request = request.expect("listener announces directional TX material");
+            let handshake_key = current_km_message(&caller).encode();
+            caller.feed_recv_buf(&conclusion.unwrap(), now).unwrap();
+            assert_initial_listener_send_blocked(&mut listener, now);
+
+            assert_km_control_rejected(
+                &mut listener,
+                SRT_CMD_KMRSP,
+                handshake_key.clone(),
+                now,
+                "the handshake key cannot confirm the independent directional key",
+            );
+            assert!(
+                !caller.can_send(),
+                "handshake KMRSP cannot authorize fresh caller TX"
+            );
+            assert!(
+                !std::iter::from_fn(|| caller.poll_event())
+                    .any(|event| matches!(event, ConnectionEvent::Connected))
+            );
+            let caller_request = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
+            assert_km_control_rejected(
+                &mut caller,
+                SRT_CMD_KMRSP,
+                handshake_key,
+                now,
+                "old handshake KMRSP cannot confirm fresh caller TX",
+            );
+            listener.feed_recv_buf(&caller_request, now).unwrap();
+            let caller_confirmation = take_user_defined_datagram(&mut listener, SRT_CMD_KMRSP);
+            caller.feed_recv_buf(&caller_confirmation, now).unwrap();
+            assert!(
+                caller.can_send(),
+                "caller confirmed independently of listener"
+            );
+
+            // The caller is confirmed first; keep its early DATA bounded
+            // behind the listener's independently pending Connected event.
+            let payload = b"equal plaintext, equal first sequence";
+            let outbound = capture_data_datagram(&mut caller, payload, now);
+            listener
+                .feed_recv_buf(&outbound, now.add_micros(1))
+                .unwrap();
+            listener
+                .handle_timer(TimerId::DeliveryContinue, now.add_micros(2))
+                .unwrap();
+            assert!(
+                !std::iter::from_fn(|| listener.poll_event()).any(|event| matches!(
+                    event,
+                    ConnectionEvent::Connected | ConnectionEvent::DataReceived { .. }
+                ))
+            );
+            caller.feed_recv_buf(&request, now.add_micros(3)).unwrap();
+            let lost_response = take_user_defined_datagram(&mut caller, SRT_CMD_KMRSP);
+            let retry_at = now.add_micros(KM_REQUEST_RETRY_INTERVAL_MICROS + 1);
+            listener.handle_timer(TimerId::Ack, retry_at).unwrap();
+            let retry = take_user_defined_datagram(&mut listener, SRT_CMD_KMREQ);
+            assert_eq!(
+                user_defined_control_info(&retry),
+                user_defined_control_info(&request)
+            );
+            assert!(!listener.can_send(), "a lost KMRSP never releases DATA");
+            caller.feed_recv_buf(&retry, retry_at).unwrap();
+            let response = take_user_defined_datagram(&mut caller, SRT_CMD_KMRSP);
+            assert_eq!(
+                user_defined_control_info(&response),
+                user_defined_control_info(&lost_response)
+            );
+            listener.feed_recv_buf(&response, retry_at).unwrap();
+            let events: Vec<_> = std::iter::from_fn(|| listener.poll_event()).collect();
+            let connected = events
+                .iter()
+                .position(|event| matches!(event, ConnectionEvent::Connected))
+                .unwrap();
+            let received = events
+                .iter()
+                .position(|event| matches!(event, ConnectionEvent::DataReceived { .. }))
+                .unwrap();
+            assert!(connected < received);
+            assert_eq!(crypto_event_bytes(events), payload);
+            let reverse = capture_data_datagram(&mut listener, payload, retry_at);
+            let (SrtPacket::Data(forward), SrtPacket::Data(backward)) = (
+                SrtPacket::decode(&outbound).unwrap(),
+                SrtPacket::decode(&reverse).unwrap(),
+            ) else {
+                panic!("DATA in both directions");
+            };
+            assert_eq!(forward.sequence_number, backward.sequence_number);
+            // Exclude GCM's tag: differing AAD can change a tag even when
+            // the same nonce produces identical ciphertext.
+            assert_ne!(
+                &forward.payload[..payload.len()],
+                &backward.payload[..payload.len()]
+            );
+            caller
+                .feed_recv_buf(&reverse, retry_at.add_micros(1))
+                .unwrap();
+            caller
+                .handle_timer(TimerId::DeliveryContinue, retry_at.add_micros(2))
+                .unwrap();
+            assert_eq!(
+                crypto_event_bytes(std::iter::from_fn(|| caller.poll_event())),
+                payload
+            );
+        }
+    }
+
+    fn capture_initial_listener_key_outputs(
+        listener: &mut SrtConnection,
+    ) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        let mut conclusion = None;
+        let mut request = None;
+        for output in drain_outputs(listener) {
+            if let ConnectionOutput::SendPacket(wire) = output {
+                match SrtPacket::decode(&wire).unwrap() {
+                    SrtPacket::Control(packet) if packet.control_type == ControlType::Handshake => {
+                        conclusion = Some(wire);
+                    }
+                    SrtPacket::Control(packet) if packet.subtype == SRT_CMD_KMREQ => {
+                        request = Some(wire);
+                    }
+                    _ => panic!("unexpected preconfirmation DATA"),
+                }
+            }
+        }
+        (conclusion, request)
+    }
+
+    fn assert_initial_listener_send_blocked(listener: &mut SrtConnection, now: Timestamp) {
+        assert!(!listener.can_send());
+        assert!(!listener.can_send_with_pacing(now));
+        let sequence = listener.next_sequence_number();
+        assert!(listener.send(b"blocked", now).is_err());
+        assert!(listener.send_message(b"blocked", now).is_err());
+        assert!(
+            listener
+                .send_shared(Bytes::from_static(b"blocked"), now)
+                .is_err()
+        );
+        assert_eq!(listener.next_sequence_number(), sequence);
+        assert!(drain_outputs(listener).is_empty());
+        assert!(
+            !std::iter::from_fn(|| listener.poll_event()).any(|event| matches!(
+                event,
+                ConnectionEvent::Connected | ConnectionEvent::DataReceived { .. }
+            ))
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "real CTR handshake"
+    )]
+    fn first_bidirectional_ciphertexts_do_not_reuse_nonce_ctr() {
+        assert_first_bidirectional_ciphertexts_do_not_reuse_nonce(CipherMode::Ctr);
+    }
+
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "real GCM handshake"
+    )]
+    fn first_bidirectional_ciphertexts_do_not_reuse_nonce_gcm() {
+        assert_first_bidirectional_ciphertexts_do_not_reuse_nonce(CipherMode::Gcm);
+    }
+
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "real CTR/GCM handshakes"
+    )]
+    fn late_initial_kmrsp_cannot_announce_connected_after_terminal_close() {
+        for mode in [CipherMode::Ctr, CipherMode::Gcm] {
+            for listener_side in [false, true] {
+                for peer_shutdown in [false, true] {
+                    assert_late_initial_kmrsp_after_close(mode, listener_side, peer_shutdown);
+                }
+            }
+        }
+    }
+
+    fn capture_initial_kmrsp(mode: CipherMode, listener_side: bool) -> (SrtConnection, Vec<u8>) {
+        let options = |socket_id| ConnectionOptions {
+            socket_id,
+            syn_cookie: Some(7),
+            passphrase: Some(KM_FIXTURE_PASSPHRASE.to_owned()),
+            crypto_salt: Some(test_km_salt()),
+            crypto_sek: Some(fixture_key(0x5A).to_vec()),
+            cipher_mode: mode,
+            ..ConnectionOptions::default()
+        };
+        let mut caller = SrtConnection::new_caller(options(1));
+        let mut listener = SrtConnection::new_listener(options(2));
+        let now = Timestamp::from_micros(1_000);
+        caller.connect(Timestamp::default()).unwrap();
+        listener
+            .feed_recv_buf(&next_wire(&mut caller), now)
+            .unwrap();
+        caller
+            .feed_recv_buf(&next_wire(&mut listener), now)
+            .unwrap();
+        listener
+            .feed_recv_buf(&next_wire(&mut caller), now)
+            .unwrap();
+        let mut listener_request = None;
+        for output in drain_outputs(&mut listener) {
+            if let ConnectionOutput::SendPacket(wire) = output {
+                match SrtPacket::decode(&wire).unwrap() {
+                    SrtPacket::Control(packet) if packet.control_type == ControlType::Handshake => {
+                        caller.feed_recv_buf(&wire, now).unwrap();
+                    }
+                    SrtPacket::Control(packet) if packet.subtype == SRT_CMD_KMREQ => {
+                        listener_request = Some(wire);
+                    }
+                    _ => panic!("unexpected preconfirmation output"),
+                }
+            }
+        }
+        let caller_request = take_user_defined_datagram(&mut caller, SRT_CMD_KMREQ);
+        let response = if listener_side {
+            caller
+                .feed_recv_buf(&listener_request.unwrap(), now)
+                .unwrap();
+            take_user_defined_datagram(&mut caller, SRT_CMD_KMRSP)
+        } else {
+            listener.feed_recv_buf(&caller_request, now).unwrap();
+            take_user_defined_datagram(&mut listener, SRT_CMD_KMRSP)
+        };
+        (if listener_side { listener } else { caller }, response)
+    }
+
+    fn assert_late_initial_kmrsp_after_close(
+        mode: CipherMode,
+        listener_side: bool,
+        peer_shutdown: bool,
+    ) {
+        let (mut connection, response) = capture_initial_kmrsp(mode, listener_side);
+        let target = &mut connection;
+        let now = Timestamp::from_micros(1_000);
+        assert!(target.initial_tx_pending());
+        assert!(!target.can_send());
+        assert!(
+            !std::iter::from_fn(|| target.poll_event())
+                .any(|event| matches!(event, ConnectionEvent::Connected))
+        );
+        let terminal_at = now.add_micros(INACTIVITY_TIMEOUT_MICROS + 1);
+        let reason = if peer_shutdown {
+            let shutdown =
+                control_datagram(target.socket_id(), ControlType::Shutdown, 0, 0, Vec::new());
+            target.feed_recv_buf(&shutdown, terminal_at).unwrap();
+            DisconnectReason::PeerShutdown
+        } else {
+            target
+                .handle_timer(TimerId::Inactivity, terminal_at)
+                .unwrap();
+            DisconnectReason::InactivityTimeout
+        };
+        assert_eq!(target.state(), ConnectionState::Disconnected);
+        let events: Vec<_> = std::iter::from_fn(|| target.poll_event()).collect();
+        assert!(events.contains(&ConnectionEvent::Disconnected { reason }));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ConnectionEvent::Connected))
+        );
+        assert_km_control_rejected(
+            target,
+            SRT_CMD_KMRSP,
+            user_defined_control_info(&response),
+            terminal_at.add_micros(1),
+            "late initial confirmation after terminal close",
+        );
+        assert!(!target.can_send());
+        assert!(target.poll_event().is_none());
+    }
+
+    /// Runs against the pre-fix handshake too: the failing inequality
+    /// exposes actual nonce reuse, not just the absent new KM transaction.
+    fn assert_first_bidirectional_ciphertexts_do_not_reuse_nonce(mode: CipherMode) {
+        let (mut caller, mut listener) = quiet_encrypted_pair(mode, KeyLength::Aes128);
+        let now = Timestamp::from_micros(10_000_000);
+        let plaintext = b"same plaintext in both directions";
+        let forward = capture_data_datagram(&mut caller, plaintext, now);
+        let reverse = capture_data_datagram(&mut listener, plaintext, now);
+        let (SrtPacket::Data(a), SrtPacket::Data(b)) = (
+            SrtPacket::decode(&forward).unwrap(),
+            SrtPacket::decode(&reverse).unwrap(),
+        ) else {
+            panic!("DATA in both directions");
+        };
+        assert_eq!(a.sequence_number, b.sequence_number);
+        assert_ne!(
+            &a.payload[..plaintext.len()],
+            &b.payload[..plaintext.len()],
+            "{mode:?} nonce reuse"
+        );
+        listener.feed_recv_buf(&forward, now.add_micros(1)).unwrap();
+        caller.feed_recv_buf(&reverse, now.add_micros(1)).unwrap();
+        for connection in [&mut caller, &mut listener] {
+            connection
+                .handle_timer(TimerId::DeliveryContinue, now.add_micros(200_000))
+                .unwrap();
+            assert_eq!(
+                crypto_event_bytes(std::iter::from_fn(|| connection.poll_event())),
+                plaintext
+            );
+        }
+    }
+
+    fn crypto_event_bytes(events: impl IntoIterator<Item = ConnectionEvent>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for event in events {
+            if let ConnectionEvent::DataReceived { payload, .. } = event {
+                for chunk in payload.chunks() {
+                    bytes.extend_from_slice(chunk);
+                }
+            }
+        }
+        bytes
+    }
+
+    /// Cross normal KM thresholds with real DATA and real receiver ACKs.
+    /// Only the counter is accelerated; no key/retention state is injected.
+    fn confirm_switch_and_retire(
+        sender: &mut SrtConnection,
+        receiver: &mut SrtConnection,
+        sek: &[u8],
+        now: Timestamp,
+    ) -> Vec<u8> {
+        sender.provide_new_sek(sek, now).unwrap();
+        let request = take_user_defined_datagram(sender, SRT_CMD_KMREQ);
+        receiver.feed_recv_buf(&request, now).unwrap();
+        let response = take_user_defined_datagram(receiver, SRT_CMD_KMRSP);
+        sender.feed_recv_buf(&response, now).unwrap();
+        sender
+            .seed_encrypted_packet_count_for_test(CryptoContext::KM_REFRESH_PERIOD)
+            .unwrap();
+        let old = capture_data_datagram(sender, b"last old-generation DATA", now);
+        receiver.feed_recv_buf(&old, now.add_micros(1)).unwrap();
+        receiver
+            .handle_timer(TimerId::Ack, now.add_micros(20_000))
+            .unwrap();
+        for output in drain_outputs(receiver) {
+            if let ConnectionOutput::SendPacket(wire) = output {
+                sender.feed_recv_buf(&wire, now.add_micros(20_001)).unwrap();
+            }
+        }
+        sender
+            .seed_encrypted_packet_count_for_test(CryptoContext::KM_PRE_ANNOUNCE_PERIOD)
+            .unwrap();
+        let new = capture_data_datagram(sender, b"postannouncement DATA", now.add_micros(20_002));
+        receiver
+            .feed_recv_buf(&new, now.add_micros(20_003))
+            .unwrap();
+        receiver
+            .handle_timer(TimerId::DeliveryContinue, now.add_micros(200_000))
+            .unwrap();
+        while receiver.poll_event().is_some() {}
+        while sender.poll_event().is_some() {}
+        let crypto = sender.crypto.as_ref().unwrap();
+        assert_eq!(
+            crypto.km_refresh_state(),
+            crate::crypto_impl::KmRefreshState::Idle
+        );
+        let state = crypto.key_state_for_test();
+        let retired = match state.tx_current {
+            KeyFlag::Even => state.tx_odd,
+            KeyFlag::Odd => state.tx_even,
+        };
+        assert!(
+            retired.iter().all(|byte| *byte == 0),
+            "old TX schedule retired normally"
+        );
+        request
+    }
+
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "real CTR handshake and refresh"
+    )]
+    fn retired_transmit_key_reflection_cannot_replace_live_receive_key_ctr() {
+        assert_retired_transmit_key_reflection_cannot_replace_live_receive_key(CipherMode::Ctr);
+    }
+
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "real GCM handshake and refresh"
+    )]
+    fn retired_transmit_key_reflection_cannot_replace_live_receive_key_gcm() {
+        assert_retired_transmit_key_reflection_cannot_replace_live_receive_key(CipherMode::Gcm);
+    }
+
+    fn assert_retired_transmit_key_reflection_cannot_replace_live_receive_key(mode: CipherMode) {
+        let (mut caller, mut listener) = quiet_encrypted_pair(mode, KeyLength::Aes128);
+        let now = Timestamp::from_micros(10_000_000);
+        confirm_switch_and_retire(&mut listener, &mut caller, &fixture_key(0x71), now);
+        let own_odd = confirm_switch_and_retire(
+            &mut caller,
+            &mut listener,
+            &fixture_key(0x6B),
+            now.add_micros(300_000),
+        );
+        confirm_switch_and_retire(
+            &mut caller,
+            &mut listener,
+            &fixture_key(0x7C),
+            now.add_micros(600_000),
+        );
+        let payload = b"authentic peer odd DATA survives retired TX reflection";
+        // Protect first, reflect historical KM second, deliver afterwards.
+        let peer_data = capture_data_datagram(&mut listener, payload, now.add_micros(900_000));
+        assert_km_control_rejected(
+            &mut caller,
+            SRT_CMD_KMREQ,
+            user_defined_control_info(&own_odd),
+            now.add_micros(900_001),
+            "decommissioned outbound key reflected",
+        );
+        caller
+            .feed_recv_buf(&peer_data, now.add_micros(900_002))
+            .unwrap();
+        caller
+            .handle_timer(TimerId::DeliveryContinue, now.add_micros(1_100_000))
+            .unwrap();
+        assert_eq!(
+            crypto_event_bytes(std::iter::from_fn(|| caller.poll_event())),
+            payload
+        );
+    }
+
     /// A connected encrypted pair sharing one passphrase.
     fn encrypted_pair(cipher_mode: CipherMode) -> (SrtConnection, SrtConnection) {
         encrypted_pair_with(cipher_mode, KeyLength::Aes128)
@@ -12991,6 +13802,7 @@ mod tests {
         state: ConnectionState,
         keys: crate::crypto_impl::KeyStateForTest,
         pending_response: Option<Vec<u8>>,
+        initial_tx_pending: bool,
         acknowledged: Vec<Option<Vec<u8>>>,
         acknowledged_next: usize,
     }
@@ -13008,6 +13820,7 @@ mod tests {
                 .pending
                 .as_ref()
                 .map(|pending| pending.request.encode()),
+            initial_tx_pending: state.initial_tx_pending,
             acknowledged: state
                 .acknowledged
                 .entries
@@ -14255,6 +15068,27 @@ mod tests {
 
     fn drain_outputs(conn: &mut SrtConnection) -> Vec<ConnectionOutput> {
         std::iter::from_fn(|| conn.poll_output().unwrap()).collect()
+    }
+    fn forward_handshake_round(from: &mut SrtConnection, to: &mut SrtConnection, now: Timestamp) {
+        for output in drain_outputs(from) {
+            match output {
+                ConnectionOutput::SendPacket(packet) => {
+                    to.feed_recv_buf(&packet, now).expect("peer accepts packet");
+                }
+                ConnectionOutput::SetTimer {
+                    id,
+                    duration_micros,
+                } => {
+                    from.queue_output(QueuedOutput::SetTimer {
+                        id,
+                        duration_micros,
+                    });
+                }
+                ConnectionOutput::ClearTimer { id } => {
+                    from.queue_output(QueuedOutput::ClearTimer { id });
+                }
+            }
+        }
     }
 
     /// Drain the queued outputs and return only the datagrams.

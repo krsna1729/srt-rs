@@ -108,6 +108,8 @@ fn establish_connection(
 
         if caller.state() == ConnectionState::Connected
             && listener.state() == ConnectionState::Connected
+            && caller.can_send()
+            && listener.can_send()
         {
             return Ok(());
         }
@@ -450,6 +452,8 @@ fn listener_can_apply_stream_policy_before_encrypted_conclusion() {
         exchange_packets(&mut caller, &mut listener, ts(round * 10_000));
         if caller.state() == ConnectionState::Connected
             && listener.state() == ConnectionState::Connected
+            && caller.can_send()
+            && listener.can_send()
         {
             return;
         }

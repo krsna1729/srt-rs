@@ -915,6 +915,8 @@ struct InboundGroupLeg {
     output_faulted: bool,
     /// Per-leg retirement token; see [`AdmissionPeer::output_failure`].
     output_failure: Option<ProtocolOutputFailure>,
+    /// Observed after this member's queued DATA, not merely its state change.
+    terminal: bool,
 }
 
 /// Where the retirement token for one quarantined peer/leg lives.
@@ -969,6 +971,7 @@ struct InboundGroup {
     logical_peer: LogicalPeerId,
     generation: u64,
     connected: bool,
+    disconnect_reason: Option<DisconnectReason>,
     /// Benchmark-only success-window deadline; see [`AdmissionPeer::stream_deadline`].
     #[cfg(any(test, feature = "bench-internals"))]
     stream_deadline: Option<Instant>,
@@ -1642,6 +1645,7 @@ impl PeerTable {
         identity: &srt_lifecycle::HandshakeIdentity,
         handshake: &srt_proto::handshake::HandshakePacket,
         options: &AdmissionOptions,
+        physical: Option<PhysicalPeerKey>,
     ) -> bool {
         let Some(group) = identity.group.as_ref() else {
             return true;
@@ -1654,12 +1658,55 @@ impl PeerTable {
         {
             return false;
         }
-        self.groups
-            .get(&group.logical_key())
-            .is_none_or(|existing| {
-                existing.group.mode() == mode
-                    && existing.group.member(handshake.socket_id).is_none()
-            })
+        self.group_member_admission_allowed(
+            &group.logical_key(),
+            mode,
+            handshake.socket_id,
+            physical,
+        )
+    }
+
+    /// CONCLUSION processing and local adoption run under the same table
+    /// borrow. Count established legs awaiting relocation as occupied too:
+    /// failed socket promotion must still be able to adopt them locally.
+    fn group_member_admission_allowed(
+        &self,
+        key: &srt_lifecycle::LogicalGroupKey,
+        mode: srt_proto::GroupMode,
+        member_id: u32,
+        physical: Option<PhysicalPeerKey>,
+    ) -> bool {
+        let mut occupied = 0;
+        if let Some(existing) = self.groups.get(key) {
+            if existing.group.mode() != mode || existing.group.member(member_id).is_some() {
+                return false;
+            }
+            // Broken members still own their slots and receive reservations.
+            occupied = existing.group.members().len();
+        }
+        for (pending, _) in &self.pending_promotions {
+            if Some(*pending) == physical {
+                continue;
+            }
+            let Some(entry) = self.get_peer(pending) else {
+                continue;
+            };
+            let Some(extension) = entry.conn.peer_group_extension() else {
+                continue;
+            };
+            if extension.group_id != key.group_id
+                || entry.conn.peer_stream_id() != key.stream_id.as_deref()
+            {
+                continue;
+            }
+            if srt_proto::GroupMode::from_group_type(extension.group_type) != Some(mode)
+                || entry.conn.peer_socket_id() == member_id
+            {
+                return false;
+            }
+            occupied += 1;
+        }
+        occupied < srt_proto::MAX_GROUP_MEMBERS
     }
 
     fn apply_policy_hook<F>(
@@ -1738,7 +1785,8 @@ impl PeerTable {
             debug_assert!(false, "conclusion identity without decoded handshake");
             return Some(Admit::Dropped(AdmissionDropReason::InvalidPacket));
         };
-        let group_admission_allowed = self.group_admission_allowed(identity, packet, options);
+        let group_admission_allowed =
+            self.group_admission_allowed(identity, packet, options, Some(physical));
         if self
             .get_peer(&physical)
             .is_some_and(|entry| !entry.admission_established)
@@ -2176,6 +2224,19 @@ impl PeerTable {
     /// hold it (full, or its slot is unexpectedly taken).
     pub(crate) fn adopt(&mut self, leg: Box<RelocatedLeg>) -> Result<(), Box<RelocatedLeg>> {
         let window_bytes = leg.entry.conn.window_memory_bound_bytes();
+        if let Some(affinity) = group_affinity_of(&leg.entry.conn)
+            && !self.group_member_admission_allowed(
+                &affinity.logical_key(),
+                srt_proto::GroupMode::from_group_type(affinity.extension.group_type)
+                    .expect("group affinity has a supported mode"),
+                leg.entry.conn.peer_socket_id(),
+                None,
+            )
+        {
+            // Preserve ownership for the caller's ordinary failed-relocation
+            // path; never detach a successful session and silently lose it.
+            return Err(leg);
+        }
         if self.established_peers + self.retired_protocols.established
             >= self.config.max_established_peers
             || self.len() + self.retired_protocols.established + self.retired_protocols.half_open
@@ -2304,6 +2365,7 @@ impl PeerTable {
                     logical_peer,
                     generation,
                     connected: false,
+                    disconnect_reason: None,
                     #[cfg(any(test, feature = "bench-internals"))]
                     stream_deadline: None,
                     ever_connected: false,
@@ -2335,7 +2397,7 @@ impl PeerTable {
         group
             .group
             .add_member(member_id, weight, entry.conn)
-            .expect("duplicate GROUP member IDs are rejected before admission");
+            .expect("GROUP capacity, mode and member identity are checked before admission");
         group.legs.insert(
             member_id,
             InboundGroupLeg {
@@ -2344,6 +2406,7 @@ impl PeerTable {
                 pending_outputs: entry.pending_outputs,
                 output_faulted: false,
                 output_failure: None,
+                terminal: false,
             },
         );
         group.leg_order.push(member_id);
@@ -3980,6 +4043,7 @@ impl PeerTable {
     ) {
         let last_now = self.last_now;
         let mut visits = 0;
+        let mut group_work = 0;
         while visits < max_visits && out.len() < max_events {
             let Some(token) = self.group_event_ready.pop_front() else {
                 break;
@@ -3992,14 +4056,23 @@ impl PeerTable {
             if group.generation != token.generation {
                 continue;
             }
-            while out.len() < max_events {
-                let Some(event) = group.group.poll_event(last_now) else {
-                    break;
-                };
-                apply_group_event(group, event, out);
+            drain_group_protocol_events_bounded(
+                group,
+                last_now,
+                max_events,
+                max_visits,
+                &mut group_work,
+                out,
+            );
+            let terminal_work = group_has_event_continuation(group);
+            if mark_group_member_output_ready(group) {
+                self.enqueue_group_ready(token.clone());
             }
-            if out.len() >= max_events {
+            if out.len() >= max_events || group_work >= max_visits || terminal_work {
                 self.enqueue_group_event_ready(token);
+            }
+            if group_work >= max_visits {
+                break;
             }
         }
     }
@@ -4730,6 +4803,53 @@ fn duration_micros_saturating(timeout: Duration) -> u64 {
     u64::try_from(timeout.as_micros()).unwrap_or(u64::MAX)
 }
 
+fn drain_group_protocol_events_bounded(
+    group: &mut InboundGroup,
+    now: Timestamp,
+    max_events: usize,
+    max_work: usize,
+    group_work: &mut usize,
+    out: &mut Vec<AdmissionEvent>,
+) {
+    while out.len() < max_events && *group_work < max_work {
+        let Some(event) = group.group.poll_event(now) else {
+            finish_group_terminal(group, out);
+            break;
+        };
+        *group_work += 1;
+        apply_group_event(group, event, out);
+    }
+}
+
+fn group_has_event_continuation(group: &InboundGroup) -> bool {
+    group.group.has_receive_continuation()
+        || group.group.members().iter().any(|member| {
+            member.connection().state() == srt_proto::ConnectionState::Disconnected
+                && !group
+                    .legs
+                    .get(&member.id())
+                    .expect("known group leg")
+                    .terminal
+        })
+        || (group.group.has_pending_data()
+            && group.group.members().iter().all(|member| {
+                member.connection().state() == srt_proto::ConnectionState::Disconnected
+            }))
+}
+
+fn mark_group_member_output_ready(group: &mut InboundGroup) -> bool {
+    // Releasing group reservations can queue an urgent ACK. Schedule
+    // that output without manufacturing a fresh event-ready marker.
+    for member in group.group.members() {
+        if member.connection().peek_output().is_some()
+            && group.ready_legs_queued.insert(member.id())
+        {
+            group.ready_legs.push_back(member.id());
+        }
+    }
+    !group.ready_legs.is_empty()
+}
+
 /// Apply one bonded-group protocol event to its group's bookkeeping,
 /// pushing the resulting application-visible event (if any) into `out` --
 /// split out of [`PeerTable::drain_group_events_bounded`]'s own loop body
@@ -4741,7 +4861,7 @@ fn apply_group_event(
 ) {
     match event {
         srt_proto::GroupEvent::MemberConnected { .. } => {
-            if !group.connected {
+            if !group.ever_connected {
                 group.connected = true;
                 group.ever_connected = true;
                 out.push(AdmissionEvent {
@@ -4771,25 +4891,45 @@ fn apply_group_event(
                 },
             });
         }
-        srt_proto::GroupEvent::MemberError { error, .. }
-        | srt_proto::GroupEvent::MemberDisconnected { reason: error, .. }
-            if group.connected
-                && !group.group.members().iter().any(|member| {
-                    member.connection().state() == srt_proto::ConnectionState::Connected
-                }) =>
-        {
-            group.connected = false;
-            let reason = DisconnectReason::from_message(&error);
-            group.torn_down |= !is_ordered_close(&reason);
-            out.push(AdmissionEvent {
-                representative_peer: group.representative_peer,
-                logical_peer: group.logical_peer,
-                event: ConnectionEvent::Disconnected { reason },
-            });
+        srt_proto::GroupEvent::MemberDisconnected { member_id, reason } => {
+            group
+                .legs
+                .get_mut(&member_id)
+                .expect("known group leg")
+                .terminal = true;
+            group.disconnect_reason = Some(DisconnectReason::from_message(&reason));
         }
-        srt_proto::GroupEvent::MemberError { .. }
-        | srt_proto::GroupEvent::MemberDisconnected { .. } => {}
+        srt_proto::GroupEvent::MemberError { error, .. } => {
+            group.disconnect_reason = Some(DisconnectReason::from_message(&error));
+        }
     }
+}
+
+/// A terminal member cannot stand in for its sibling's unread DATA. Consume
+/// every physical terminal event and the deduplicated tail before handing the
+/// application its single logical terminal event.
+fn finish_group_terminal(group: &mut InboundGroup, out: &mut Vec<AdmissionEvent>) {
+    if !group.connected
+        || group.group.has_pending_data()
+        || !group.legs.values().all(|leg| leg.terminal)
+        || !group
+            .group
+            .members()
+            .iter()
+            .all(|member| member.connection().state() == srt_proto::ConnectionState::Disconnected)
+    {
+        return;
+    }
+    let Some(reason) = group.disconnect_reason.take() else {
+        return;
+    };
+    group.connected = false;
+    group.torn_down |= !is_ordered_close(&reason);
+    out.push(AdmissionEvent {
+        representative_peer: group.representative_peer,
+        logical_peer: group.logical_peer,
+        event: ConnectionEvent::Disconnected { reason },
+    });
 }
 
 /// Whether a bounded output drain may still service another ready peer
@@ -6004,6 +6144,7 @@ pub(crate) mod tests {
         let mut leg = InboundGroupLeg {
             output_faulted: false,
             output_failure: None,
+            terminal: false,
             physical: PhysicalPeerKey {
                 address: "127.0.0.1:9100".parse().unwrap(),
                 local_socket_id: 1,
@@ -6033,6 +6174,7 @@ pub(crate) mod tests {
                 logical_peer,
                 generation,
                 connected: false,
+                disconnect_reason: None,
                 #[cfg(any(test, feature = "bench-internals"))]
                 stream_deadline: None,
                 ever_connected: false,
@@ -7202,6 +7344,7 @@ pub(crate) mod tests {
         let leg = InboundGroupLeg {
             output_faulted: true,
             output_failure: None,
+            terminal: false,
             physical,
             timers: ManualTimerStore::new(),
             pending_outputs: VecDeque::new(),
@@ -7220,6 +7363,7 @@ pub(crate) mod tests {
                 logical_peer,
                 generation,
                 connected: true,
+                disconnect_reason: None,
                 stream_deadline: None,
                 ever_connected: true,
                 data_events: 0,

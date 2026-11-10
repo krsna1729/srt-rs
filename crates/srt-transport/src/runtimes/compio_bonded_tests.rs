@@ -69,10 +69,18 @@ fn dead_peer() -> SocketAddr {
 /// An Owner whose listener accepts bonded publishers, so a bonded caller
 /// created on the SAME owner has a real peer to handshake with.
 fn owner_with_bonded_listener(tx_capacity: usize) -> (Owner, SocketAddr) {
+    owner_with_bonded_listener_session(tx_capacity, crate::SessionConfig::default())
+}
+
+fn owner_with_bonded_listener_session(
+    tx_capacity: usize,
+    session: crate::SessionConfig,
+) -> (Owner, SocketAddr) {
     let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind listener");
     let addr = std_sock.local_addr().expect("listener addr");
     let sock = compio::net::UdpSocket::from_std(std_sock).expect("adopt listener");
     let config = crate::ListenerConfig::builder(addr)
+        .session(session)
         .bonded_inputs(crate::BondedInputPolicy::Accept)
         // A bonded caller refuses a response without the receiving group's
         // mirror GROUP extension, as libsrt does.
@@ -609,6 +617,275 @@ fn bonded_and_direct_callers_share_one_socket_at_fixed_runtime_cost() {
         }
         assert_eq!(side.table().len(), 3);
         assert_eq!(owner.caller_pool_stats().expect("stats").in_flight, 3);
+    });
+}
+
+#[test]
+fn owner_rejects_a_65th_independently_handshaking_broadcast_member() {
+    let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+    runtime.block_on(async {
+        let session = crate::SessionConfig::from_connection_options(srt_proto::ConnectionOptions {
+            initial_seq: Some(1234),
+            flow_window_packets: 64,
+            receive_buffer_packets: 64,
+            delivery_queue_packets: 64,
+            ..Default::default()
+        });
+        let (mut owner, listener) = owner_with_bonded_listener_session(128, session.clone());
+        set_pool(&mut owner, srt_proto::MAX_GROUP_MEMBERS + 1);
+        let mut ids = Vec::new();
+        for index in 0..=srt_proto::MAX_GROUP_MEMBERS {
+            let mut leg = session.clone();
+            leg.set_socket_id(0x1000 + index as u32);
+            leg.set_group(Some(GroupConfig::new(81, GroupType::Broadcast)));
+            leg.set_stream_id(Some("publish:owner-capacity".to_string()));
+            let config = CallerConfig::builder(listener)
+                .ownership(crate::SocketOwnership::Shared)
+                .session(leg)
+                .build()
+                .expect("independent GROUP caller");
+            ids.push(admitted(
+                owner
+                    .connect(&config, Timestamp::default())
+                    .expect("connect"),
+            ));
+        }
+        let now = drive_until(&mut owner, 5_000, 400, |owner| {
+            ids.iter().all(|id| {
+                matches!(
+                    owner.logical_caller(id).and_then(|caller| caller.state()),
+                    Some(LogicalCallerState::Connected | LogicalCallerState::Disconnected)
+                )
+            })
+        })
+        .await;
+        let connected: Vec<_> = ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                owner.logical_caller(id).and_then(|caller| caller.state())
+                    == Some(LogicalCallerState::Connected)
+            })
+            .collect();
+        assert_eq!(connected.len(), srt_proto::MAX_GROUP_MEMBERS);
+        let rejected = ids
+            .iter()
+            .copied()
+            .find(|id| !connected.contains(id))
+            .expect("one excess caller");
+        assert_eq!(
+            owner.logical_caller(&rejected).and_then(|c| c.state()),
+            Some(LogicalCallerState::Disconnected)
+        );
+        assert!(
+            owner.is_operational(),
+            "capacity refusal must not panic/fault the Owner"
+        );
+        let table = &owner.listener.as_ref().expect("listener").table;
+        assert_eq!(table.established_count(), srt_proto::MAX_GROUP_MEMBERS);
+        assert_eq!(
+            table.bonded_stats()[0].connection.legs.len(),
+            srt_proto::MAX_GROUP_MEMBERS
+        );
+        let mut caller_events = Vec::new();
+        let mut batch = Vec::new();
+        for _ in 0..8 {
+            owner.poll_caller_events(&mut batch);
+            caller_events.append(&mut batch);
+            if !owner
+                .caller()
+                .expect("caller side")
+                .table()
+                .has_pending_events()
+            {
+                break;
+            }
+        }
+        assert!(
+            caller_events.iter().any(|event| {
+                event.id == rejected
+                    && matches!(
+                        &event.event,
+                        srt_proto::ConnectionEvent::StateChanged(
+                            srt_proto::ConnectionState::Disconnected
+                        )
+                    )
+            }),
+            "the refused attempt becomes terminal at the caller"
+        );
+        owner
+            .logical_caller_mut(&connected[0])
+            .expect("surviving leg")
+            .send(b"capacity survivor", Timestamp::from_micros(now + 5_000))
+            .expect("existing leg sends");
+        let mut delivered = 0;
+        drive_until(&mut owner, now + 10_000, 400, |owner| {
+            let mut events = Vec::new();
+            owner.poll_listener_events(&mut events);
+            delivered += events
+                .iter()
+                .filter(|event| {
+                    matches!(&event.event,
+                srt_proto::ConnectionEvent::DataReceived { payload, .. }
+                    if payload.eq(b"capacity survivor".as_slice()))
+                })
+                .count();
+            delivered == 1
+        })
+        .await;
+        assert_eq!(
+            delivered, 1,
+            "a full group's admitted member still delivers"
+        );
+        assert!(owner.shutdown_and_drain(Duration::from_secs(5)).await);
+    });
+}
+
+/// Service real Owners on both sides of a two-endpoint receiving group.
+async fn drive_bonded_receivers(
+    owner: &mut Owner,
+    receivers: &mut [Owner; 2],
+    start: u64,
+    rounds: u64,
+    mut done: impl FnMut(&mut Owner, &mut [Owner; 2]) -> bool,
+) -> u64 {
+    let mut now = start;
+    for round in 0..rounds {
+        now = start + round * 5_000;
+        let timestamp = Timestamp::from_micros(now);
+        let budget = OwnerServiceBudget::default();
+        let _ = owner.service(timestamp, budget).await;
+        for receiver in receivers.iter_mut() {
+            let _ = receiver.service(timestamp, budget).await;
+        }
+        owner.wait_for_activity(Duration::from_millis(1)).await;
+        if done(owner, receivers) {
+            break;
+        }
+    }
+    now
+}
+
+#[test]
+fn owner_bonded_caller_has_one_bidirectional_lifecycle_and_ordered_tail() {
+    use srt_proto::ConnectionEvent;
+    let runtime = compio::runtime::Runtime::new().expect("compio runtime builds");
+    runtime.block_on(async {
+        // The endpoints belong to the same receiving group and transmit the
+        // same sequence space. They remain independently closable through
+        // real Owner logical-peer APIs, without poking caller group state.
+        let mut session = crate::SessionConfig::default();
+        session.set_initial_seq(4321);
+        let (first, first_address) = owner_with_bonded_listener_session(32, session.clone());
+        let (second, second_address) = owner_with_bonded_listener_session(32, session);
+        let mut receivers = [first, second];
+        let mut owner = Owner::new(32);
+        let config = bonded(82, GroupType::Broadcast, &[(first_address, 1), (second_address, 1)]);
+        let id = admitted(owner.connect_bonded(&config, Timestamp::default()).expect("bond"));
+        let mut observed = Vec::new();
+        let mut peer_ids = [None, None];
+        let mut now = drive_bonded_receivers(&mut owner, &mut receivers, 5_000, 400, |owner, receivers| {
+            let mut events = Vec::new();
+            owner.poll_caller_events_bounded(1, &mut events);
+            assert!(events.len() <= 1);
+            observed.extend(events);
+            for (index, receiver) in receivers.iter_mut().enumerate() {
+                let mut events = Vec::new();
+                receiver.poll_listener_events(&mut events);
+                for event in events {
+                    if matches!(event.event, ConnectionEvent::Connected) {
+                        assert!(peer_ids[index].replace(event.logical_peer).is_none());
+                    }
+                }
+            }
+            all_legs_established(owner, &id, 2)
+                && peer_ids.iter().all(Option::is_some)
+                && observed.iter().any(|event| matches!(event.event, ConnectionEvent::Connected))
+        }).await;
+        assert!(all_legs_established(&owner, &id, 2));
+        assert!(peer_ids.iter().all(Option::is_some));
+        assert_eq!(observed.iter().filter(|event| matches!(event.event, ConnectionEvent::Connected)).count(), 1);
+        let mut probe = Vec::new();
+        owner.poll_caller_events_bounded(0, &mut probe);
+        assert!(probe.is_empty(), "zero event budget transfers no ownership");
+
+        now += 5_000;
+        owner.logical_caller_mut(&id).expect("caller")
+            .send(b"forward", Timestamp::from_micros(now)).expect("forward send");
+        for (receiver, peer) in receivers.iter_mut().zip(peer_ids) {
+            receiver.listener_peer_mut(peer.expect("logical listener peer")).expect("peer")
+                .send(b"reverse", Timestamp::from_micros(now)).expect("reverse send");
+        }
+        let mut forward = [0, 0];
+        now = drive_bonded_receivers(&mut owner, &mut receivers, now + 5_000, 400, |owner, receivers| {
+            let mut events = Vec::new();
+            owner.poll_caller_events_bounded(1, &mut events);
+            assert!(events.len() <= 1);
+            observed.extend(events);
+            for (index, receiver) in receivers.iter_mut().enumerate() {
+                let mut events = Vec::new();
+                receiver.poll_listener_events(&mut events);
+                forward[index] += events.iter().filter(|event| matches!(&event.event,
+                    ConnectionEvent::DataReceived { payload, .. } if payload.eq(b"forward".as_slice()))).count();
+            }
+            forward == [1, 1]
+                && group_stats(owner, &id).aggregate.wire_packets_received >= 2
+                && observed.iter().any(|event| matches!(&event.event,
+                    ConnectionEvent::DataReceived { payload, .. } if payload.eq(b"reverse".as_slice())))
+        }).await;
+        assert_eq!(forward, [1, 1], "both physical forward paths delivered");
+        assert_eq!(observed.iter().filter(|event| matches!(&event.event,
+            ConnectionEvent::DataReceived { payload, .. } if payload.eq(b"reverse".as_slice()))).count(), 1);
+        assert_eq!(group_stats(&owner, &id).aggregate.logical_payloads_received, 1);
+
+        receivers[0].listener_peer_mut(peer_ids[0].expect("first peer")).expect("first peer")
+            .disconnect(Timestamp::from_micros(now + 5_000));
+        now = drive_bonded_receivers(&mut owner, &mut receivers, now + 10_000, 400, |owner, _| {
+            let mut events = Vec::new();
+            owner.poll_caller_events_bounded(1, &mut events);
+            observed.extend(events);
+            let stats = group_stats(owner, &id);
+            stats.legs.iter().filter(|leg| leg.state == GroupMemberState::Broken).count() == 1
+                && stats.aggregate.active_legs == 1
+                && !owner.caller().expect("caller side").table().has_pending_events()
+        }).await;
+        assert_eq!(group_stats(&owner, &id).aggregate.active_legs, 1);
+        assert!(!observed.iter().any(|event| matches!(event.event, ConnectionEvent::Disconnected { .. })),
+            "the first leg's failure must not terminate its surviving sibling");
+
+        // Queue final DATA and SHUTDOWN together while TSBPD still holds the
+        // tail. The logical terminal must follow, not overtake, that DATA.
+        let mut peer = receivers[1].listener_peer_mut(peer_ids[1].expect("second peer")).expect("second peer");
+        peer.send(b"final tail", Timestamp::from_micros(now + 5_000)).expect("tail accepted");
+        peer.disconnect(Timestamp::from_micros(now + 5_000));
+        now = drive_bonded_receivers(&mut owner, &mut receivers, now + 10_000, 800, |owner, _| {
+            let mut events = Vec::new();
+            owner.poll_caller_events_bounded(1, &mut events);
+            assert!(events.len() <= 1);
+            observed.extend(events);
+            observed.iter().any(|event| matches!(event.event, ConnectionEvent::Disconnected { .. }))
+        }).await;
+        drive_bonded_receivers(&mut owner, &mut receivers, now + 5_000, 40, |owner, _| {
+            let mut events = Vec::new();
+            owner.poll_caller_events_bounded(1, &mut events);
+            observed.extend(events);
+            false
+        }).await;
+        assert!(observed.iter().all(|event| event.id == id));
+        assert_eq!(observed.iter().filter(|event| matches!(event.event, ConnectionEvent::Connected)).count(), 1);
+        assert_eq!(observed.iter().filter(|event| matches!(event.event, ConnectionEvent::Disconnected { .. })).count(), 1);
+        let payloads: Vec<_> = observed.iter().filter_map(|event| match &event.event {
+            ConnectionEvent::DataReceived { payload, .. } =>
+                Some(payload.chunks().flat_map(|chunk| chunk.iter().copied()).collect::<Vec<_>>()),
+            _ => None,
+        }).collect();
+        assert_eq!(payloads, vec![b"reverse".as_slice(), b"final tail".as_slice()]);
+        assert!(matches!(observed.last().map(|event| &event.event), Some(ConnectionEvent::Disconnected { .. })));
+        assert_eq!(group_stats(&owner, &id).aggregate.logical_payloads_received, 2);
+        assert!(owner.shutdown_and_drain(Duration::from_secs(5)).await);
+        for receiver in &mut receivers {
+            assert!(receiver.shutdown_and_drain(Duration::from_secs(5)).await);
+        }
     });
 }
 

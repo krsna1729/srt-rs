@@ -61,6 +61,10 @@ service budget at the same time.
   Owner's one caller UDP socket: no socket, task or connection object is added
   per leg. TX failures carry the logical group *and* the physical leg in their
   `TxAttribution`.
+  Caller event polling exposes one logical `Connected`, deduplicated reverse
+  `DataReceived` events, and one `Disconnected` only after every leg and its
+  accepted receive tail have drained. A failed leg does not terminate a
+  surviving sibling; bounded polling charges suppressed member events too.
 * **Drive** with `service(now, budget)` (never blocks; every dimension
   bounded) and `wait_for_activity(timeout)` when idle. `Owner::fault()` is
   typed: a panicked TX lane, a short/failed send completion, a stopped

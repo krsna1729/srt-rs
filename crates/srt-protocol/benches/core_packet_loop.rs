@@ -95,6 +95,8 @@ fn setup_connected_pair(passphrase: Option<&str>) -> (SrtConnection, SrtConnecti
         }
         if caller.state() == ConnectionState::Connected
             && listener.state() == ConnectionState::Connected
+            && caller.can_send()
+            && listener.can_send()
         {
             return (caller, listener);
         }
@@ -210,6 +212,8 @@ fn setup_connected_pair_gcm(passphrase: Option<&str>) -> (SrtConnection, SrtConn
         }
         if caller.state() == ConnectionState::Connected
             && listener.state() == ConnectionState::Connected
+            && caller.can_send()
+            && listener.can_send()
         {
             return (caller, listener);
         }

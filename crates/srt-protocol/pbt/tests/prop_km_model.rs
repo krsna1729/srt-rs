@@ -5,7 +5,7 @@
 //! receives the listener's own DATA and key rotations. Each case runs a
 //! generated sequence of steps:
 //!
-//! * the handshake KM exchange (initial key, KMRSP echo);
+//! * the handshake KM exchange and independent directional TX confirmations;
 //! * peer KMREQs, single-key and both-key (KK = 3, even SEK first): fresh
 //!   keys under the session salt or a new salt, identical repeats, replays
 //!   of earlier requests (stale and retired keys), malformed requests
@@ -15,7 +15,7 @@
 //! * peer DATA under either selector;
 //! * the listener's own rotations, acknowledged through the real caller,
 //!   answered by mismatched, stale or error KMRSPs, retried by the timer,
-//!   and switched at the refresh boundary.
+//!   switched at the refresh boundary and retired after real DATA ACKs.
 //!
 //! After every step the observable outcome -- KMRSP echoed or not, which
 //! key decrypts DATA under each selector, which selector the listener's
@@ -86,6 +86,8 @@ mod srt_rs {
     /// One SEK under both selectors is refused. (libsrt installs any key
     /// that unwraps.)
     pub const RETIRED_RECEIVE_KEYS: usize = 4;
+    /// HARDENING: independently bounded retired transmit identities.
+    pub const RETIRED_TRANSMIT_KEYS: usize = 4;
     /// HARDENING: fresh-salt KEK derivations available at once per
     /// connection, and the interval that restores one.
     pub const DERIVATION_BURST: u64 = 2;
@@ -142,6 +144,11 @@ enum Request {
         flag: KeyFlag,
         salt: u8,
     },
+    ReflectRetired {
+        index: Index,
+        flag: KeyFlag,
+        salt: u8,
+    },
     /// A key the listener receives under, announced elsewhere.
     MoveKnown {
         from: KeyFlag,
@@ -176,6 +183,7 @@ enum Step {
     Wait,
     SwitchThreshold,
     LocalData,
+    RetireOld,
 }
 
 fn ts(micros: u64) -> Timestamp {
@@ -225,6 +233,8 @@ struct Model {
     tokens: u64,
     tokens_at: Option<u64>,
     tx: [Vec<u8>; 2],
+    tx_retired: VecDeque<Vec<u8>>,
+    tx_postannounce: bool,
     tx_current: KeyFlag,
     tx_next: Option<KeyFlag>,
     pending: Option<Pending>,
@@ -233,20 +243,21 @@ struct Model {
 }
 
 impl Model {
-    /// After the handshake: the caller's initial even key, in both
-    /// directions (libsrt clones the responder's transmit context from
-    /// the received KM).
-    fn new(suite: Suite) -> Self {
+    /// Both directions have confirmed independent material via ordinary
+    /// runtime KM exchanges; the shared handshake key is retired from RX.
+    fn new(suite: Suite, directional_sek: Vec<u8>, peer_sek: Vec<u8>) -> Self {
         let len = suite.key_length.len();
         let initial = vec![INITIAL_SEK; len];
         Self {
             suite,
-            rx: [Some((initial.clone(), SESSION_SALT)), None],
-            retired: VecDeque::new(),
+            rx: [Some((peer_sek, SESSION_SALT)), None],
+            retired: VecDeque::from([initial.clone()]),
             rx_kek_salt: None,
             tokens: srt_rs::DERIVATION_BURST,
             tokens_at: None,
-            tx: [initial, vec![0; len]],
+            tx: [directional_sek, vec![0; len]],
+            tx_retired: VecDeque::from([initial]),
+            tx_postannounce: false,
             tx_current: KeyFlag::Even,
             tx_next: None,
             pending: None,
@@ -293,6 +304,7 @@ impl Model {
     /// HARDENING: reflected, moved or retired key.
     fn refuses(&self, sek: &[u8]) -> bool {
         self.tx.iter().any(|key| key == sek)
+            || self.tx_retired.iter().any(|key| key == sek)
             || self.rx.iter().flatten().any(|(key, _)| key == sek)
             || self.retired.iter().any(|key| key == sek)
     }
@@ -336,12 +348,30 @@ impl Model {
     }
 
     fn rotate(&mut self, flag: KeyFlag, sek: Vec<u8>, body: Vec<u8>) {
+        self.remember_tx_key(self.tx[slot(flag)].clone());
+        self.tx_postannounce = false;
         self.tx[slot(flag)] = sek;
         self.tx_next = Some(flag);
         self.pending = Some(Pending {
             body,
             retries_left: srt_rs::RETRIES,
         });
+    }
+
+    fn remember_tx_key(&mut self, key: Vec<u8>) {
+        if key.iter().any(|byte| *byte != 0) {
+            self.tx_retired.push_back(key);
+            if self.tx_retired.len() > srt_rs::RETIRED_TRANSMIT_KEYS {
+                self.tx_retired.pop_front();
+            }
+        }
+    }
+
+    fn retire_old(&mut self) {
+        let old = slot(self.tx_current.other());
+        self.remember_tx_key(self.tx[old].clone());
+        self.tx[old].fill(0);
+        self.tx_postannounce = false;
     }
 
     fn retry(&mut self) -> Retry {
@@ -365,6 +395,7 @@ impl Model {
         if let Some(next) = self.tx_next.take() {
             self.tx_current = next;
             self.at_threshold = false;
+            self.tx_postannounce = true;
         }
     }
 }
@@ -397,6 +428,26 @@ fn wrap(kek: &[u8], plain: &[u8]) -> Vec<u8> {
     };
     assert!(wrapped_ok, "the fixture wraps its SEKs");
     wrapped
+}
+
+fn unwrap(kek: &[u8], wrapped: &[u8]) -> Vec<u8> {
+    let mut plain = vec![0; wrapped.len() - 8];
+    let ok = match kek.len() {
+        16 => KwAes128::new_from_slice(kek)
+            .unwrap()
+            .unwrap_key(wrapped, &mut plain)
+            .is_ok(),
+        24 => KwAes192::new_from_slice(kek)
+            .unwrap()
+            .unwrap_key(wrapped, &mut plain)
+            .is_ok(),
+        _ => KwAes256::new_from_slice(kek)
+            .unwrap()
+            .unwrap_key(wrapped, &mut plain)
+            .is_ok(),
+    };
+    assert!(ok, "directional KM unwraps independently");
+    plain
 }
 
 /// libsrt's KM message (`haicrypt/hcrypt_km.h`): version/type, KK, KEKI,
@@ -565,11 +616,7 @@ fn options(socket_id: u32, suite: Suite, passphrase: Option<&str>) -> Connection
 }
 
 /// Forward everything `from` sends to `to`; the handshakes among it.
-fn forward(
-    from: &mut SrtConnection,
-    to: &mut SrtConnection,
-    now: Timestamp,
-) -> Vec<HandshakePacket> {
+fn forward(from: &mut SrtConnection, to: &mut SrtConnection, now: Timestamp) -> Outputs {
     let mut outputs = Outputs::default();
     while let Some(output) = from.poll_output().expect("poll_output") {
         if let ConnectionOutput::SendPacket(datagram) = output {
@@ -577,19 +624,32 @@ fn forward(
             outputs.record(datagram);
         }
     }
-    outputs.handshakes
+    outputs
 }
 
 /// Run a handshake; every handshake packet either side sent.
-fn handshake(caller: &mut SrtConnection, listener: &mut SrtConnection) -> Vec<HandshakePacket> {
+fn handshake(
+    caller: &mut SrtConnection,
+    listener: &mut SrtConnection,
+) -> (Vec<HandshakePacket>, Option<Vec<u8>>, Option<Vec<u8>>) {
     let mut seen = Vec::new();
+    let mut directional = None;
+    let mut peer_directional = None;
     caller.connect(ts(0)).expect("caller connects");
     for round in 0..6 {
         let now = ts(round * 10_000);
-        seen.extend(forward(caller, listener, now));
-        seen.extend(forward(listener, caller, now));
+        let caller_outputs = forward(caller, listener, now);
+        seen.extend(caller_outputs.handshakes);
+        if let Some(body) = caller_outputs.kmreq.into_iter().next() {
+            peer_directional = Some(body);
+        }
+        let outputs = forward(listener, caller, now);
+        seen.extend(outputs.handshakes);
+        if let Some(body) = outputs.kmreq.into_iter().next() {
+            directional = Some(body);
+        }
     }
-    seen
+    (seen, directional, peer_directional)
 }
 
 // ============================================================================
@@ -619,18 +679,34 @@ impl Harness {
     fn connect(suite: Suite) -> Result<Self, TestCaseError> {
         let mut peer = SrtConnection::new_caller(options(1, suite, Some(PASSPHRASE)));
         let mut sut = SrtConnection::new_listener(options(2, suite, Some(PASSPHRASE)));
-        let seen = handshake(&mut peer, &mut sut);
+        let (seen, directional, peer_directional) = handshake(&mut peer, &mut sut);
         prop_assert_eq!(sut.state(), ConnectionState::Connected);
         prop_assert_eq!(peer.state(), ConnectionState::Connected);
         let request = seen.iter().find_map(|hs| hs.get_km_request()?.ok());
         let response = seen.iter().find_map(|hs| hs.get_km_response().ok()?);
         prop_assert!(request.is_some(), "no handshake KMREQ");
         prop_assert_eq!(request, response, "the handshake KMRSP echoes the KMREQ");
+        let directional = directional.ok_or_else(|| TestCaseError::fail("no directional KMREQ"))?;
+        let tx_key = unwrap(
+            &derive_kek(&SESSION_SALT, suite.key_length.len()),
+            &directional[32..],
+        );
+        prop_assert_ne!(&tx_key, &vec![INITIAL_SEK; suite.key_length.len()]);
+        let peer_directional =
+            peer_directional.ok_or_else(|| TestCaseError::fail("no caller directional KMREQ"))?;
+        let peer_key = unwrap(
+            &derive_kek(&SESSION_SALT, suite.key_length.len()),
+            &peer_directional[32..],
+        );
+        prop_assert_ne!(&peer_key, &vec![INITIAL_SEK; suite.key_length.len()]);
+        prop_assert_ne!(&tx_key, &peer_key);
+        prop_assert!(peer.can_send(), "caller directional KMRSP releases DATA");
+        prop_assert!(sut.can_send(), "matching directional KMRSP releases DATA");
         let _ = (take_delivered(&mut peer), take_delivered(&mut sut));
         let _ = (take_outputs(&mut peer), take_outputs(&mut sut));
         let peer_seq = peer.next_sequence_number().expect("caller sequence");
         Ok(Self {
-            model: Model::new(suite),
+            model: Model::new(suite, tx_key, peer_key),
             sut,
             peer,
             now: 100_000,
@@ -661,6 +737,7 @@ impl Harness {
             }
             Step::SwitchThreshold => self.switch_threshold(),
             Step::LocalData => self.local_data(),
+            Step::RetireOld => self.retire_old(),
         }
     }
 
@@ -712,6 +789,13 @@ impl Harness {
                 };
                 let sek = self.model.tx[slot(source)].clone();
                 Some(self.announcement((*flag).into(), *salt, vec![sek]))
+            }
+            Request::ReflectRetired { index, flag, salt } => {
+                if self.model.tx_retired.is_empty() {
+                    return None;
+                }
+                let key = self.model.tx_retired[index.index(self.model.tx_retired.len())].clone();
+                Some(self.announcement((*flag).into(), *salt, vec![key]))
             }
             Request::MoveKnown { from, to, salt } => {
                 let (sek, _) = self.model.rx[slot(*from)].clone()?;
@@ -771,7 +855,10 @@ impl Harness {
             prop_assert!(result.is_err(), "{:?} accepted; model {:?}", a, self.model);
             prop_assert!(outputs.kmrsp.is_empty(), "refused {:?} answered", a);
         }
-        if !matches!(request, Request::Reflect { .. }) {
+        if !matches!(
+            request,
+            Request::Reflect { .. } | Request::ReflectRetired { .. }
+        ) {
             self.sent.push(a);
         }
         Ok(())
@@ -962,6 +1049,25 @@ impl Harness {
         self.model.after_local_send();
         Ok(())
     }
+
+    fn retire_old(&mut self) -> TestCaseResult {
+        if !self.model.tx_postannounce {
+            return Ok(());
+        }
+        // ACK every earlier local DATA with the real peer, so normal
+        // retention cannot keep the old TX generation alive.
+        self.now += 100_000;
+        self.peer.handle_timer(TimerId::Ack, ts(self.now)).unwrap();
+        let _ = forward(&mut self.peer, &mut self.sut, ts(self.now));
+        let _ = take_outputs(&mut self.sut);
+        self.sut
+            .seed_encrypted_packet_count_for_test(4_000)
+            .unwrap();
+        self.model.at_threshold = false;
+        self.local_data()?;
+        self.model.retire_old();
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -1009,6 +1115,8 @@ fn request() -> impl Strategy<Value = Request> {
         2 => any::<Index>().prop_map(Request::Replay),
         1 => (any::<bool>(), flag(), 0u8..4)
             .prop_map(|(next, flag, salt)| Request::Reflect { next, flag, salt }),
+        1 => (any::<Index>(), flag(), 0u8..4)
+            .prop_map(|(index, flag, salt)| Request::ReflectRetired { index, flag, salt }),
         1 => (flag(), flag(), 0u8..4)
             .prop_map(|(from, to, salt)| Request::MoveKnown { from, to, salt }),
         2 => (defect(), 0u8..4, any::<u8>())
@@ -1036,6 +1144,7 @@ fn step() -> impl Strategy<Value = Step> {
         1 => Just(Step::Wait),
         1 => Just(Step::SwitchThreshold),
         2 => Just(Step::LocalData),
+        2 => Just(Step::RetireOld),
     ]
 }
 
@@ -1072,6 +1181,39 @@ proptest! {
 proptest! {
     #![proptest_config(config(8))]
 
+    /// Hold an already protected peer packet across both local rotations
+    /// and retirement. Rebuilding peer DATA from the current RX slots
+    /// after the hostile KMREQ would conceal an overwritten RX key.
+    #[test]
+    fn retired_tx_reflection_preserves_preprotected_peer_data(suite in suite()) {
+        let mut h = Harness::connect(suite)?;
+        h.kmreq(&Request::Fresh {
+            keys: KmKeySelection::Odd, salt: 0, seeds: [3, 4],
+        })?;
+        let plaintext = b"protected before local TX retirement and reflected KM";
+        let protected = h.peer_datagram(KeyFlag::Odd, plaintext, false);
+        h.local_rotate()?;
+        let captured = h.model.pending.as_ref().unwrap().body.clone();
+        let retired_key = h.model.tx[slot(KeyFlag::Odd)].clone();
+        h.ack_rotation()?;
+        h.switch_threshold()?;
+        h.local_data()?;
+        h.retire_old()?;
+        h.local_rotate()?;
+        h.ack_rotation()?;
+        h.switch_threshold()?;
+        h.local_data()?;
+        h.retire_old()?;
+        prop_assert!(h.model.tx[slot(KeyFlag::Odd)].iter().all(|b| *b == 0));
+        prop_assert!(h.model.tx_retired.contains(&retired_key));
+        prop_assert!(h.model.refuses(&retired_key));
+        let reflection = control_datagram(h.sut.socket_id(), SRT_CMD_KMREQ, &captured, h.now);
+        prop_assert!(h.sut.feed_recv_buf(&reflection, ts(h.now)).is_err());
+        prop_assert!(take_outputs(&mut h.sut).kmrsp.is_empty());
+        prop_assert!(h.sut.feed_recv_buf(&protected, ts(h.now)).is_ok());
+        prop_assert_eq!(take_delivered(&mut h.sut), plaintext);
+    }
+
     /// Property 1: a wrong or missing listener secret fails the handshake;
     /// a wrong one is reported as BADSECRET.
     #[test]
@@ -1081,7 +1223,7 @@ proptest! {
     ) {
         let mut caller = SrtConnection::new_caller(options(1, suite, Some(PASSPHRASE)));
         let mut listener = SrtConnection::new_listener(options(2, suite, listener_secret));
-        let seen = handshake(&mut caller, &mut listener);
+        let (seen, _, _) = handshake(&mut caller, &mut listener);
         prop_assert_ne!(caller.state(), ConnectionState::Connected);
         let failures: Vec<KmError> = seen.iter().filter_map(|hs| hs.get_km_response().err()).collect();
         if listener_secret.is_some() {
