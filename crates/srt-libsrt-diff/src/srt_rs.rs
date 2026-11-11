@@ -21,7 +21,7 @@ impl SrtRsReceiver {
             profile.initial_seq,
             profile.latency_ms,
             Timestamp::from_micros(profile.time_base_us),
-            profile.time_base_us,
+            i64::try_from(profile.time_base_us).expect("time base within the signed clock"),
             profile.capacity,
         );
         Self { buffer, profile }

@@ -919,3 +919,18 @@ Each item below was reproduced by a regression test that failed on
   (core.cpp:9150-9200), within the same per-report DROPREQ cap. An ACK below
   the retired drops moves nothing (it is not current) but narrows what a
   NAK may name.
+
+## Pass 3 receiver: peer-triggered timing, ACKACK, close and KM defects
+
+Each item below was reproduced by a regression test that failed on
+`8a697ef`; commit messages carry the fail-before output and mutations.
+
+- TSBPD base before the receiver epoch (R3). The base was
+  `now.saturating_sub(handshake_timestamp)`, with `now` measured from the
+  Owner's creation. A libsrt bonded member stamps its handshake with the
+  group's age (`group.h:768-782`, `core.cpp:3621-3622`), so reconnecting to
+  a freshly started listener clamped the base to zero and every packet was
+  held for the clock difference (an hour in the test). libsrt derives the
+  base on the steady clock and never clamps (`core.cpp:2253/2490`). The base
+  is now an `i64` through delivery, source-time, drift and wrap arithmetic;
+  only the final instant is floored at the epoch.

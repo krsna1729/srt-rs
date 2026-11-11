@@ -818,6 +818,33 @@ proptest! {
         prop_assert_eq!(popped, seqs);
     }
 
+    /// The TSBPD base is the receiver clock minus the peer's handshake
+    /// timestamp and lies before the receiver's epoch whenever the peer's
+    /// clock is older. Wherever the two clocks started, a packet the peer
+    /// stamped `sent_after` past its handshake plays exactly `delay` after
+    /// the matching receiver moment.
+    #[test]
+    fn tsbpd_play_time_is_independent_of_the_clock_offset(
+        peer_epoch in 0u64..u64::from(u32::MAX - 40_000_000),
+        local_epoch in 0u64..10_000_000_000,
+        sent_after in 0u64..10_000_000,
+        delay_ms in 0u16..8_000,
+    ) {
+        let base = local_epoch as i64 - peer_epoch as i64;
+        let mut buf =
+            ReceiverBuffer::new(0, delay_ms, Timestamp::from_micros(local_epoch), base);
+        let arrival = local_epoch + sent_after;
+        buf.receive(
+            make_packet(0, (peer_epoch + sent_after) as u32),
+            Timestamp::from_micros(arrival),
+        );
+        let play = arrival + u64::from(delay_ms) * 1_000;
+        if play > 0 {
+            prop_assert!(buf.pop_ready(Timestamp::from_micros(play - 1)).is_none());
+        }
+        prop_assert!(buf.pop_ready(Timestamp::from_micros(play)).is_some());
+    }
+
     /// DROPREQ removes exactly its circular interval, preserves every packet
     /// outside it, and leaves delivery ordered across the sequence wrap.
     #[test]
