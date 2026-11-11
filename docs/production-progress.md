@@ -817,3 +817,11 @@ mutation results and numbers in its commit message.
   identity check. The VENDOR.md late-handshake row claimed such repeats were
   answered; its regression rewrote the destination to hide that they were
   not, and is corrected.
+- Lent slots and listener capacity (T6). A member of a relocating layout
+  keeps the slot of every session it relocated lent until the target
+  releases it, but `reject_new_peer` counted only occupied and retired
+  slots. With enough legs relocated away, a new peer passed the check and
+  found no free local slot, and `allocate_listener_socket_id`'s `expect`
+  panicked the Owner. Lent slots now count against `max_peers`, and a failed
+  allocation is a `Dropped(Capacity)` (with a debug assertion) instead of a
+  panic.
