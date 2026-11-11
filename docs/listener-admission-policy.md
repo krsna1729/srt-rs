@@ -181,7 +181,9 @@ exactly like `listen`.
   on the packet-owner thread, through `PeerTable::admit_with_resolver`. Owners
   add no second admission engine; Configure, Reject, Defer, telemetry and the
   half-open TTL are the table's own. A Deferred peer keeps its original hard
-  half-open expiry.
+  half-open expiry. A CONCLUSION repeated after the peer connected (its
+  response was lost) is answered from the established connection without
+  running the resolver again: its policy window has closed.
 - **Never on the data path.** It does not run for DATA, ACK, NAK, retransmits
   or timers. Its cost is per admitted handshake, not per packet.
 - **Bounded and cache-backed.** The callback is synchronous and bounded. It is
@@ -247,7 +249,7 @@ cross-counter transaction.
 
 | Counter | Operational meaning |
 |---|---|
-| `policy_requests` | Valid-cookie CONCLUSION attempts presented to policy, including retransmissions. |
+| `policy_requests` | Valid-cookie CONCLUSION attempts presented to policy, including retransmissions to a peer that is not yet established (a `Defer`red one). A repeat to an established peer is answered from its stored response and never reaches policy. |
 | `policy_configurations` | Typed per-peer configurations successfully applied. Plain `Accept` is not included. |
 | `policy_deferred` | Attempts retained without feeding CONCLUSION or refreshing expiry. |
 | `policy_rejections` | Application policy rejections. |

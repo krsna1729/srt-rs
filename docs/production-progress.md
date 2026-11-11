@@ -800,3 +800,20 @@ index probes, heap entries visited or cloned, promoted slot probes,
 retirement index probes, receiver-stat entries walked, limiter entries
 visited and free-slot probes. Each finding has a test at three sizes;
 before/after counts and mutations are in each commit message.
+
+## Admission against lost and spoofed handshakes (2026-11-11)
+
+Findings of the pass-3 admission audit, each with a fail-before regression,
+mutation results and numbers in its commit message.
+
+- Lost CONCLUSION response (T2). A caller whose listener response was lost
+  retransmits its CONCLUSION to socket 0. Admission sent it through the
+  resolver again, where a `Configure` policy fails on a connected peer, and
+  the connected listener's destination check refused socket 0 anyway, so the
+  caller timed out. A repeat to an established peer is now fed straight to
+  the connection, which resends its stored response (libsrt answers a repeat
+  from existing state before its accept hook, api.cpp:646-676), and a
+  connected listener accepts a socket-0 handshake into its late-handshake
+  identity check. The VENDOR.md late-handshake row claimed such repeats were
+  answered; its regression rewrote the destination to hide that they were
+  not, and is corrected.

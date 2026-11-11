@@ -1984,14 +1984,20 @@ impl SrtConnection {
                 packet.control_type == ControlType::Handshake,
             ),
         };
+        // A handshake may name socket ID 0 until it is answered: the caller
+        // sends every CONCLUSION, retransmissions included, to 0 (libsrt
+        // too), so an established listener still receives a repeat whose
+        // response was lost that way. `handle_handshake` answers only an
+        // exact repeat of the established session's CONCLUSION.
         if self.options.socket_id != 0
             && dest_socket_id != self.options.socket_id
             && !(is_handshake
                 && dest_socket_id == 0
-                && !matches!(
-                    self.state,
-                    ConnectionState::Connected | ConnectionState::Closing
-                ))
+                && match self.state {
+                    ConnectionState::Connected => self.role == ConnectionRole::Listener,
+                    ConnectionState::Closing => false,
+                    _ => true,
+                })
         {
             return Err(Error::invalid_data(format!(
                 "destination socket ID mismatch: expected {:#x}, got {:#x}",
@@ -11149,13 +11155,13 @@ mod tests {
             .clone()
             .expect("listener retained its CONCLUSION response");
 
-        for (target, mut valid) in [
+        for (target, valid) in [
             (&mut caller, conclusion_response),
             (&mut listener, conclusion_request),
         ] {
-            // The initial caller CONCLUSION targets socket zero; once the
-            // listener is established, its demultiplexer requires its own ID.
-            valid.dest_socket_id = target.socket_id();
+            // Each CONCLUSION keeps the destination it had on the wire: the
+            // caller's request names socket 0 (libsrt's does too), so an
+            // established listener must still answer a repeat sent that way.
             let _ = drain_outputs(target);
             while target.poll_event().is_some() {}
             let peer_id = target.peer_socket_id;
@@ -11234,7 +11240,6 @@ mod tests {
             );
             assert_eq!(target.state(), ConnectionState::Connected);
         }
-
         assert_encrypted_roundtrip(
             &mut caller,
             &mut listener,
@@ -11247,6 +11252,31 @@ mod tests {
             Timestamp::from_micros(1_000_020),
             b"post-handshake listener DATA",
         );
+    }
+
+    /// Only a listener is addressed by socket 0 once connected (a caller
+    /// sends every CONCLUSION there); a connected caller refuses a
+    /// handshake sent there.
+    #[test]
+    #[cfg_attr(
+        all(miri, not(feature = "miri-extended")),
+        ignore = "real AES-CTR handshake under Miri; run in the miri-extended scheduled job"
+    )]
+    fn a_connected_caller_refuses_a_handshake_addressed_to_socket_zero() {
+        let (mut caller, listener) = encrypted_pair(CipherMode::Ctr);
+        let mut stray = listener
+            .last_handshake_packet
+            .clone()
+            .expect("listener retained its CONCLUSION response");
+        stray.dest_socket_id = 0;
+        let mut bytes = Vec::new();
+        stray.encode(&mut bytes).expect("wire-format control");
+        let _ = drain_outputs(&mut caller);
+        caller
+            .feed_recv_buf(&bytes, Timestamp::from_micros(1_000_003))
+            .expect_err("a connected caller is not addressed by socket 0");
+        assert!(drain_outputs(&mut caller).is_empty());
+        assert_eq!(caller.state(), ConnectionState::Connected);
     }
 
     /// A documentation-range peer address on `family`'s path.
