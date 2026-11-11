@@ -865,7 +865,7 @@ pub struct DropRangeSummary {
 /// Delay and RTT estimation remain properties of the individual connection.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct GroupReceiveTime {
-    time_base: u64,
+    time_base: i64,
     wrap_generation: u64,
     wrapping: bool,
     drift_us: i64,
@@ -949,7 +949,10 @@ pub struct ReceiverBuffer {
     tsbpd_enabled: bool,
 
     /// TSBPD time base (TsbpdTimeBase = T_NOW - HSREQ_TIMESTAMP, microseconds).
-    tsbpd_time_base: u64,
+    /// Signed: a peer whose clock is older than this receiver's epoch (a
+    /// bonded member carrying its group's start time, say) puts the base
+    /// before zero, and libsrt's steady-clock base never clamps there.
+    tsbpd_time_base: i64,
 
     /// First RTT sample, used to compensate one-way-delay changes while
     /// measuring TSBPD clock drift.
@@ -1038,7 +1041,7 @@ impl ReceiverBuffer {
         initial_seq: u32,
         tsbpd_delay_ms: u16,
         start_time: Timestamp,
-        tsbpd_time_base: u64,
+        tsbpd_time_base: i64,
     ) -> Self {
         Self::with_buffer_size(
             initial_seq,
@@ -1054,7 +1057,7 @@ impl ReceiverBuffer {
         initial_seq: u32,
         tsbpd_delay_ms: u16,
         start_time: Timestamp,
-        tsbpd_time_base: u64,
+        tsbpd_time_base: i64,
         max_buffer_size: u32,
     ) -> Self {
         let max_buffer_size = max_buffer_size.clamp(1, MAX_FLOW_WINDOW);
@@ -1458,16 +1461,24 @@ impl ReceiverBuffer {
             .unwrap_or(self.loss_detection_frontier.wrapping_add(1) & SEQUENCE_MASK)
     }
 
-    fn packet_base_time(&self, timestamp: u32) -> u64 {
+    /// The receiver-clock moment, possibly before this clock's epoch, at
+    /// which the sender stamped `timestamp`, before drift correction.
+    fn packet_base_time(&self, timestamp: u32) -> i64 {
+        let carry =
+            if self.wrapping_period_active && u64::from(timestamp) < WRAPPING_CARRYOVER_BELOW {
+                MAX_TIMESTAMP as i64 + 1
+            } else {
+                0
+            };
         self.tsbpd_time_base
-            .saturating_add(timestamp as u64)
-            .saturating_add(
-                if self.wrapping_period_active && (timestamp as u64) < WRAPPING_CARRYOVER_BELOW {
-                    MAX_TIMESTAMP + 1
-                } else {
-                    0
-                },
-            )
+            .saturating_add(i64::from(timestamp))
+            .saturating_add(carry)
+    }
+
+    /// A receiver-clock moment as a `Timestamp`; one before the epoch has
+    /// already passed, so it is the epoch itself.
+    fn local_time(micros: i64) -> Timestamp {
+        Timestamp::from_micros(u64::try_from(micros).unwrap_or(0))
     }
 
     fn delivery_time(&self, entry: &ReceivedPacket) -> Timestamp {
@@ -1476,10 +1487,11 @@ impl ReceiverBuffer {
             return entry.recv_time;
         }
 
-        let base_and_delay = self
-            .packet_base_time(entry.timestamp)
-            .saturating_add(self.tsbpd_delay_us);
-        Timestamp::from_micros(base_and_delay.saturating_add_signed(self.drift_tracer.drift_us()))
+        Self::local_time(
+            self.packet_base_time(entry.timestamp)
+                .saturating_add_unsigned(self.tsbpd_delay_us)
+                .saturating_add(self.drift_tracer.drift_us()),
+        )
     }
 
     /// The connection-clock-domain moment the sender originally queued this
@@ -1497,9 +1509,9 @@ impl ReceiverBuffer {
         if !self.tsbpd_enabled {
             return entry.recv_time;
         }
-        Timestamp::from_micros(
+        Self::local_time(
             self.packet_base_time(entry.timestamp)
-                .saturating_add_signed(self.drift_tracer.drift_us()),
+                .saturating_add(self.drift_tracer.drift_us()),
         )
     }
 
@@ -1547,7 +1559,7 @@ impl ReceiverBuffer {
         if self.tsbpd_enabled && self.wrapping_period_active {
             let ts = entry.timestamp as u64;
             if (WRAPPING_PERIOD_END_MIN..=WRAPPING_PERIOD_END_MAX).contains(&ts) {
-                self.tsbpd_time_base += MAX_TIMESTAMP + 1;
+                self.tsbpd_time_base += MAX_TIMESTAMP as i64 + 1;
                 self.wrap_generation += 1;
                 self.wrapping_period_active = false;
             }
@@ -1895,12 +1907,13 @@ impl ReceiverBuffer {
             .zip(self.first_rtt_sample)
             .map_or(0, |(sample, first)| i64::from(sample) - i64::from(first))
             / 2;
-        let drift_sample =
-            now.as_micros() as i64 - self.packet_base_time(packet_timestamp) as i64 - rtt_delta;
+        let drift_sample = (now.as_micros() as i64)
+            .saturating_sub(self.packet_base_time(packet_timestamp))
+            .saturating_sub(rtt_delta);
         if self.drift_tracer.update(drift_sample) {
             self.tsbpd_time_base = self
                 .tsbpd_time_base
-                .saturating_add_signed(self.drift_tracer.overdrift_us());
+                .saturating_add(self.drift_tracer.overdrift_us());
         }
     }
 
@@ -1996,13 +2009,18 @@ impl ReceiverBuffer {
     /// When a loss with no later packet retained is given up: the play time
     /// estimated from the time base, plus the TLPKTDROP threshold.
     fn estimated_tail_drop_time(&self) -> u64 {
-        let base = self.tsbpd_time_base + self.tsbpd_delay_us;
-        let estimated_delivery = if self.wrapping_period_active {
-            base + MAX_TIMESTAMP + 1
+        let carry = if self.wrapping_period_active {
+            MAX_TIMESTAMP as i64 + 1
         } else {
-            base
+            0
         };
-        estimated_delivery + self.tlpktdrop_threshold_us()
+        let estimated_delivery = self
+            .tsbpd_time_base
+            .saturating_add_unsigned(self.tsbpd_delay_us)
+            .saturating_add(carry);
+        Self::local_time(estimated_delivery)
+            .as_micros()
+            .saturating_add(self.tlpktdrop_threshold_us())
     }
 
     /// Validate a 31-bit inclusive DROPREQ range against this receiver's

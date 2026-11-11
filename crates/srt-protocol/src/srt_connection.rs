@@ -1934,7 +1934,7 @@ impl SrtConnection {
     /// Initialize the send/receive buffers. Demand starts false: static
     /// `pacing_repay` only enables repay, the app must still signal waiting
     /// data via `set_pacing_demand`.
-    fn init_buffers(&mut self, now: Timestamp, peer_initial_seq: u32, tsbpd_time_base: u64) {
+    fn init_buffers(&mut self, now: Timestamp, peer_initial_seq: u32, tsbpd_time_base: i64) {
         self.peer_initial_seq = Some(peer_initial_seq & 0x7FFF_FFFF);
         let negotiated_window = self.negotiated_flow_window();
         let mut sender =
@@ -4285,7 +4285,7 @@ impl SrtConnection {
         // derived from that CONCLUSION timestamp (libsrt stamps its start
         // time once, when the socket opens).
 
-        let tsbpd_time_base = now.as_micros().saturating_sub(hsreq_timestamp as u64);
+        let tsbpd_time_base = now.as_micros() as i64 - i64::from(hsreq_timestamp);
         self.init_buffers(now, hs.initial_packet_seq, tsbpd_time_base);
 
         self.queue_output(QueuedOutput::ClearTimer {
@@ -4523,7 +4523,7 @@ impl SrtConnection {
         self.handshake_started_at = None;
         self.set_state(ConnectionState::Connected);
 
-        let tsbpd_time_base = now.as_micros().saturating_sub(hsreq_timestamp as u64);
+        let tsbpd_time_base = now.as_micros() as i64 - i64::from(hsreq_timestamp);
         self.init_buffers(now, hs.initial_packet_seq, tsbpd_time_base);
         self.queue_output(QueuedOutput::ClearTimer {
             id: TimerId::Handshake,
@@ -6860,6 +6860,80 @@ mod tests {
         let (mut caller, mut listener) = isn_pair(0x8000_0011);
         drive_handshake_to_connected(&mut caller, &mut listener);
         assert_eq!(caller.initial_seq, 0x11);
+    }
+
+    /// A bonded member's handshake timestamp is the group's age (libsrt
+    /// members share the group start time, group.h:768-782,
+    /// core.cpp:3621-3622), which can exceed a freshly started listener's
+    /// clock. libsrt derives the peer start on the steady clock and never
+    /// clamps it (core.cpp:2253/2490), so the TSBPD base must stay negative
+    /// here instead of saturating to zero and holding every packet for the
+    /// clock difference.
+    #[test]
+    fn handshake_timestamp_beyond_the_local_clock_keeps_tsbpd_on_schedule() {
+        const CALLER_EPOCH: u64 = 3_600_000_000;
+        const LISTENER_EPOCH: u64 = 1_000_000;
+        let caller_at = |t: u64| Timestamp::from_micros(CALLER_EPOCH + t);
+        let listener_at = |t: u64| Timestamp::from_micros(LISTENER_EPOCH + t);
+        let latency = u64::from(ConnectionOptions::default().tsbpd_delay) * 1_000;
+
+        // The group clock started at zero, an hour before this member joins.
+        let (group_peer, _) = connected_pair();
+        let group_time = group_peer.group_time().expect("connected member clock");
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 1,
+            ..ConnectionOptions::default()
+        });
+        let mut listener = SrtConnection::new_listener(ConnectionOptions {
+            socket_id: 2,
+            syn_cookie: Some(7),
+            ..ConnectionOptions::default()
+        });
+        caller.inherit_group_time(group_time);
+        crate::test_support::wire_checker::check_pair(&mut caller, &mut listener);
+        caller.connect(caller_at(0)).expect("caller starts");
+        // A symmetric 5 ms one-way delay each way.
+        for round in 0..4 {
+            forward_handshake_round(&mut caller, &mut listener, listener_at(round * 10_000));
+            forward_handshake_round(
+                &mut listener,
+                &mut caller,
+                caller_at(round * 10_000 + 5_000),
+            );
+        }
+        assert_eq!(caller.state(), ConnectionState::Connected);
+        assert_eq!(listener.state(), ConnectionState::Connected);
+        let _ = drain_outputs(&mut listener);
+
+        caller
+            .send(b"due", caller_at(100_000))
+            .expect("DATA queued");
+        let data = drain_datagrams(&mut caller)
+            .into_iter()
+            .find(|bytes| matches!(SrtPacket::decode(bytes), Ok(SrtPacket::Data(_))))
+            .expect("DATA sent");
+        let arrival = 105_000;
+        listener
+            .feed_recv_buf(&data, listener_at(arrival))
+            .expect("DATA accepted");
+        let delivered = |listener: &mut SrtConnection, now: Timestamp| {
+            listener
+                .handle_timer(TimerId::DeliveryContinue, now)
+                .expect("delivery");
+            std::iter::from_fn(|| listener.poll_event())
+                .filter(|event| matches!(event, ConnectionEvent::DataReceived { .. }))
+                .count()
+        };
+        assert_eq!(
+            delivered(&mut listener, listener_at(arrival + latency - 1)),
+            0,
+            "held for its latency"
+        );
+        assert_eq!(
+            delivered(&mut listener, listener_at(arrival + latency)),
+            1,
+            "delivered at its play time, not an hour late"
+        );
     }
 
     /// Record a DATA packet a test injects below the connection's receive
