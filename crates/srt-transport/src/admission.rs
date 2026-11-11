@@ -1755,6 +1755,24 @@ impl PeerTable {
         Ok(())
     }
 
+    /// A repeat CONCLUSION to an established peer means its response was
+    /// lost: the connection resends the stored response. Capacity, key
+    /// derivation and policy were settled when it connected, and the policy
+    /// window has closed, so none of them runs again (libsrt answers a
+    /// repeat from existing state before its accept hook, api.cpp:646-676).
+    fn is_established_repeat(
+        &self,
+        physical: Option<PhysicalPeerKey>,
+        conclusion: Option<&srt_lifecycle::HandshakeIdentity>,
+    ) -> bool {
+        let (Some(physical), Some(identity)) = (physical, conclusion) else {
+            return false;
+        };
+        self.get_peer(&physical).is_some_and(|entry| {
+            entry.admission_established && identity.syn_cookie == entry.conn.syn_cookie()
+        })
+    }
+
     fn apply_known_conclusion_policy<F>(
         &mut self,
         context: KnownConclusionContext<'_>,
@@ -2861,18 +2879,20 @@ impl PeerTable {
             if let Some(result) = self.reject_new_peer(peer, handshake.as_ref(), telemetry) {
                 return result;
             }
-        } else if let Some(result) = self.apply_known_conclusion_policy(
-            KnownConclusionContext {
-                peer,
-                physical,
-                handshake: handshake.as_ref(),
-                identity: conclusion,
-                now,
-                options,
-                telemetry,
-            },
-            hook,
-        ) {
+        } else if !self.is_established_repeat(physical, conclusion)
+            && let Some(result) = self.apply_known_conclusion_policy(
+                KnownConclusionContext {
+                    peer,
+                    physical,
+                    handshake: handshake.as_ref(),
+                    identity: conclusion,
+                    now,
+                    options,
+                    telemetry,
+                },
+                hook,
+            )
+        {
             return result;
         }
 
@@ -6338,6 +6358,73 @@ pub(crate) mod tests {
                     .expect("conclusion response");
             }
         }
+    }
+
+    /// T2: a CONCLUSION retransmitted because the listener's response was
+    /// lost reaches an already established peer. It is answered from that
+    /// connection's stored response without running policy again, as libsrt
+    /// answers a repeat from existing state before the accept hook
+    /// (api.cpp:646-676). Running a `Configure` policy on a connected peer
+    /// fails (its policy window has closed), which dropped the
+    /// retransmission and left the caller to time out.
+    #[test]
+    fn a_retransmitted_conclusion_is_answered_without_running_policy_again() {
+        let mut table = PeerTable::new();
+        let telemetry = IngressTelemetry::new();
+        let options = default_options();
+        let peer: std::net::SocketAddr = "10.0.0.9:5000".parse().unwrap();
+        let configure = || {
+            AdmissionResolution::Configure(crate::config::ListenerPeerPolicy {
+                latency: crate::config::PolicyOverride::Set(Duration::from_millis(200)),
+                ..crate::config::ListenerPeerPolicy::default()
+            })
+        };
+        let (mut caller, conclusion) =
+            admit_up_to_conclusion(&mut table, peer, 0x55, &options, &telemetry);
+        let now = Timestamp::from_micros(2);
+        let admit =
+            table.admit_with_resolver(peer, &conclusion, now, &options, 0, 1, &telemetry, |_| {
+                configure()
+            });
+        assert_eq!(admit, Admit::Fed);
+        let mut outbound = Vec::new();
+        table.poll_outbound(now, &mut outbound);
+        assert_eq!(table.established_count(), 1, "the listener side connected");
+        // That response is lost; the caller retransmits its CONCLUSION.
+        let resolved = std::cell::Cell::new(0);
+        let later = Timestamp::from_micros(300_000);
+        let admit =
+            table.admit_with_resolver(peer, &conclusion, later, &options, 0, 1, &telemetry, |_| {
+                resolved.set(resolved.get() + 1);
+                configure()
+            });
+        assert_eq!(admit, Admit::Fed);
+        table.poll_outbound(later, &mut outbound);
+        let responses: Vec<_> = outbound
+            .iter()
+            .filter(|(to, bytes)| {
+                *to == peer
+                    && decode_admission_datagram(bytes)
+                        .ok()
+                        .and_then(|decoded| decoded.handshake)
+                        .is_some_and(|hs| {
+                            hs.handshake_type == srt_proto::handshake::HandshakeType::Conclusion
+                        })
+            })
+            .collect();
+        assert_eq!(
+            responses.len(),
+            1,
+            "the stored CONCLUSION response is resent"
+        );
+        caller
+            .feed_recv_buf(&responses[0].1, Timestamp::from_micros(300_001))
+            .expect("caller accepts the resent response");
+        assert_eq!(caller.state(), srt_proto::ConnectionState::Connected);
+        assert_eq!(resolved.get(), 0, "policy ran once, at admission");
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.policy_errors, 0);
+        assert_eq!(snapshot.policy_requests, 1);
     }
 
     /// A Rust caller and a Rust listener on an IPv6 path negotiate the IPv6
