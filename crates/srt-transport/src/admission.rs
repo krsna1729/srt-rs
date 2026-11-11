@@ -1514,12 +1514,9 @@ impl PeerTable {
         })
     }
 
-    fn allocate_listener_socket_id(&mut self, preferred: u32) -> u32 {
-        let (_, socket_id) = self
-            .slots
-            .allocate_socket_id(preferred)
-            .expect("capacity checked before allocating listener socket ID");
-        socket_id
+    fn allocate_listener_socket_id(&mut self, preferred: u32) -> Option<u32> {
+        let (_, socket_id) = self.slots.allocate_socket_id(preferred)?;
+        Some(socket_id)
     }
 
     #[inline]
@@ -1583,7 +1580,13 @@ impl PeerTable {
             telemetry.record_invalid_datagram();
             return Some(Admit::Dropped(AdmissionDropReason::InvalidPacket));
         }
-        if self.len() + self.retired_protocols.established + self.retired_protocols.half_open
+        // Slots lent to sessions relocated to other members stay this
+        // member's until released, so they are taken as much as occupied
+        // ones: counting them keeps a local slot free for every admission.
+        if self.len()
+            + self.slots.lent_count()
+            + self.retired_protocols.established
+            + self.retired_protocols.half_open
             >= self.config.max_peers
         {
             telemetry.record_admission_capacity_drop();
@@ -2896,10 +2899,22 @@ impl PeerTable {
             return result;
         }
 
-        let physical = physical.unwrap_or_else(|| PhysicalPeerKey {
-            address: peer,
-            local_socket_id: self.allocate_listener_socket_id(options.socket_id),
-        });
+        let physical = match physical {
+            Some(physical) => physical,
+            None => {
+                // `reject_new_peer` counted every local slot that is taken.
+                let Some(local_socket_id) = self.allocate_listener_socket_id(options.socket_id)
+                else {
+                    debug_assert!(false, "capacity checked before allocating a socket ID");
+                    telemetry.record_admission_capacity_drop();
+                    return Admit::Dropped(AdmissionDropReason::Capacity);
+                };
+                PhysicalPeerKey {
+                    address: peer,
+                    local_socket_id,
+                }
+            }
+        };
         let new_logical_peer =
             (!known).then(|| self.allocate_logical_peer(LogicalPeerTarget::Direct(physical)));
         let feed = self.feed_admission_datagram(

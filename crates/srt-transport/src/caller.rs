@@ -5004,6 +5004,135 @@ mod tests {
         assert_pending_bond_relocation_ownership(&mut source, &mut target, &seed);
     }
 
+    /// T6: a slot lent to a session relocated to another member is still
+    /// this member's, so it counts against capacity. With 63 of member 1's
+    /// 64 local slots lent and none occupied, a second fresh handshake is
+    /// refused for capacity instead of finding no slot to allocate (which
+    /// panicked the Owner).
+    #[test]
+    fn lent_slots_count_against_listener_capacity() {
+        use crate::admission::{AdmissionDropReason, PromotionWork, TableRelocation};
+        let limits = PeerTableConfig {
+            max_peers: 64,
+            max_half_open_peers: 64,
+            max_established_peers: 64,
+            ..PeerTableConfig::default()
+        };
+        let router: crate::admission::SharedWorkerRouter =
+            std::sync::Arc::new(std::sync::Mutex::new(srt_lifecycle::WorkerRouter::new(2)));
+        let make_table = |member| {
+            let mut table = PeerTable::with_partition(limits, member, 2);
+            table.set_relocation(TableRelocation {
+                mode: srt_lifecycle::Promotion::Relocate,
+                member,
+                router: router.clone(),
+                exclusive: true,
+            });
+            table
+        };
+        let mut target = make_table(0);
+        let mut source = make_table(1);
+        let mut options = bonded_listener_options(0x2222);
+        let listener = options.connection_template.as_mut().expect("template");
+        listener.flow_window_packets = 64;
+        listener.receive_buffer_packets = 64;
+        listener.delivery_queue_packets = 64;
+        let caller_options = |index: u32| ConnectionOptions {
+            socket_id: 0x5000 + index,
+            initial_seq: Some(1234),
+            flow_window_packets: 64,
+            receive_buffer_packets: 64,
+            delivery_queue_packets: 64,
+            group_extension: Some(srt_proto::handshake::GroupExtensionData {
+                group_id: srt_proto::handshake::SRTGROUP_MASK | 83,
+                group_type: srt_proto::handshake::GroupType::Broadcast,
+                flags: 0,
+                weight: 1,
+            }),
+            ..ConnectionOptions::default()
+        };
+        let address =
+            |index: usize| std::net::SocketAddr::from(([127, 0, 0, 1], 30_000 + index as u16));
+        let telemetry = IngressTelemetry::new();
+        // The group is held on member 0; every leg member 1 admits leaves.
+        let (mut seed, conclusion) = prepare_conclusion_with_options(
+            &mut target,
+            address(0),
+            caller_options(0),
+            &options,
+            &telemetry,
+        );
+        finish_conclusion(
+            &mut target,
+            address(0),
+            &mut seed,
+            &conclusion,
+            &options,
+            &telemetry,
+        );
+        for index in 1..=srt_proto::MAX_GROUP_MEMBERS {
+            let (mut caller, conclusion) = prepare_conclusion_with_options(
+                &mut source,
+                address(index),
+                caller_options(index as u32),
+                &options,
+                &telemetry,
+            );
+            finish_conclusion(
+                &mut source,
+                address(index),
+                &mut caller,
+                &conclusion,
+                &options,
+                &telemetry,
+            );
+        }
+        let mut moved = Vec::new();
+        source.take_promotions(|_| Some(()), |work, ()| moved.push(work));
+        for work in moved {
+            let PromotionWork::Relocate(leg) = work else {
+                panic!("expected relocation")
+            };
+            if let Err(leg) = target.adopt(leg) {
+                // Refused by the group cap: its home slot is released.
+                assert!(
+                    source.reclaim_lent_slot(source.slot_index_for_socket_id(leg.socket_id) as u32)
+                );
+            }
+        }
+        assert_eq!(source.lent_slot_count(), srt_proto::MAX_GROUP_MEMBERS - 1);
+        assert_eq!(source.len(), 0);
+
+        let fresh = |port| std::net::SocketAddr::from(([10, 9, 0, 1], port));
+        let options = AdmissionOptions::basic(0x3333, 0, true);
+        let now = Timestamp::from_micros(5);
+        assert_eq!(
+            source.admit(
+                fresh(1),
+                &induction(0x7001),
+                now,
+                &options,
+                1,
+                2,
+                &telemetry
+            ),
+            Admit::Fed,
+            "the one slot not lent is free"
+        );
+        assert_eq!(
+            source.admit(
+                fresh(2),
+                &induction(0x7002),
+                now,
+                &options,
+                1,
+                2,
+                &telemetry
+            ),
+            Admit::Dropped(AdmissionDropReason::Capacity)
+        );
+    }
+
     #[test]
     fn relocated_bonded_leg_joins_its_group_on_the_owning_member() {
         let (mut members, route, relocations, _) =
