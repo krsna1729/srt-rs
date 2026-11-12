@@ -431,11 +431,18 @@ proptest! {
         prop_assert_eq!(buf.next_sequence_number(), expected);
     }
 
+    /// `notify_after[i]` models the queued DROPREQs going out after
+    /// operation `i`. Once they are out, the next TLPKTDROP pass retires the
+    /// dropped prefix without a peer ACK (S6), and a NAK into the retired
+    /// drops is answered with one DROPREQ for the range. It is generated
+    /// after `operations` so the persisted regression seeds still produce
+    /// the same first three inputs.
     #[test]
     fn prop_sender_differential_state_machine(
         initial_seq in 0u32..0x7FFF_FFFFu32,
         window_size in 64u32..256u32,
         operations in prop::collection::vec(0u8..10u8, 1..100),
+        notify_after in prop::collection::vec(any::<bool>(), 100),
     ) {
         const MASK: u32 = 0x7FFF_FFFF;
         let mut buf = SenderBuffer::new(initial_seq, window_size, 10);
@@ -446,6 +453,21 @@ proptest! {
         let mut model_queue = std::collections::VecDeque::new();
         let mut model_retransmit_set = std::collections::HashSet::new();
         let mut model_oldest_unacked = initial_seq & MASK;
+        // The newest real cumulative ACK; `[model_peer_ack,
+        // model_oldest_unacked)` are drops retired without one.
+        let mut model_peer_ack = initial_seq & MASK;
+        // Tombstones whose DROPREQ went out.
+        let mut model_notified = HashSet::new();
+        let less = |a: u32, b: u32| {
+            let distance = b.wrapping_sub(a) & MASK;
+            distance > 0 && distance < 0x4000_0000
+        };
+        let room = |retained: usize, flight: usize, to_end: u32| {
+            retained < window_size as usize
+                && flight < window_size as usize
+                && to_end > 0
+                && to_end < 0x4000_0000
+        };
         let mut model_next_seq = initial_seq & MASK;
         // The peer's advertised window end, moved only by the valid-ACK op
         // (which models a Full ACK carrying the same window back).
@@ -462,7 +484,7 @@ proptest! {
 
         let mut current_time_us = 1_000u64;
 
-        for op in operations {
+        for (step, op) in operations.into_iter().enumerate() {
             current_time_us += 1_000;
             let now = Timestamp::from_micros(current_time_us);
             let may_queue = move |seq: u32,
@@ -482,11 +504,7 @@ proptest! {
                         let flight = model_packets.len();
                         let to_end =
                             model_window_end.wrapping_sub(model_next_seq) & MASK;
-                        let room = retained < window_size as usize
-                            && flight < window_size as usize
-                            && to_end > 0
-                            && to_end < 0x4000_0000;
-                        if !room {
+                        if !room(retained, flight, to_end) {
                             break;
                         }
                         let seq = model_next_seq;
@@ -519,9 +537,11 @@ proptest! {
                             // A tombstone is retired by the same cumulative
                             // ACK that retires a live packet.
                             model_dropped.remove(&cur);
+                            model_notified.remove(&cur);
                             cur = cur.wrapping_add(1) & MASK;
                         }
                         model_oldest_unacked = ack_seq;
+                        model_peer_ack = ack_seq;
                     }
                 }
                 2 => {
@@ -532,6 +552,14 @@ proptest! {
                         model_oldest_unacked | 0x8000_0000
                     };
                     buf.handle_ack(stale_ack);
+                    // An ACK into the retired drops narrows what a NAK may
+                    // name, and moves nothing else.
+                    if stale_ack & !MASK == 0
+                        && less(model_peer_ack, stale_ack)
+                        && !less(model_oldest_unacked, stale_ack)
+                    {
+                        model_peer_ack = stale_ack;
+                    }
                 }
                 3 => {
                     // Future / out-of-window ACK (strictly ahead of next_seq)
@@ -593,8 +621,19 @@ proptest! {
                     }
                 }
                 7 => {
-                    // TLPKTDROP (advance time past 1s threshold): the media
-                    // goes, the sequence identity stays until the ACK.
+                    // TLPKTDROP (advance time past 1s threshold). First the
+                    // dropped prefix whose DROPREQs are out retires and
+                    // returns its credit; then the media of every expired
+                    // message goes, its sequence identity staying.
+                    let mut retired = 0u32;
+                    while model_oldest_unacked != model_next_seq
+                        && model_notified.remove(&model_oldest_unacked)
+                    {
+                        model_dropped.remove(&model_oldest_unacked);
+                        model_oldest_unacked = model_oldest_unacked.wrapping_add(1) & MASK;
+                        retired += 1;
+                    }
+                    model_window_end = model_window_end.wrapping_add(retired) & MASK;
                     let drop_time = Timestamp::from_micros(current_time_us + 2_000_000);
                     let dropped = buf.drop_expired(drop_time);
                     for msg in dropped {
@@ -624,7 +663,38 @@ proptest! {
                 _ => unreachable!(),
             }
 
+            if notify_after[step] {
+                for &seq in &model_dropped {
+                    if model_notified.insert(seq) {
+                        buf.note_dropreq_submitted(seq, seq);
+                    }
+                }
+            }
+            // A NAK into the retired drops (at most a window of them, the
+            // most a report may name) is answered with one DROPREQ for the
+            // range, and queues nothing.
+            if model_peer_ack != model_oldest_unacked {
+                let retired_span = model_oldest_unacked.wrapping_sub(model_peer_ack) & MASK;
+                let first_seq = model_oldest_unacked.wrapping_sub(retired_span.min(window_size)) & MASK;
+                let last_seq = model_oldest_unacked.wrapping_sub(1) & MASK;
+                let queued_before = buf.stats().packets_in_loss_list;
+                prop_assert_eq!(
+                    buf.handle_nak_ranges(&[LossRange { first_seq, last_seq }], now),
+                    Ok(vec![DroppedMessage { message_number: 0, first_seq, last_seq }])
+                );
+                prop_assert_eq!(buf.stats().packets_in_loss_list, queued_before);
+            }
+
             // Assert invariants after each operation
+            prop_assert_eq!(buf.oldest_unacked_sequence(), model_oldest_unacked);
+            prop_assert_eq!(
+                buf.can_send(),
+                room(
+                    model_packets.len() + model_dropped.len(),
+                    model_packets.len(),
+                    model_window_end.wrapping_sub(model_next_seq) & MASK,
+                )
+            );
             prop_assert_eq!(buf.packets_in_flight() as usize, model_packets.len());
             prop_assert_eq!(
                 buf.retained_span() as usize,

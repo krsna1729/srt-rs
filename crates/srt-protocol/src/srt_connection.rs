@@ -2541,6 +2541,8 @@ impl SrtConnection {
                 }
             }
         }
+        // Retiring notified drops may leave acknowledged pages to release.
+        self.continue_acked_release_later();
     }
 
     fn handle_nak_timer(&mut self, now: Timestamp) {
@@ -7885,6 +7887,105 @@ mod tests {
             waiting(&caller, is_control(ControlType::DropReq)),
             MAX_DROPREQ_PER_NAK
         );
+    }
+
+    /// TLPKTDROP gives up a flight the peer never acknowledges (S6). Once
+    /// its DROPREQs are out, the next tick retires it as libsrt's
+    /// `sndDropTooLate` fake ACK does (core.cpp:6806-6870), so a peer that
+    /// stops acknowledging after drops cannot wedge the sender. A later NAK
+    /// into the retired drops is answered with a DROPREQ for the range.
+    #[test]
+    fn drops_the_peer_never_acknowledges_free_the_window() {
+        const WINDOW: u32 = 32;
+        let (mut caller, _listener) = connected_pair_with_window(WINDOW);
+        let first = caller.next_sequence_number().expect("connected sender");
+        for _ in 0..WINDOW {
+            caller
+                .send(b"payload", Timestamp::from_micros(0))
+                .expect("the window is open");
+        }
+        drain_outputs(&mut caller);
+        assert!(!caller.can_send(), "the flight fills the window");
+
+        caller
+            .handle_timer(TimerId::Ack, Timestamp::from_micros(2_000_000))
+            .expect("ACK tick");
+        assert_eq!(drain_drop_requests(&mut caller).len(), WINDOW as usize);
+        caller
+            .handle_timer(TimerId::Ack, Timestamp::from_micros(2_010_000))
+            .expect("ACK tick");
+        drain_outputs(&mut caller);
+        assert!(
+            caller.can_send(),
+            "the dropped flight no longer holds the window"
+        );
+        for _ in 0..WINDOW {
+            caller
+                .send(b"payload", Timestamp::from_micros(2_010_000))
+                .expect("the window is open");
+        }
+        drain_outputs(&mut caller);
+
+        let last = first.wrapping_add(WINDOW - 1) & SEQUENCE_MASK;
+        caller
+            .feed_recv_buf(
+                &nak_datagram(caller.socket_id(), &[first, last]),
+                Timestamp::from_micros(2_020_000),
+            )
+            .expect("a NAK into retired drops is accepted");
+        assert_eq!(drain_drop_requests(&mut caller), [(first, last)]);
+    }
+
+    /// Retiring a large dropped flight without a peer ACK (S6) leaves
+    /// dropping its pages to the retransmit continuation, as a large ACK
+    /// does.
+    #[test]
+    fn retiring_a_large_dropped_flight_leaves_dropping_pages_to_the_continuation() {
+        const SENT: u32 = 2_048;
+        let (mut caller, _listener) = connected_pair();
+        for _ in 0..SENT {
+            caller
+                .send(&[0u8; 1_000], Timestamp::from_micros(0))
+                .expect("send admits the payload");
+        }
+        drain_outputs(&mut caller);
+        caller
+            .handle_timer(TimerId::Ack, Timestamp::from_micros(2_000_000))
+            .expect("ACK tick");
+        assert_eq!(drain_drop_requests(&mut caller).len(), SENT as usize);
+
+        let now = Timestamp::from_micros(2_010_000);
+        caller.handle_timer(TimerId::Ack, now).expect("ACK tick");
+        let sender = caller.sender.as_ref().expect("connected sender");
+        assert_eq!(sender.retained_span(), 0, "the dropped flight retired");
+        assert!(sender.has_acked_packets_to_release());
+        let arms_continuation = |outputs: &[ConnectionOutput]| {
+            outputs.iter().any(|output| {
+                matches!(
+                    output,
+                    ConnectionOutput::SetTimer {
+                        id: TimerId::RetransmitContinue,
+                        ..
+                    }
+                )
+            })
+        };
+        assert!(arms_continuation(&drain_outputs(&mut caller)));
+        for _ in 0..64 {
+            caller
+                .handle_timer(TimerId::RetransmitContinue, now)
+                .expect("continuation");
+            drain_outputs(&mut caller);
+            if !caller
+                .sender
+                .as_ref()
+                .expect("connected sender")
+                .has_acked_packets_to_release()
+            {
+                return;
+            }
+        }
+        panic!("the continuation must drain the retired pages");
     }
 
     /// A NAK repeated before the sender's own RTT estimate has elapsed since

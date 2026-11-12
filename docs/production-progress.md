@@ -907,3 +907,15 @@ Each item below was reproduced by a regression test that failed on
   messages, or 200 NAKs at 10 µs disconnected the connection. Each answer
   now waits at most once (DROPREQ answers: one report's worth); a later
   request is answered once the waiting one has gone out.
+- TLPKTDROP never freed window credit (S6). A dropped message kept its
+  window storage and flow credit until the peer's cumulative ACK, so a peer
+  that stopped acknowledging after drops wedged the sender: a dropped
+  32-packet flight held a 32-packet window shut for good. Once a dropped
+  prefix's DROPREQs are out, the next expiry pass retires it and moves the
+  credit on by the positions retired, as libsrt's `sndDropTooLate` fake ACK
+  does (core.cpp:6806-6870). The newest real peer ACK is kept separately; a
+  NAK into the retired drops is answered with one DROPREQ for that part of
+  each range, message number 0, as libsrt answers a NAK below its fake ACK
+  (core.cpp:9150-9200), within the same per-report DROPREQ cap. An ACK below
+  the retired drops moves nothing (it is not current) but narrows what a
+  NAK may name.
