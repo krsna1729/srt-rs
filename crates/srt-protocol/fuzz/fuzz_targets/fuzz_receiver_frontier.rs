@@ -111,11 +111,13 @@ fuzz_target!(|data: &[u8]| {
                 assert!(ack.available_buffer <= 8_192);
                 assert!(ack.link_capacity <= 1_000_000);
             }
-            _ => receiver.handle_ackack(
-                u32::from_le_bytes([action[1], action[2], action[3], action[4]]),
-                now_us as u32,
-                now,
-            ),
+            _ => {
+                receiver.handle_ackack(
+                    u32::from_le_bytes([action[1], action[2], action[3], action[4]]),
+                    now_us as u32,
+                    now,
+                );
+            }
         }
     }
 });

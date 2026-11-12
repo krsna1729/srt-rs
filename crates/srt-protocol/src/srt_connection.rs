@@ -4763,7 +4763,11 @@ impl SrtConnection {
         }
 
         // RTT を更新 (ACK 送信時刻はReceiverBuffer内で管理)
-        receiver.handle_ackack(ack_number, pkt.timestamp, now);
+        if !receiver.handle_ackack(ack_number, pkt.timestamp, now) {
+            return Err(Error::invalid_data(format!(
+                "ACKACK names ACK number {ack_number}, which is already acknowledged or retired"
+            )));
+        }
 
         Ok(())
     }
@@ -6390,6 +6394,45 @@ mod tests {
         );
     }
 
+    /// A replayed ACKACK is not a protocol transition: it finds its ACK
+    /// already acknowledged, takes no RTT sample and is refused, so it is
+    /// not banked as peer activity either.
+    #[test]
+    fn a_replayed_ackack_is_refused_without_an_rtt_sample() {
+        let (mut caller, mut listener) = connected_pair();
+        let start = Timestamp::from_micros(1_000_000);
+        caller.send(b"once", start).unwrap();
+        listener
+            .feed_recv_buf(&next_wire(&mut caller), start)
+            .unwrap();
+        drain_outputs(&mut listener);
+        let ack_time = start.add_micros(20_000);
+        listener.handle_timer(TimerId::Ack, ack_time).unwrap();
+        let (ack, _) = take_control(&mut listener, ControlType::Ack).expect("a Full ACK");
+        caller
+            .feed_recv_buf(&ack, ack_time.add_micros(5_000))
+            .expect("ACK accepted");
+        let (ackack, _) = take_control(&mut caller, ControlType::AckAck).expect("an ACKACK");
+        listener
+            .feed_recv_buf(&ackack, ack_time.add_micros(10_000))
+            .expect("the first copy matches");
+        let rtt = listener.receiver.as_ref().unwrap().rtt();
+
+        let accepted = (1..=3)
+            .filter(|copy| {
+                listener
+                    .feed_recv_buf(&ackack, ack_time.add_micros(10_000 + copy * 1_000_000))
+                    .is_ok()
+            })
+            .count();
+        assert_eq!(
+            listener.receiver.as_ref().unwrap().rtt(),
+            rtt,
+            "no RTT sample"
+        );
+        assert_eq!(accepted, 0, "every copy is refused");
+    }
+
     /// The message-number wrap reaches the wire as `0x03ff_ffff, 1`: libsrt's
     /// `MsgNo` rolls from 1 (`packet.h:184`) and zero is the packet-filter
     /// control identity. Checked end to end by the strict wire checker.
@@ -7258,6 +7301,7 @@ mod tests {
                 first_transmission_seqs,
                 retransmitted_data,
                 tx_blocked,
+                ack_storm,
                 ..
             } = self;
             loop {
@@ -7287,9 +7331,22 @@ mod tests {
                         }
                     }
                 }
-                listener
-                    .feed_recv_buf(&bytes, *now)
-                    .expect("listener accepts packet");
+                // The ACK storm replays a Full ACK the caller has already
+                // ACKACKed, and the listener refuses the repeated ACKACK;
+                // every other packet must be accepted.
+                if let Err(error) = listener.feed_recv_buf(&bytes, *now) {
+                    assert!(
+                        *ack_storm
+                            && matches!(
+                                SrtPacket::decode(&bytes),
+                                Ok(SrtPacket::Control(ControlPacket {
+                                    control_type: ControlType::AckAck,
+                                    ..
+                                }))
+                            ),
+                        "listener accepts packet: {error}"
+                    );
+                }
             }
         }
 

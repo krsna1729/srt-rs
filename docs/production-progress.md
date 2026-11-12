@@ -947,3 +947,13 @@ Each item below was reproduced by a regression test that failed on
   packet is held (a latency of up to 65 s allows that) or a loss is
   unresolved, where libsrt's unconditional close would hold that packet
   ~71.6 minutes.
+- ACKACK replay (R4). An ACKACK looked its ACK up without consuming it,
+  and an unmatched one still fed the drift tracer. A peer (or an on-path
+  replayer) repeating one ACKACK re-sampled RTT with a round trip growing
+  with every copy and fed the TSBPD drift tracer one sample per copy: a
+  thousand copies moved the base by the tracer's overdrift. libsrt's ACK
+  window consumes the matched record and every older one, and an
+  unmatched ACKACK changes nothing (`window.cpp:82-140`,
+  `core.cpp:8994-9027`). srt-rs now does the same in O(1) (a consumed-through
+  ACK number), and the connection refuses an unmatched ACKACK, so replays
+  are not peer activity.

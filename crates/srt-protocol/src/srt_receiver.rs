@@ -559,9 +559,18 @@ const WRAPPING_CARRYOVER_BELOW: u64 = MAX_TIMESTAMP.div_ceil(2);
 /// ACK number, so two generations of one slot never alias. An unused slot
 /// holds a number that does not map to it, so no lookup can match it and no
 /// separate validity bitmap is needed.
+///
+/// An ACKACK consumes the record it matches and every older one, as
+/// libsrt's ACK window moves its tail past the match (window.cpp:82-140):
+/// a replayed or reordered ACKACK finds nothing and takes no RTT or drift
+/// sample.
 #[derive(Debug)]
 struct AckTimestampTracker {
     entries: Option<Box<[AckTimestamp; MAX_ACK_TIMESTAMPS]>>,
+    /// The newest ACK number an ACKACK matched. Every record at most
+    /// `MAX_ACK_TIMESTAMPS - 1` behind it is consumed, and older ones have
+    /// been overwritten by the ACKs up to it.
+    consumed_through: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -573,7 +582,10 @@ struct AckTimestamp {
 
 impl AckTimestampTracker {
     fn new() -> Self {
-        Self { entries: None }
+        Self {
+            entries: None,
+            consumed_through: None,
+        }
     }
 
     fn slot(ack_number: u32) -> usize {
@@ -598,9 +610,23 @@ impl AckTimestampTracker {
         };
     }
 
+    /// The record of ACK `ack_number`, consumed or not.
     fn get(&self, ack_number: u32) -> Option<&AckTimestamp> {
         let entry = &self.entries.as_ref()?[Self::slot(ack_number)];
         (entry.ack_number == ack_number).then_some(entry)
+    }
+
+    /// Match an ACKACK: return its record unless it is already consumed,
+    /// and consume it with every older one.
+    fn acknowledge(&mut self, ack_number: u32) -> Option<AckTimestamp> {
+        if self.consumed_through.is_some_and(|consumed| {
+            (consumed.wrapping_sub(ack_number) & ACK_NUMBER_MASK) < MAX_ACK_TIMESTAMPS as u32
+        }) {
+            return None;
+        }
+        let entry = *self.get(ack_number)?;
+        self.consumed_through = Some(ack_number);
+        Some(entry)
     }
 
     /// Get an ACK's send time.
@@ -609,6 +635,7 @@ impl AckTimestampTracker {
     }
 
     /// Get the sequence position an ACK acknowledged.
+    #[cfg(test)]
     fn get_acked_seq(&self, ack_number: u32) -> Option<u32> {
         self.get(ack_number).map(|entry| entry.acked_seq)
     }
@@ -1904,23 +1931,30 @@ impl ReceiverBuffer {
         interval.max(crate::PERIODIC_NAK_INTERVAL_MICROS) // Minimum 20ms.
     }
 
-    /// Process an ACKACK and update RTT.
-    pub fn handle_ackack(&mut self, ack_number: u32, packet_timestamp: u32, now: Timestamp) {
-        // Look up the ACK's send time.
-        let rtt_sample = self
-            .ack_timestamps
-            .get_send_time(ack_number)
-            .and_then(|send_time| {
-                let rtt = (now.as_micros().saturating_sub(send_time.as_micros())) as u32;
-                (rtt != 0 && rtt <= 30_000_000).then_some(rtt)
-            });
+    /// Process an ACKACK: update RTT, ACK suppression and the TSBPD drift.
+    ///
+    /// Returns whether it matched an unconsumed ACK record. One that does
+    /// not (never sent, evicted, already acknowledged, or older than an
+    /// acknowledged one) changes nothing, as in libsrt
+    /// (`processCtrlAckAck`, core.cpp:8994-9027): a replayed ACKACK must not
+    /// re-sample RTT with an ever-growing round trip or feed the drift
+    /// tracer a sample per copy.
+    pub fn handle_ackack(
+        &mut self,
+        ack_number: u32,
+        packet_timestamp: u32,
+        now: Timestamp,
+    ) -> bool {
+        let Some(record) = self.ack_timestamps.acknowledge(ack_number) else {
+            return false;
+        };
+        let rtt = (now.as_micros().saturating_sub(record.send_time.as_micros())) as u32;
+        let rtt_sample = (rtt != 0 && rtt <= 30_000_000).then_some(rtt);
 
         // The peer confirmed this ACK position; remember it so
         // should_send_ack can suppress redundant periodic ACKs (§4.8.1).
-        if let Some(acked_seq) = self.ack_timestamps.get_acked_seq(ack_number) {
-            self.last_ackacked_number = Some(ack_number);
-            self.last_ackacked_seq = Some(acked_seq);
-        }
+        self.last_ackacked_number = Some(ack_number);
+        self.last_ackacked_seq = Some(record.acked_seq);
 
         if let Some(rtt) = rtt_sample {
             // Smooth with EWMA: RTT = 7/8 * RTT + 1/8 * rtt
@@ -1931,10 +1965,14 @@ impl ReceiverBuffer {
             self.rtt_var = (self.rtt_var * 3 / 4) + (diff / 4);
         }
 
-        if !self.tsbpd_enabled {
-            return;
+        if self.tsbpd_enabled {
+            self.sample_drift(rtt_sample, packet_timestamp, now);
         }
+        true
+    }
 
+    /// Feed one matched ACKACK to the TSBPD drift tracer.
+    fn sample_drift(&mut self, rtt_sample: Option<u32>, packet_timestamp: u32, now: Timestamp) {
         if self.first_rtt_sample.is_none() {
             self.first_rtt_sample = rtt_sample;
         }
@@ -3446,7 +3484,10 @@ mod tests {
     ) {
         let before = receiver.rtt();
         assert!(receiver.ack_number_was_sent(ack_number));
-        receiver.handle_ackack(ack_number, 0, now);
+        assert!(
+            receiver.handle_ackack(ack_number, 0, now),
+            "ACKACK #{ack_number} matches"
+        );
         assert_eq!(
             receiver.rtt(),
             smoothed_rtt(before, sample_us),
@@ -3455,13 +3496,17 @@ mod tests {
         assert_eq!(receiver.last_ackacked_number, Some(ack_number));
     }
 
-    /// Deliver an ACKACK for a sent ACK that has left the history: it is
-    /// still valid input, but yields no RTT sample and no suppression update.
+    /// Deliver an ACKACK for a sent ACK that has left the history or was
+    /// already acknowledged: it matches nothing and yields no RTT sample
+    /// and no suppression update.
     fn assert_ackack_evicted(receiver: &mut ReceiverBuffer, ack_number: u32, now: Timestamp) {
         let (rtt, rtt_var) = (receiver.rtt(), receiver.rtt_var());
         let suppression = (receiver.last_ackacked_number, receiver.last_ackacked_seq);
         assert!(receiver.ack_number_was_sent(ack_number));
-        receiver.handle_ackack(ack_number, 0, now);
+        assert!(
+            !receiver.handle_ackack(ack_number, 0, now),
+            "ACKACK #{ack_number} matches nothing"
+        );
         assert_eq!((receiver.rtt(), receiver.rtt_var()), (rtt, rtt_var));
         assert_eq!(
             (receiver.last_ackacked_number, receiver.last_ackacked_seq),
@@ -3480,6 +3525,48 @@ mod tests {
         assert_eq!(receiver.ack_number(), 25);
 
         assert_ackack_samples(&mut receiver, 1, Timestamp::from_micros(260_000), 250_000);
+    }
+
+    /// A replayed ACKACK finds its record consumed, like libsrt's ACK window
+    /// (window.cpp:82-140, core.cpp:9001-9027): it neither re-samples RTT
+    /// with a round trip that grows with every copy nor feeds the drift
+    /// tracer, so a thousand copies cannot move the TSBPD base.
+    #[test]
+    fn replayed_ackack_takes_no_second_rtt_or_drift_sample() {
+        let at = Timestamp::from_micros;
+        let mut buf = ReceiverBuffer::new(1000, 120, at(0), 100_000);
+        assert!(!buf.generate_full_ack(at(10_000)).is_light);
+        let ack_number = buf.ack_number();
+        assert!(buf.handle_ackack(ack_number, 0, at(20_000)));
+        let state = |buf: &ReceiverBuffer| {
+            (
+                buf.rtt(),
+                buf.rtt_var(),
+                buf.drift_tracer.drift_us(),
+                buf.tsbpd_time_base,
+                buf.last_ackacked_number,
+            )
+        };
+        let after_first = state(&buf);
+
+        let matched = (1..=TSBPD_DRIFT_MAX_SAMPLES as u64)
+            .filter(|copy| buf.handle_ackack(ack_number, 0, at(20_000 + copy * 1_000_000)))
+            .count();
+        assert_eq!(state(&buf), after_first);
+        assert_eq!(matched, 0);
+    }
+
+    /// Matching an ACKACK consumes every older record too, as libsrt moves
+    /// its window tail past the match: a reordered older ACKACK arriving
+    /// after a newer one takes no sample, and a later one still does.
+    #[test]
+    fn ackack_consumes_every_older_ack_record() {
+        let mut receiver = ackack_receiver();
+        let last = send_full_acks(&mut receiver, 10_000, 10_000, 3);
+        let now = last.add_micros(1_000);
+        assert_ackack_samples(&mut receiver, 2, now, 11_000);
+        assert_ackack_evicted(&mut receiver, 1, now);
+        assert_ackack_samples(&mut receiver, 3, now, 1_000);
     }
 
     /// The history horizon is a count of Full ACKs, not wall time: the
@@ -3996,10 +4083,23 @@ mod tests {
         let mut buf = ReceiverBuffer::new(1000, 0, Timestamp::from_micros(0), 100_000);
         buf.receive(make_packet(1000, 10), Timestamp::from_micros(0));
 
-        // libsrt averages 1,000 ACKACK samples. A 7ms average drift carries
-        // 5ms into the base and leaves a 2ms delivery offset.
-        for _ in 0..TSBPD_DRIFT_MAX_SAMPLES {
-            buf.handle_ackack(0, 0, Timestamp::from_micros(107_000));
+        // libsrt averages 1,000 ACKACK samples, one per acknowledged Full
+        // ACK. A 7ms average drift carries 5ms into the base and leaves a
+        // 2ms delivery offset. Each ACK is acknowledged 1 ms after it was
+        // sent, so no sample carries an RTT change.
+        for index in 0..TSBPD_DRIFT_MAX_SAMPLES as u64 {
+            let ack_at = 200_000 + index * 10_000;
+            assert!(
+                !buf.generate_full_ack(Timestamp::from_micros(ack_at))
+                    .is_light
+            );
+            let ackack_at = ack_at + 1_000;
+            let peer_timestamp = (ackack_at - 100_000 - 7_000) as u32;
+            assert!(buf.handle_ackack(
+                buf.ack_number(),
+                peer_timestamp,
+                Timestamp::from_micros(ackack_at)
+            ));
         }
 
         assert_eq!(buf.tsbpd_time_base, 105_000);
