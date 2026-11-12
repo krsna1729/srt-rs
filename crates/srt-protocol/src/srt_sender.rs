@@ -38,6 +38,11 @@ pub(crate) const MAX_STALE_RETRANSMITS_SKIPPED_PER_POP: usize = 64;
 /// `SenderBuffer::record_retransmit_send_time`): one connection visit's
 /// worth of retransmissions (`MAX_RETRANSMITS_PER_VISIT`).
 const RETRANSMIT_PACING_BURST: u64 = 32;
+/// Shortest hold-back for a loss report naming a recent retransmission (see
+/// `SenderBuffer::retransmit_suppression_micros`): libsrt's minimum NAK
+/// period (`LiveCC` `m_iMinNakInterval_us`, congctl.cpp:87), which a peer's
+/// RTT reports cannot lower.
+const MIN_RETRANSMIT_SUPPRESSION_MICROS: u64 = 20_000;
 
 /// Largest DATA message number (26 bits).
 const MESSAGE_NUMBER_MAX: u32 = 0x03FF_FFFF;
@@ -476,13 +481,18 @@ pub struct SenderBuffer {
     /// half of this crate already smooths its own raw ACKACK round-trip
     /// samples (`SrtReceiver::handle_ackack`). Distinct from
     /// `PeerFeedback::rtt_micros`, which is the peer's raw, unsmoothed-by-us
-    /// report. Initialized to [`INITIAL_SRTT_MICROS`], the same starting
-    /// value used before any compatible ACK feedback arrives.
+    /// report. Initialized to [`INITIAL_SRTT_MICROS`] and replaced by the
+    /// peer's first real report (see `rtt_sampled`).
     sender_rtt_micros: u32,
     /// This sender's own smoothed RTT variance estimate, in microseconds,
     /// updated alongside `sender_rtt_micros`. Initialized to
     /// [`INITIAL_RTT_VAR_MICROS`].
     sender_rtt_var_micros: u32,
+    /// Whether a peer report other than the initial 100/50 ms values has
+    /// arrived. The first one replaces the estimate instead of being
+    /// smoothed into it, as libsrt's `processCtrlAck` resets SRTT/RTTVar to
+    /// the first such report (core.cpp:8926-8936).
+    rtt_sampled: bool,
     /// The newest sequence number whose first datagram has actually been
     /// submitted to the transport, if any.
     ///
@@ -637,6 +647,7 @@ impl SenderBuffer {
             peer_feedback: None,
             sender_rtt_micros: INITIAL_SRTT_MICROS,
             sender_rtt_var_micros: INITIAL_RTT_VAR_MICROS,
+            rtt_sampled: false,
             newest_submitted: None,
             rto: SenderRto::new(),
             dropreq_cursor: 0,
@@ -1651,7 +1662,7 @@ impl SenderBuffer {
 
     /// How long after a packet's retransmission a peer loss report naming it
     /// is held back instead of queuing it again: this sender's own smoothed
-    /// RTT estimate.
+    /// RTT estimate, but at least `MIN_RETRANSMIT_SUPPRESSION_MICROS`.
     ///
     /// A report arriving within one RTT of the retransmission left the peer
     /// before the retransmission could have reached it, so it carries no
@@ -1665,8 +1676,15 @@ impl SenderBuffer {
     /// own rule (`CUDT::checkRexmitRightTime`, core.cpp:9827-9862) holds back
     /// for `RTT - 4*RTTVar`, which is nothing once the variance reaches a
     /// quarter of the RTT.
+    ///
+    /// The RTT estimate comes from the peer's ACKs, so the floor keeps a peer
+    /// reporting a tiny RTT from collapsing the interval: at most one repeat
+    /// per 20 ms re-sends what a report names, and pacing at the configured
+    /// bandwidth bounds the rest. A conforming receiver's periodic reports
+    /// are at least 20 ms apart anyway, so the floor holds back at most one
+    /// of them: the next arrives within `20 ms + P` of the retransmission.
     pub fn retransmit_suppression_micros(&self) -> u64 {
-        u64::from(self.sender_rtt_micros)
+        u64::from(self.sender_rtt_micros).max(MIN_RETRANSMIT_SUPPRESSION_MICROS)
     }
 
     /// Process an ACK and release the buffer.
@@ -2255,9 +2273,13 @@ impl SenderBuffer {
     /// sample rather than substituted wholesale -- otherwise every such ACK
     /// would simply replace the sender's RTO input with whatever the peer
     /// last measured, which is exactly the smoothing the draft specifies
-    /// against. `peer_feedback` keeps the raw, unsmoothed-by-us report for
-    /// telemetry; `sender_rtt_micros`/`sender_rtt_var_micros` is what the RTO
-    /// actually consumes.
+    /// against. The exception is the first real report: it replaces the
+    /// initial 100/50 ms values, as libsrt's `processCtrlAck` does
+    /// (core.cpp:8926-8936), instead of taking seconds of ACKs to converge
+    /// from them; reports carrying the receiver's own initial values before
+    /// that change nothing. `peer_feedback` keeps the raw, unsmoothed-by-us
+    /// report for telemetry; `sender_rtt_micros`/`sender_rtt_var_micros` is
+    /// what the RTO and the repeat hold-back consume.
     ///
     /// `rate_feedback` is `None` when this particular ACK carried no rate
     /// section at all (a 16-byte Small ACK): the previous rate snapshot, if
@@ -2282,27 +2304,35 @@ impl SenderBuffer {
             available_buffer_packets,
             rate_feedback,
         });
-        if rtt_micros > 0 {
-            // Smooth with EWMA: RTT = 7/8 * RTT + 1/8 * sample -- the same
-            // estimator `SrtReceiver::handle_ackack` uses for its own raw
-            // samples. `rtt_micros` is an untrusted peer's raw `u32` ACK
-            // field (any value is wire-legal), and multiplying an already
-            // large smoothed estimate by 7 in `u32` can overflow -- a debug
-            // panic, or a silent wraparound in release that corrupts the RTO
-            // estimator with an artificially tiny value. Both terms are
-            // widened to `u64` before combining; the combined average of two
-            // `u32` values is always itself `<= u32::MAX`, so narrowing back
-            // is exact, never truncating.
-            let new_rtt = (7 * u64::from(self.sender_rtt_micros) + u64::from(rtt_micros)) / 8;
-            self.sender_rtt_micros =
-                u32::try_from(new_rtt).expect("EWMA average of two u32 values fits in u32");
-            // RTTVar = 3/4 * RTTVar + 1/4 * |RTT - sample|, same widening
-            // reasoning (`diff` is itself already bounded by `u32::MAX`).
-            let diff = self.sender_rtt_micros.abs_diff(rtt_micros);
-            let new_var = (3 * u64::from(self.sender_rtt_var_micros) + u64::from(diff)) / 4;
-            self.sender_rtt_var_micros =
-                u32::try_from(new_var).expect("EWMA average of two u32 values fits in u32");
+        if rtt_micros == 0 {
+            return;
         }
+        if !self.rtt_sampled {
+            if rtt_micros != INITIAL_SRTT_MICROS && rtt_variance_micros != INITIAL_RTT_VAR_MICROS {
+                self.sender_rtt_micros = rtt_micros;
+                self.sender_rtt_var_micros = rtt_variance_micros;
+                self.rtt_sampled = true;
+            }
+            return;
+        }
+        // Smooth with EWMA: RTT = 7/8 * RTT + 1/8 * sample -- the same
+        // estimator `SrtReceiver::handle_ackack` uses for its own raw
+        // samples. `rtt_micros` is an untrusted peer's raw `u32` ACK field
+        // (any value is wire-legal), and multiplying an already large
+        // smoothed estimate by 7 in `u32` can overflow -- a debug panic, or a
+        // silent wraparound in release that corrupts the RTO estimator with
+        // an artificially tiny value. Both terms are widened to `u64` before
+        // combining; the combined average of two `u32` values is always
+        // itself `<= u32::MAX`, so narrowing back is exact, never truncating.
+        let new_rtt = (7 * u64::from(self.sender_rtt_micros) + u64::from(rtt_micros)) / 8;
+        self.sender_rtt_micros =
+            u32::try_from(new_rtt).expect("EWMA average of two u32 values fits in u32");
+        // RTTVar = 3/4 * RTTVar + 1/4 * |RTT - sample|, same widening
+        // reasoning (`diff` is itself already bounded by `u32::MAX`).
+        let diff = self.sender_rtt_micros.abs_diff(rtt_micros);
+        let new_var = (3 * u64::from(self.sender_rtt_var_micros) + u64::from(diff)) / 4;
+        self.sender_rtt_var_micros =
+            u32::try_from(new_var).expect("EWMA average of two u32 values fits in u32");
     }
 
     /// Drop expired messages (TLPKTDROP), replacing them with tombstones.
@@ -3533,8 +3563,11 @@ mod tests {
         // whole-list pass -- 16 bytes, deliberate. A tenth added
         // `retransmit_due` (a `Timestamp`), the retransmissions' own pacing
         // schedule, so an unpaced burst of new data cannot hold a repair
-        // back -- 8 bytes, deliberate.
-        assert!(inline_bytes <= 472);
+        // back -- 8 bytes, deliberate. An eleventh added `rtt_sampled` (a
+        // `bool`, 8 bytes with alignment), so the peer's first real RTT
+        // report replaces the initial estimate as libsrt's does instead of
+        // being smoothed into it -- deliberate.
+        assert!(inline_bytes <= 480);
         assert_eq!(window.heap_bytes(), 8_320);
     }
 
@@ -5305,17 +5338,26 @@ mod tests {
         assert_eq!(stats.peer_link_capacity_bytes_per_second, Some(3_000_000));
     }
 
-    /// SRT draft §4.10: the RTO's RTT input is this sender's own smoothed
-    /// estimate, with the peer's report folded in as one sample -- never a
-    /// direct replacement. `stats().peer_rtt_micros` (telemetry) reflects the
-    /// raw report immediately; `rto_base_timeout_micros()` must not.
+    /// The RTO's RTT input is this sender's own estimate. The peer's first
+    /// real report replaces the initial 100/50 ms values, as libsrt's
+    /// `processCtrlAck` resets SRTT/RTTVar to it (core.cpp:8926-8936); a
+    /// report still carrying the receiver's initial values changes nothing.
+    /// Every later report is folded in as one sample (SRT draft §4.10), never
+    /// a direct replacement. `stats().peer_rtt_micros` (telemetry) reflects
+    /// the raw report immediately.
     #[test]
-    fn sender_rtt_is_smoothed_not_replaced_by_raw_peer_feedback() {
+    fn sender_rtt_starts_at_the_first_real_report_then_is_smoothed() {
         let mut buf = SenderBuffer::new(0, 64, 120);
         assert_eq!(
             buf.rto_base_timeout_micros(),
             SenderRto::base_timeout_micros(None),
             "before any compatible ACK feedback, the RTO base uses the same initial constants"
+        );
+        buf.record_peer_feedback(100_000, 50_000, 60, full_rate_feedback());
+        assert_eq!(
+            buf.rtt_estimate_micros(),
+            (INITIAL_SRTT_MICROS, INITIAL_RTT_VAR_MICROS),
+            "the receiver's initial values are no sample"
         );
 
         buf.record_peer_feedback(20_000, 1_000, 60, full_rate_feedback());
@@ -5324,24 +5366,21 @@ mod tests {
             Some(20_000),
             "telemetry keeps the raw, unsmoothed report"
         );
-        // One report must not overwrite the sender's own estimate outright:
-        // a sudden change moves the variance term first (correctly, per
-        // Jacobson's algorithm, that alone can widen the timeout before it
-        // narrows), so the only property checked here is that it is not the
-        // same value a direct substitution would produce.
-        let after_one = buf.rto_base_timeout_micros();
-        assert_ne!(
-            after_one,
-            SenderRto::base_timeout_micros(Some((20_000, 1_000))),
-            "one report must not overwrite the sender's own estimate outright"
+        assert_eq!(
+            buf.rtt_estimate_micros(),
+            (20_000, 1_000),
+            "the first real report replaces the initial estimate"
         );
+
+        // A later report is one sample: RTT = 7/8 RTT + 1/8 sample.
+        buf.record_peer_feedback(40_000, 1_000, 60, full_rate_feedback());
+        assert_eq!(buf.rtt_estimate_micros().0, 22_500);
 
         // Repeated identical RTT reports converge the sender's own RTT
         // estimate toward what the peer keeps reporting (20 ms), and its
         // variance estimate toward zero (the reported RTT never varies) --
-        // note the peer's reported `rtt_variance_micros` is deliberately not
-        // itself part of the input; the draft derives variance from the RTT
-        // residual, not by taking the peer's own variance figure directly.
+        // after the first report the peer's `rtt_variance_micros` is not part
+        // of the input; the draft derives variance from the RTT residual.
         // The base timeout should settle near `rtt + 2*SYN = 40 ms`.
         for _ in 0..50 {
             buf.record_peer_feedback(20_000, 1_000, 60, full_rate_feedback());

@@ -8009,24 +8009,22 @@ mod tests {
     }
 
     /// A NAK naming a packet whose retransmission still waits for TX
-    /// capacity queues it no second time, however small an RTT the peer
-    /// reports: the waiting copy answers it. libsrt has no such state (it
-    /// sends a retransmission the moment it takes it off the loss list).
-    /// Once the copy has gone out, a later report re-sends.
+    /// capacity queues it no second time, however long it waits: the
+    /// waiting copy answers it, also once the repeat hold-back has passed.
+    /// libsrt has no such state (it sends a retransmission the moment it
+    /// takes it off the loss list). Once the copy has gone out, a later
+    /// report past the hold-back re-sends.
     #[test]
     fn a_nak_storm_while_tx_is_blocked_queues_each_retransmission_once() {
         let (mut caller, first, last) = sent_unacknowledged(64, 100);
         let id = caller.socket_id();
-        // An RTT report of 1 us, repeated until the sender's estimate is
-        // down to it, collapses the repeat interval.
-        for number in 1..=200 {
-            caller
-                .feed_recv_buf(
-                    &ack_datagram_with_feedback(id, first, number, &[1, 1, 64, 0, 0, 0]),
-                    Timestamp::from_micros(10_000),
-                )
-                .expect("a duplicate ACK is accepted");
-        }
+        // An RTT report of 1 us puts the hold-back at its 20 ms floor.
+        caller
+            .feed_recv_buf(
+                &ack_datagram_with_feedback(id, first, 1, &[1, 1, 64, 0, 0, 0]),
+                Timestamp::from_micros(10_000),
+            )
+            .expect("a current ACK is accepted");
         drain_outputs(&mut caller);
         let srtt = caller
             .sender
@@ -8034,12 +8032,14 @@ mod tests {
             .expect("sender")
             .rtt_estimate_micros()
             .0;
-        assert!(srtt <= 1, "estimate {srtt} us");
+        assert_eq!(srtt, 1);
 
+        // Reports every millisecond for 200 ms (ten hold-back intervals), TX
+        // blocked.
         let nak = nak_datagram(id, &[first, last]);
         let mut at = 20_000;
         for _ in 0..200 {
-            at += 10;
+            at += 1_000;
             caller
                 .feed_recv_buf(&nak, Timestamp::from_micros(at))
                 .expect("a credible NAK is accepted");
@@ -8320,6 +8320,100 @@ mod tests {
         assert_eq!(early.len() + rest.len(), 64);
         assert_eq!(resent_by(&mut caller, &mut at), rest);
         assert_eq!(caller.sender_stats().expect("sender").total_lost, 128);
+    }
+
+    /// Feed `conn` a NAK at `at` and follow its retransmissions; returns
+    /// the sequences re-sent.
+    fn resent_after_nak(conn: &mut SrtConnection, nak: &[u8], at: u64) -> Vec<u32> {
+        conn.feed_recv_buf(nak, Timestamp::from_micros(at))
+            .expect("a credible NAK is accepted");
+        let mut at = at;
+        drain_retransmissions(conn, &mut at)
+            .into_iter()
+            .map(|(_, seq)| seq)
+            .collect()
+    }
+
+    /// The repeat hold-back is at least 20 ms, libsrt's minimum NAK period
+    /// (`LiveCC` `m_iMinNakInterval_us`, congctl.cpp:87), however small an
+    /// RTT the peer reports. An RTT report of 1 us collapsed it, so every
+    /// repeat of a NAK re-sent every named packet whose copy had gone out,
+    /// bounded only by the configured bandwidth.
+    #[test]
+    fn a_tiny_peer_rtt_does_not_collapse_the_repeat_hold_back() {
+        let (mut caller, first, last) = sent_unacknowledged(64, 100);
+        let id = caller.socket_id();
+        for number in 1..=200 {
+            caller
+                .feed_recv_buf(
+                    &ack_datagram_with_feedback(id, first, number, &[1, 1, 64, 0, 0, 0]),
+                    Timestamp::from_micros(10_000),
+                )
+                .expect("a duplicate ACK is accepted");
+        }
+        drain_outputs(&mut caller);
+        let srtt = caller
+            .sender
+            .as_ref()
+            .expect("sender")
+            .rtt_estimate_micros()
+            .0;
+        assert!(srtt <= 1, "estimate {srtt} us");
+
+        let nak = nak_datagram(id, &[first, last]);
+        let mut at = 20_000;
+        caller
+            .feed_recv_buf(&nak, Timestamp::from_micros(at))
+            .expect("a credible NAK is accepted");
+        let burst = drain_retransmissions(&mut caller, &mut at);
+        assert_eq!(burst.len(), 64, "the first NAK repairs every loss");
+        let (first_copy, last_copy) = (burst[0].0, burst[63].0);
+        for repeat in [last_copy + 10, last_copy + 10_000, first_copy + 19_999] {
+            assert_eq!(
+                resent_after_nak(&mut caller, &nak, repeat),
+                Vec::<u32>::new(),
+                "a repeat {} us after the first copy re-sends nothing",
+                repeat - first_copy
+            );
+        }
+        assert_eq!(
+            resent_after_nak(&mut caller, &nak, last_copy + 20_000).len(),
+            64,
+            "20 ms after the last copy, every loss re-sends"
+        );
+    }
+
+    /// The sender's RTT estimate starts at the peer's first real report, as
+    /// libsrt's `processCtrlAck` resets SRTT/RTTVar to it
+    /// (core.cpp:8926-8936), instead of smoothing down from the initial
+    /// 100 ms. On a 1 ms path, a lost retransmission is then re-sent by the
+    /// peer's next report 25 ms later; smoothed from 100 ms, the estimate
+    /// after one report was 87.6 ms and held that report back, so a packet
+    /// lost twice missed a 120 ms latency.
+    #[test]
+    fn a_lost_retransmission_is_re_sent_once_rtt_feedback_exists() {
+        let (mut caller, first, _) = sent_unacknowledged(64, 100);
+        let id = caller.socket_id();
+        caller
+            .feed_recv_buf(
+                &ack_datagram_with_feedback(id, first, 1, &[1_000, 500, 64, 0, 0, 0]),
+                Timestamp::from_micros(10_000),
+            )
+            .expect("a current ACK is accepted");
+        drain_outputs(&mut caller);
+
+        let nak = nak_datagram(id, &[first, first]);
+        assert_eq!(resent_after_nak(&mut caller, &nak, 20_000), [first]);
+        assert_eq!(
+            resent_after_nak(&mut caller, &nak, 30_000),
+            Vec::<u32>::new(),
+            "a report within the 20 ms floor is held back"
+        );
+        assert_eq!(
+            resent_after_nak(&mut caller, &nak, 45_000),
+            [first],
+            "the report after the lost retransmission re-sends it"
+        );
     }
 
     /// Retransmissions are paced at the configured bandwidth, as libsrt's

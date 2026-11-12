@@ -909,6 +909,19 @@ Each item below was reproduced by a regression test that failed on
   schedule of their own (`retransmit_due`) and that NAK is answered at
   once. With paced new data the two schedules together allow up to twice
   the configured rate.
+- The repeat hold-back was the peer's to set, and slow to start (review of
+  the above). It was the sender's smoothed RTT, which the peer's ACKs
+  set: a peer reporting 1 µs collapsed it, so every repeat of a NAK re-sent
+  whatever it named and only pacing bounded the amplification (1 Gbit/s
+  per connection by default). The bound is now a hold-back of at least
+  20 ms, libsrt's minimum NAK period (`LiveCC`, congctl.cpp:87), plus the
+  configured bandwidth: at most one re-send of a position per 20 ms. And
+  the estimate was smoothed down from the initial 100 ms, so on a 1 ms
+  path one report left it at 87.6 ms and a lost retransmission's next NAK
+  25 ms later was held back. The first real report (not the receiver's
+  initial 100/50 ms) now replaces the estimate, as libsrt's
+  `processCtrlAck` does (core.cpp:8926-8936); later reports are smoothed as
+  before.
 - `total_lost` counted repeats (R6). It counts positions a report newly
   queues, so a held-back repeat adds nothing (3,392 before, 64 after), as
   libsrt counts newly inserted losses (core.cpp:9194, 9218).
