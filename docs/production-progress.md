@@ -859,3 +859,23 @@ mutation results and numbers in its commit message.
   retransmission), any other is dropped as invalid. A caller restarted on
   the same address and port is refused until the old session idles out, then
   lands on the listener socket.
+- Unbounded forwarded-CONCLUSION inbox (T4). A member counted the
+  CONCLUSIONs it forwarded against `LISTENER_FORWARD_CAPACITY` (256) only
+  until the application drained them (`poll_listener_transfers`), then
+  started again from zero, so the inbox of a member that consumed more
+  slowly than its peers forwarded grew without bound: one verified
+  CONCLUSION replayed 300 times left 300 transfers waiting. The cap is now a
+  credit per target member, shared by the layout (`owner_plans`): a forward
+  takes one of its target's 256 credits and returns it when that member
+  accepts the transfer or the application drops it; without a credit the
+  forward is dropped at its source (`listener_forwards_dropped`). Relocated
+  sessions and slot releases take no credit and stay lossless.
+  Applications (Restream's Owner inbox) must deliver or drop handshake
+  transfers: holding them stops forwards to that member.
+- Known, not fixed: srt-bench's hand-off path takes a connection out of the
+  table when it moves it to its own socket, so a verified CONCLUSION
+  retransmitted to the listener after that (the caller lost the answer) is
+  admitted as a new peer, which idles out; before the stateless INDUCTION
+  change it was dropped as a duplicate. Owner promotion keeps the session in
+  the table and answers the repeat (T2). Telling the repeat apart would need
+  per-departed-peer state in the bench harness.
