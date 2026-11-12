@@ -1,4 +1,4 @@
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use srt_proto::Timestamp;
 use srt_proto::receiver::ReceiverBuffer;
 use std::hint::black_box;
@@ -17,22 +17,25 @@ fn receiver_with_acks(count: u32) -> (ReceiverBuffer, u32) {
 }
 
 fn bench_receiver_ackack_lookup(c: &mut Criterion) {
-    let (mut retained_receiver, retained_ack) = receiver_with_acks(1);
     let (mut stale_receiver, stale_ack) = receiver_with_acks(17);
     let mut now = 1_000u64;
     let mut group = c.benchmark_group("receiver_ackack_lookup");
     group.sample_size(30);
 
+    // A matched ACKACK consumes its record, so each hit needs a fresh one.
     group.bench_function("retained_hit", |b| {
-        b.iter(|| {
-            now += 1;
-            retained_receiver.handle_ackack(
-                black_box(retained_ack),
-                0,
-                Timestamp::from_micros(now),
-            );
-            black_box(retained_receiver.rtt())
-        });
+        b.iter_batched_ref(
+            || receiver_with_acks(1),
+            |(receiver, ack)| {
+                black_box(receiver.handle_ackack(
+                    black_box(*ack),
+                    0,
+                    Timestamp::from_micros(1_000),
+                ));
+                black_box(receiver.rtt())
+            },
+            BatchSize::SmallInput,
+        );
     });
 
     group.bench_function("stale_miss", |b| {
