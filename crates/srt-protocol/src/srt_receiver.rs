@@ -1359,13 +1359,15 @@ impl ReceiverBuffer {
         self.link_capacity_estimator.on_packet_received(now);
     }
 
+    /// RFC 3550 §6.4.1 interarrival jitter: `J += (|D| - J) / 16`, signed so
+    /// that it falls back after a spike as well as rising.
     fn update_jitter(&mut self, now: Timestamp, packet_timestamp: u32) {
         let transit = now.as_micros() as i64 - packet_timestamp as i64;
         if let Some(last) = self.last_transit {
-            let d = (transit - last).unsigned_abs() as u32;
-            self.jitter = self
-                .jitter
-                .saturating_add((d.saturating_sub(self.jitter)) / 16);
+            let d = i64::from((transit - last).unsigned_abs() as u32);
+            let jitter = i64::from(self.jitter);
+            // Between the old jitter and `d`, both `u32`.
+            self.jitter = (jitter + (d - jitter) / 16) as u32;
         }
         self.last_transit = Some(transit);
     }
@@ -4042,6 +4044,37 @@ mod tests {
         let stats = buf.stats();
         // jitter = 31 + (500 - 31) / 16 = 31 + 29 = 60
         assert_eq!(stats.jitter, 60);
+    }
+
+    /// RFC 3550's interarrival jitter is an EWMA that moves toward every
+    /// sample, falling as well as rising: one late packet must not pin the
+    /// reported jitter at its spike for the rest of the session.
+    #[test]
+    fn jitter_decays_after_a_single_spike() {
+        let mut buf = ReceiverBuffer::new(0, 120, Timestamp::from_micros(0), 0);
+        buf.set_tsbpd_enabled(false);
+        let arrive = |buf: &mut ReceiverBuffer, seq: u32, late_us: u64| {
+            let sent = u64::from(seq) * 1_000;
+            buf.receive(
+                make_packet(seq, sent as u32),
+                Timestamp::from_micros(sent + 1_000 + late_us),
+            );
+        };
+        arrive(&mut buf, 0, 0);
+        arrive(&mut buf, 1, 100_000);
+        arrive(&mut buf, 2, 0);
+        let spiked = buf.stats().jitter;
+        assert!(spiked > 10_000, "the spike registers: {spiked}");
+
+        for seq in 3..1_003 {
+            arrive(&mut buf, seq, 0);
+        }
+        // Integer division leaves at most 15 us of a converged EWMA.
+        assert!(
+            buf.stats().jitter < 16,
+            "jitter decays from {spiked} us, now {} us",
+            buf.stats().jitter
+        );
     }
 
     #[test]

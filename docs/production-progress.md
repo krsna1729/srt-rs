@@ -957,3 +957,8 @@ Each item below was reproduced by a regression test that failed on
   `core.cpp:8994-9027`). srt-rs now does the same in O(1) (a consumed-through
   ACK number), and the connection refuses an unmatched ACKACK, so replays
   are not peer activity.
+- Jitter that never decays (R5). The interarrival-jitter EWMA used
+  `saturating_sub`, so `J += (|D| - J) / 16` could only rise: one late
+  packet (or a peer stamping one outlier timestamp) pinned the reported
+  jitter at its spike for the rest of the session. The update is now the
+  signed RFC 3550 §6.4.1 EWMA, unchanged on rises.
