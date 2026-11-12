@@ -962,3 +962,15 @@ Each item below was reproduced by a regression test that failed on
   packet (or a peer stamping one outlier timestamp) pinned the reported
   jitter at its spike for the rest of the session. The update is now the
   signed RFC 3550 §6.4.1 EWMA, unchanged on rises.
+- Post-SHUTDOWN drain held open by KEEPALIVEs (S5). After a peer's
+  SHUTDOWN the connection keeps delivering what it accepted, bounded by
+  the inactivity timer measured from the last packet received. KEEPALIVEs
+  still count as received, so a peer sending SHUTDOWN and then a
+  KEEPALIVE a second held an undrainable half-close (an incomplete message
+  without TLPKTDROP) open forever. libsrt gives a broken socket a fixed
+  countdown (`m_iBrokenCounter`) and ignores what the peer sends after
+  SHUTDOWN. The drain is now bounded as if the peer had gone silent at its
+  SHUTDOWN: the inactivity timer acts no later than one timeout after it,
+  still deferring to a deliverable tail's own TSBPD deadline. The same
+  change stops the tick once a drain it completed itself has closed; it
+  used to fall through and emit a second terminal event.

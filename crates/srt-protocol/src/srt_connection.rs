@@ -898,9 +898,10 @@ pub struct SrtConnection {
     /// A TLPKTDROP visit stopped at its gap budget with more gaps possibly
     /// due; the next `DeliveryContinue` visit continues it.
     receive_expiry_continues: bool,
-    /// Whether the peer closed its send half and this connection is still
-    /// delivering what it had already accepted. Terminal on drain.
-    peer_shutdown_pending: bool,
+    /// When the peer closed its send half, while this connection is still
+    /// delivering what it had already accepted. Terminal on drain, and at
+    /// most one inactivity timeout later whatever the peer still sends.
+    peer_shutdown_at: Option<Timestamp>,
     output_overflowed: bool,
     event_overflowed: bool,
 
@@ -1458,7 +1459,7 @@ impl SrtConnection {
             pending_tx_odd: 0,
             receive_window_reopen_pending: false,
             receive_expiry_continues: false,
-            peer_shutdown_pending: false,
+            peer_shutdown_at: None,
             output_overflowed: false,
             event_overflowed: false,
             start_time: None,
@@ -1522,7 +1523,7 @@ impl SrtConnection {
             pending_tx_odd: 0,
             receive_window_reopen_pending: false,
             receive_expiry_continues: false,
-            peer_shutdown_pending: false,
+            peer_shutdown_at: None,
             output_overflowed: false,
             event_overflowed: false,
             start_time: None,
@@ -2570,17 +2571,15 @@ impl SrtConnection {
         if self.state != ConnectionState::Connected {
             return;
         }
-        let elapsed = self.last_recv_time.map_or(INACTIVITY_TIMEOUT_MICROS, |t| {
-            now.as_micros().saturating_sub(t.as_micros())
-        });
-        if elapsed < INACTIVITY_TIMEOUT_MICROS {
+        let remaining = self.inactivity_remaining(now);
+        if remaining > 0 {
             self.queue_output(QueuedOutput::SetTimer {
                 id: TimerId::Inactivity,
-                duration_micros: INACTIVITY_TIMEOUT_MICROS - elapsed,
+                duration_micros: remaining,
             });
             return;
         }
-        if !self.peer_shutdown_pending {
+        if self.peer_shutdown_at.is_none() {
             self.queue_event(ConnectionEvent::Disconnected {
                 reason: DisconnectReason::InactivityTimeout,
             });
@@ -2597,7 +2596,7 @@ impl SrtConnection {
         // would equal `now` and neither message would ever be delivered.
         self.service_receive_deadlines(now);
         self.finish_peer_shutdown_if_drained();
-        if !self.peer_shutdown_pending {
+        if self.state != ConnectionState::Connected {
             return;
         }
         // A due unread head is also pending delivery, not an impossible
@@ -2642,6 +2641,26 @@ impl SrtConnection {
             return;
         }
         self.finish_local_close(DisconnectReason::PeerShutdown);
+    }
+
+    /// How long until the inactivity timer acts: one inactivity timeout
+    /// after the last packet received, and for a peer that closed its send
+    /// half no later than one inactivity timeout after its SHUTDOWN. Its
+    /// KEEPALIVEs still count as received, but must not hold an undrainable
+    /// half-close open forever: the drain is bounded as if the peer had gone
+    /// silent at its SHUTDOWN (libsrt gives a broken socket a fixed
+    /// countdown, `m_iBrokenCounter`).
+    fn inactivity_remaining(&self, now: Timestamp) -> u64 {
+        let since = |at: Option<Timestamp>| {
+            at.map_or(INACTIVITY_TIMEOUT_MICROS, |at| {
+                now.as_micros().saturating_sub(at.as_micros())
+            })
+        };
+        let quiet = since(self.last_recv_time);
+        let closing = self
+            .peer_shutdown_at
+            .map_or(0, |shutdown| since(Some(shutdown)));
+        INACTIVITY_TIMEOUT_MICROS.saturating_sub(quiet.max(closing))
     }
 
     fn handle_shutdown_timer(&mut self, now: Timestamp) {
@@ -3596,7 +3615,7 @@ impl SrtConnection {
     }
 
     fn handle_data_packet(&mut self, mut pkt: DataPacket, now: Timestamp) -> Result<(), Error> {
-        if self.peer_shutdown_pending {
+        if self.peer_shutdown_at.is_some() {
             // The peer closed its send half: no further DATA is part of this
             // connection's protocol progress. It is rejected rather than
             // ignored, so it cannot bank itself as peer activity either.
@@ -4786,7 +4805,7 @@ impl SrtConnection {
         // A peer may retransmit SHUTDOWN until it sees this side's answer.
         // Once terminal-pending, every duplicate is ignored: it must not
         // restart the drain, and it must not emit a second terminal event.
-        if self.peer_shutdown_pending || self.state == ConnectionState::Disconnected {
+        if self.peer_shutdown_at.is_some() || self.state == ConnectionState::Disconnected {
             return Ok(());
         }
         if self.state == ConnectionState::Closing {
@@ -4796,7 +4815,7 @@ impl SrtConnection {
             return Ok(());
         }
 
-        self.peer_shutdown_pending = true;
+        self.peer_shutdown_at = Some(now);
         self.shutdown_started_at = None;
         self.queue_output(QueuedOutput::ClearTimer {
             id: TimerId::Shutdown,
@@ -4816,7 +4835,7 @@ impl SrtConnection {
     /// inactivity timer bounds the drain, and TLPKTDROP retires expired
     /// positions the ordinary way.
     fn finish_peer_shutdown_if_drained(&mut self) {
-        if !self.peer_shutdown_pending || self.state == ConnectionState::Disconnected {
+        if self.peer_shutdown_at.is_none() || self.state == ConnectionState::Disconnected {
             return;
         }
         let receiver_drained = self
@@ -7206,6 +7225,14 @@ mod tests {
 
         fn is_armed(&self, id: TimerId) -> bool {
             self.deadlines[id.index()].is_some()
+        }
+
+        /// The armed timer due first, inactivity winning ties.
+        fn earliest(&self) -> Option<(TimerId, Timestamp)> {
+            TimerId::ALL
+                .iter()
+                .filter_map(|&id| self.deadlines[id.index()].map(|at| (id, at)))
+                .min_by_key(|(id, at)| (at.as_micros(), *id != TimerId::Inactivity, id.index()))
         }
 
         /// Fire every elapsed timer, once each, in `TimerId::ALL` order.
@@ -15016,14 +15043,14 @@ mod tests {
 
         conn.feed_recv_buf(&shutdown, arrived)
             .expect("the peer's SHUTDOWN is accepted");
-        assert!(conn.peer_shutdown_pending);
+        assert!(conn.peer_shutdown_at.is_some());
         assert_eq!(conn.state(), ConnectionState::Connected, "still draining");
         assert!(conn.poll_event().is_none(), "no event before the deadline");
 
         // Duplicate SHUTDOWN: a peer retransmits until it sees an answer.
         conn.feed_recv_buf(&shutdown, arrived)
             .expect("a duplicate SHUTDOWN is accepted and ignored");
-        assert!(conn.peer_shutdown_pending);
+        assert!(conn.peer_shutdown_at.is_some());
 
         // One microsecond before the deadline: nothing is released, and the
         // peer's close is not terminal yet.
@@ -15073,7 +15100,7 @@ mod tests {
             arrived,
         )
         .expect("the peer's SHUTDOWN is accepted");
-        assert!(conn.peer_shutdown_pending);
+        assert!(conn.peer_shutdown_at.is_some());
 
         // The fixed inactivity timeout elapses (5s after the last received
         // packet) while the message's own deadline is still ~3s away. The
@@ -15150,7 +15177,7 @@ mod tests {
             arrived,
         )
         .expect("the peer's SHUTDOWN is accepted");
-        assert!(conn.peer_shutdown_pending);
+        assert!(conn.peer_shutdown_at.is_some());
 
         // The 5s inactivity timeout fires first and defers to message 1's
         // still-future 8s deadline, exactly like the single-message case.
@@ -15413,6 +15440,125 @@ mod tests {
             })
         ));
         assert!(conn.poll_event().is_none(), "exactly one terminal event");
+    }
+
+    /// A peer that sent SHUTDOWN and then keeps sending KEEPALIVEs must not
+    /// hold an undrainable half-close open forever. The drain is bounded as
+    /// if the peer had gone silent at its SHUTDOWN: here an incomplete
+    /// message without TLPKTDROP can never drain, and the connection closes
+    /// with the peer's reason one inactivity timeout after the SHUTDOWN.
+    #[test]
+    fn keepalives_cannot_hold_a_peer_shutdown_drain_open() {
+        let mut conn = tsbpd_listener(120, false, 8);
+        let socket_id = conn.options.socket_id;
+        conn.setup_connection_timers();
+        let mut head = DataPacket::new(0, 1, 50, 0, b"head".to_vec().into());
+        head.position = crate::srt_packet::PacketPosition::First;
+        conn.handle_data_packet(head, Timestamp::from_micros(2_000))
+            .expect("the first fragment is accepted");
+        let shutdown_at = Timestamp::from_micros(10_000);
+        conn.feed_recv_buf(
+            &control_datagram(socket_id, ControlType::Shutdown, 0, 0, vec![0; 4]),
+            shutdown_at,
+        )
+        .expect("the peer's SHUTDOWN is accepted");
+        assert_eq!(
+            conn.state(),
+            ConnectionState::Connected,
+            "nothing drained yet"
+        );
+
+        let mut timers = TestTimers::default();
+        for output in drain_outputs(&mut conn) {
+            timers.apply(&output, shutdown_at);
+        }
+        let keepalive = control_datagram(socket_id, ControlType::Keepalive, 0, 0, vec![0; 4]);
+        let mut closed_at = None;
+        'run: for second in 1..=60 {
+            let keepalive_at = shutdown_at.add_micros(second * 1_000_000);
+            while let Some((id, due)) = timers.earliest().filter(|(_, due)| *due < keepalive_at) {
+                timers.deadlines[id.index()] = None;
+                conn.handle_timer(id, due).expect("armed timer");
+                for output in drain_outputs(&mut conn) {
+                    timers.apply(&output, due);
+                }
+                if conn.state() == ConnectionState::Disconnected {
+                    closed_at = Some(due);
+                    break 'run;
+                }
+            }
+            conn.feed_recv_buf(&keepalive, keepalive_at)
+                .expect("KEEPALIVE accepted");
+            for output in drain_outputs(&mut conn) {
+                timers.apply(&output, keepalive_at);
+            }
+        }
+        assert_eq!(
+            closed_at,
+            Some(shutdown_at.add_micros(INACTIVITY_TIMEOUT_MICROS)),
+            "closed one inactivity timeout after the SHUTDOWN"
+        );
+        let terminal = std::iter::from_fn(|| conn.poll_event())
+            .filter(|event| matches!(event, ConnectionEvent::Disconnected { .. }))
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(
+                terminal.as_slice(),
+                [ConnectionEvent::Disconnected {
+                    reason: DisconnectReason::PeerShutdown
+                }]
+            ),
+            "{terminal:?}"
+        );
+    }
+
+    /// A drain the inactivity tick completes itself (here TLPKTDROP gives
+    /// up the message missing its middle fragment) ends with exactly one
+    /// terminal event: the tick must stop once the drain closed.
+    #[test]
+    fn a_drain_completed_by_the_inactivity_tick_emits_one_terminal_event() {
+        let mut conn = tsbpd_listener(120, true, 8);
+        let socket_id = conn.options.socket_id;
+        let arrived = Timestamp::from_micros(2_000);
+        for (sequence, timestamp, position) in [
+            (0, 50, crate::srt_packet::PacketPosition::First),
+            (2, 60, crate::srt_packet::PacketPosition::Last),
+        ] {
+            let mut packet = DataPacket::new(sequence, 1, timestamp, 0, b"part".to_vec().into());
+            packet.position = position;
+            conn.handle_data_packet(packet, arrived)
+                .expect("fragment accepted");
+        }
+        conn.feed_recv_buf(
+            &control_datagram(socket_id, ControlType::Shutdown, 0, 0, vec![0; 4]),
+            Timestamp::from_micros(10_000),
+        )
+        .expect("the peer's SHUTDOWN is accepted");
+        assert_eq!(
+            conn.state(),
+            ConnectionState::Connected,
+            "nothing drained yet"
+        );
+        drain_outputs(&mut conn);
+
+        conn.handle_timer(TimerId::Inactivity, Timestamp::from_micros(5_010_000))
+            .expect("inactivity tick");
+        assert_eq!(conn.state(), ConnectionState::Disconnected);
+        let events: Vec<_> = std::iter::from_fn(|| conn.poll_event()).collect();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ConnectionEvent::DataReceived { .. })),
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ConnectionEvent::Disconnected { .. }))
+                .count(),
+            1,
+            "{events:?}"
+        );
     }
 
     /// DATA arriving after the peer closed its send half is not protocol
