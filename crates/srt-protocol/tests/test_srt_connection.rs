@@ -1553,9 +1553,10 @@ fn test_dropped_packet_triggers_nak_then_retransmit() {
     assert_eq!(stats.total_lost, 1);
     assert!(stats.total_retransmitted_srt_bytes > 0);
 
-    // The retransmission never reached the listener either. Its next report,
-    // more than the caller's RTT estimate (initially 100 ms) after the
-    // retransmission, is evidence it was lost and re-sends it.
+    // The retransmission goes out but never reaches the listener. Its next
+    // report, more than the caller's RTT estimate (initially 100 ms) after
+    // the retransmission, is evidence it was lost and re-sends it.
+    while caller.poll_output().unwrap().is_some() {}
     let now3 = ts(260_000);
     listener
         .handle_timer(TimerId::Nak, now3)

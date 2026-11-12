@@ -150,6 +150,11 @@ struct SentPacket {
     /// the other half of what makes a position ACK-justified: see
     /// `SenderBuffer::justified_frontier`.
     drop_notified: bool,
+    /// Whether this packet's latest retransmission is still waiting in the
+    /// connection's output queue (S4): popped, not yet submitted. A loss
+    /// report naming it is answered by that copy, so it is not queued
+    /// again until the copy has gone out (`SenderBuffer::note_data_submitted`).
+    retransmit_waiting: bool,
 }
 
 impl SentPacket {
@@ -157,6 +162,7 @@ impl SentPacket {
     fn note_retransmitted(&mut self, now: Timestamp) {
         self.retransmit_count += 1;
         self.retransmitted_at = u32::try_from(now - self.sent_time).unwrap_or(u32::MAX);
+        self.retransmit_waiting = true;
     }
 
     /// Whether this packet was retransmitted less than `interval`
@@ -1103,6 +1109,7 @@ impl SenderBuffer {
                 self.live_submitted_count = self.live_submitted_count.saturating_add(1);
             }
             entry.submitted = true;
+            entry.retransmit_waiting = false;
         }
         if self
             .newest_submitted
@@ -1394,6 +1401,7 @@ impl SenderBuffer {
                     dropped: false,
                     submitted: false,
                     drop_notified: false,
+                    retransmit_waiting: false,
                 },
             )
             .expect("alias-free live span checked by can_send");
@@ -1467,6 +1475,7 @@ impl SenderBuffer {
                         dropped: false,
                         submitted: false,
                         drop_notified: false,
+                        retransmit_waiting: false,
                     },
                 )
                 .expect("alias-free live span checked by can_send");
@@ -2115,8 +2124,9 @@ impl SenderBuffer {
     }
 
     /// Queue retained, live, transmitted packets intersecting one loss range
-    /// that a report arriving at `arrived_at` may re-send: not retransmitted
-    /// within [`Self::retransmit_suppression_micros`] before it. Counts each
+    /// that a report arriving at `arrived_at` may re-send: no retransmission
+    /// still waiting to go out, and not retransmitted within
+    /// [`Self::retransmit_suppression_micros`] before it. Counts each
     /// position queued as lost, as libsrt counts the positions a report
     /// newly inserts into its loss list (core.cpp:9194, 9218).
     fn queue_loss_range(&mut self, first_seq: u32, last_seq: u32, arrived_at: Timestamp) {
@@ -2128,7 +2138,9 @@ impl SenderBuffer {
             first_seq & SEQUENCE_MASK,
             last_seq & SEQUENCE_MASK,
             |entry: &SentPacket| {
-                !entry.dropped && !entry.retransmitted_within(arrived_at, suppression)
+                !entry.dropped
+                    && !entry.retransmit_waiting
+                    && !entry.retransmitted_within(arrived_at, suppression)
             },
             |sequence| {
                 loss_list.push_back(sequence);
