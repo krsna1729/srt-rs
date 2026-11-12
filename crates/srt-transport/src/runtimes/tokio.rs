@@ -1257,8 +1257,9 @@ impl OwnerListenerSide {
     }
 
     /// Drain every readable promoted socket through the listener's
-    /// admission path (the table demultiplexes by socket ID; a datagram
-    /// there never creates a peer: `ListenerRouting::admit_private_bytes`),
+    /// admission path (the table demultiplexes by socket ID; a CONCLUSION
+    /// there creates a peer only with a cookie verified for that 4-tuple:
+    /// `ListenerRouting::admit_private_bytes`),
     /// then poll the drained ones' readiness so their next datagram wakes
     /// this Owner.
     fn drain_promoted(&mut self, now: Timestamp) -> io::Result<()> {

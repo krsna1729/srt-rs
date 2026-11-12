@@ -1108,7 +1108,8 @@ fn drain_side_recv(
 /// Drain the promoted sockets that reported readiness, through the
 /// listener's admission path (the table demultiplexes by socket ID, so a
 /// datagram is handled as if it had reached the listener socket, except that
-/// it never creates a peer: `ListenerRouting::admit_private_bytes`).
+/// a CONCLUSION creates a peer only with a cookie verified for that 4-tuple:
+/// `ListenerRouting::admit_private_bytes`).
 fn drain_promoted_recv(side: &mut OwnerListenerSide, now: Timestamp) -> io::Result<()> {
     let mut ready = std::mem::take(&mut side.promoted.ready);
     let mut first_error = None;

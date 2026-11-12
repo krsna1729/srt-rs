@@ -641,13 +641,17 @@ fn bench_established_data_progression(c: &mut Criterion) {
 
 /// The gate every datagram from a promoted session's connected socket passes
 /// before admission: DATA and non-handshake control pass on their first two
-/// bytes; a CONCLUSION naming no live peer is decoded and refused.
+/// bytes; a CONCLUSION naming no live peer is decoded and its cookie
+/// verified: a restarted caller's passes, one issued to another address is
+/// refused.
 fn bench_promoted_socket_gate(c: &mut Criterion) {
     let options = AdmissionOptions::basic(7, 120, true);
     let telemetry = IngressTelemetry::new();
     let peer = SocketAddr::from(([127, 0, 0, 1], 10_000));
+    let elsewhere = SocketAddr::from(([127, 0, 0, 1], 10_001));
     let mut table = PeerTable::new();
-    let foreign = conclusion_for(&mut table, peer, 7, &options, &telemetry);
+    let restarted = conclusion_for(&mut table, peer, 7, &options, &telemetry);
+    let replayed = conclusion_for(&mut table, elsewhere, 8, &options, &telemetry);
     let mut data = vec![0u8; 1_332];
     data[15] = 1;
     let mut keepalive = vec![0u8; 16];
@@ -657,7 +661,8 @@ fn bench_promoted_socket_gate(c: &mut Criterion) {
     for (name, datagram, admitted) in [
         ("data", &data, true),
         ("keepalive", &keepalive, true),
-        ("foreign_conclusion", &foreign, false),
+        ("restarted_conclusion", &restarted, true),
+        ("replayed_conclusion", &replayed, false),
     ] {
         group.bench_function(name, |b| {
             b.iter(|| {

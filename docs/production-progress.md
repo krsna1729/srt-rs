@@ -854,12 +854,15 @@ mutation results and numbers in its commit message.
   connected socket and went through ordinary admission, so a second caller
   socket claiming the address (on-path, or with a captured cookie) could
   create a peer there, be rejected, and take the live session's socket with
-  it. An address is now freed only when no live peer remains at it, and a
-  handshake from a connected socket never creates a peer: a CONCLUSION
-  passes only when it routes to a live peer (the session's own
-  retransmission), any other is dropped as invalid. A caller restarted on
-  the same address and port is refused until the old session idles out, then
-  lands on the listener socket.
+  it. An address is now freed only when no live peer remains at it, which
+  alone closes that hole. A CONCLUSION from a connected socket passes when
+  it routes to a live peer (the session's own retransmission) or its cookie
+  verifies for that address and caller socket ID as issued by this member;
+  any other is dropped as invalid. A caller restarted on the same address
+  and port with a new socket ID therefore connects at once while the old
+  session lives, as libsrt accepts it (`api.cpp` `locatePeer`); the first
+  version of this fix refused it until the old session idled out (~5 s,
+  past libsrt's 3 s default connect timeout).
 - Unbounded forwarded-CONCLUSION inbox (T4). A member counted the
   CONCLUSIONs it forwarded against `LISTENER_FORWARD_CAPACITY` (256) only
   until the application drained them (`poll_listener_transfers`), then

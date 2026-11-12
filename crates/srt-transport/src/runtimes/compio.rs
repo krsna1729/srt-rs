@@ -1432,7 +1432,8 @@ pub struct ListenerSide {
     /// Application admission policy (see [`crate::ListenerAdmissionResolver`]),
     /// stored once per listener. Both listener-socket receive paths reach it
     /// through [`admit_listener_datagram`]; promoted sockets through
-    /// `ListenerRouting::admit_private`, which never creates a peer.
+    /// `ListenerRouting::admit_private`, where a CONCLUSION creates a peer
+    /// only with a cookie verified for that 4-tuple.
     resolver: Option<crate::ListenerAdmissionResolver>,
     /// Layout membership and the transfers owed to other members.
     routing: ListenerRouting,
