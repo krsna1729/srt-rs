@@ -13,6 +13,10 @@ include = ["/src/**", "LICENSE", "README.md"]
 
 [dependencies]
 srt_proto = { package = "srt-proto", version = "=0.1.0", path = "../srt-protocol" }
+# SYN-cookie MAC (`cookie.rs`): the HMAC-SHA1 the protocol crate already
+# uses for its key derivation, so no new crate enters the tree.
+hmac = "0.13"
+sha1 = "0.11"
 
 [dev-dependencies]
 proptest = "1.11"

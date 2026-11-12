@@ -13,20 +13,33 @@ without moving application policy into the sans-I/O protocol core.
 
 SRT listener admission is a two-packet handshake:
 
-1. `INDUCTION` creates bounded half-open state and returns a listener-generated
-   SYN cookie. It does not carry StreamID.
+1. `INDUCTION` is answered without keeping any state: the answer carries a
+   SYN cookie, a keyed MAC (HMAC-SHA1) over the caller's address and port,
+   its socket ID and a 60 s time bucket. It does not carry StreamID.
 2. `CONCLUSION` echoes that cookie and carries StreamID, GROUP, and KM
    extensions.
-3. `PeerTable` validates capacity, ownership, and the cookie, then decodes one
-   `AdmissionRequest`.
+3. `PeerTable` verifies the cookie first (issued to this address and caller
+   socket, in this bucket or the previous one), then checks capacity and
+   ownership, creates the half-open peer and decodes one `AdmissionRequest`.
+   A CONCLUSION whose cookie does not verify is dropped (`invalid_cookies`)
+   before any of that: it creates no state, is never forwarded to another
+   acceptor and never reaches the resolver, so a spoofer cannot make the
+   application see failures for someone else's address.
 4. The application resolver accepts, configures, rejects, or defers the peer.
 5. Only after that result is applied does `SrtConnection::feed_recv_buf`
    interpret CONCLUSION and process KM.
 
-Routing a handshake that matches no live peer (a new caller's INDUCTION, a
-stale or foreign CONCLUSION) costs a constant number of ordered-index lookups
-(by address, by address and caller socket ID, by address and SYN cookie), not
-a walk of the slot arena, so rejection stays cheap at any table capacity.
+This is libsrt's order (`processConnectRequest`, core.cpp:11755-11850): no
+state before a CONCLUSION whose cookie checks out. INDUCTION answers wait for
+`poll_outbound` in a queue of at most 4096 (an INDUCTION beyond it is a
+capacity drop; the caller retries), and each request is answered exactly
+once: a listener never resends a handshake answer on its own timer, the
+caller's retransmissions drive any repeat.
+
+Routing a handshake that matches no live peer (a stale or foreign
+CONCLUSION) costs a constant number of ordered-index lookups (by address and
+SYN cookie, by address and caller socket ID) and one MAC, not a walk of the
+slot arena, so rejection stays cheap at any table capacity.
 
 This is the same timing boundary as Haivision SRT's
 [`srt_listen_callback`](https://github.com/Haivision/srt/blob/fcae57145c000a9e7b72aa777adb8f85c2463242/docs/API/API-functions.md#srt_listen_callback):
@@ -41,10 +54,10 @@ from StreamID participates in KM processing for that connection.
 - `handshake`: the decoded handshake for advanced policy; and
 - `access_control`: the parsed `#!::k=v,...` StreamID convention, when valid.
 
-Every field remains untrusted. The cookie was issued by the listener and is
-exact-matched against retained half-open state, but it carries guessable worker
-routing metadata and is not an authentication primitive. Treat StreamID as a
-routing or credential-selection claim, not authenticated identity. A
+Every field remains untrusted. The cookie proves only that the caller
+received the listener's INDUCTION answer at the address it claims, within the
+last one to two minutes; it is not an authentication primitive. Treat StreamID
+as a routing or credential-selection claim, not authenticated identity. A
 successful KM exchange proves possession of the selected shared passphrase; it
 does not prove a person, account, or endpoint identity.
 
@@ -138,8 +151,8 @@ rejection and increments `policy_errors`.
 |---|---|
 | `Accept` | Process CONCLUSION with the prepared listener policy unchanged. |
 | `Configure(policy)` | Validate and atomically apply explicit per-peer overrides, then process CONCLUSION. |
-| `Reject { reason }` | Queue a rejection response, mark the half-open peer terminal, and never establish it. |
-| `Defer` | Retain the untouched half-open peer for a retransmitted CONCLUSION; do not extend its original hard expiry. |
+| `Reject { reason }` | Queue a rejection response, mark the half-open peer terminal, and never establish it. A replay of the same CONCLUSION while its cookie is valid is a new attempt and meets policy again. |
+| `Defer` | Retain the untouched half-open peer (created by this CONCLUSION) for a retransmitted CONCLUSION; do not extend its hard expiry, which runs from that first CONCLUSION. |
 
 Continue draining `PeerTable::poll_outbound` after `Rejected` or a terminal KM
 failure so the queued protocol response reaches the caller before the peer is
@@ -177,13 +190,14 @@ owner.listen_with_resolver(&listener_config, resolver)?;
 (`tokio::Facade::spawn_with_resolver` for the facade) and is transactional
 exactly like `listen`.
 
-- **Timing.** The resolver runs after cookie validation and before CONCLUSION,
+- **Timing.** The resolver runs after cookie verification and before CONCLUSION,
   on the packet-owner thread, through `PeerTable::admit_with_resolver`. Owners
   add no second admission engine; Configure, Reject, Defer, telemetry and the
-  half-open TTL are the table's own. A Deferred peer keeps its original hard
-  half-open expiry. A CONCLUSION repeated after the peer connected (its
-  response was lost) is answered from the established connection without
-  running the resolver again: its policy window has closed.
+  half-open TTL are the table's own. A Deferred peer keeps the hard half-open
+  expiry its first CONCLUSION set. A CONCLUSION repeated after the peer
+  connected (its response was lost) is answered from the established
+  connection without running the resolver again: its policy window has
+  closed.
 - **Never on the data path.** It does not run for DATA, ACK, NAK, retransmits
   or timers. Its cost is per admitted handshake, not per packet.
 - **Bounded and cache-backed.** The callback is synchronous and bounded. It is
@@ -234,8 +248,10 @@ For a single acceptor or shared listener loop, call `admit_with_resolver`
 directly. For several `SO_REUSEPORT` acceptors, call
 `admit_and_forward_with_resolver`.
 
-The latter first routes a rehashed CONCLUSION back to the acceptor that owns
-its half-open cookie state. Only that owner invokes the resolver. Credentials
+The latter first routes a rehashed CONCLUSION back to the acceptor that issued
+its cookie, after verifying it: every acceptor of a process shares the cookie
+key, so a CONCLUSION that fails verification is dropped where it arrived and
+never forwarded. Only the issuing acceptor invokes the resolver. Credentials
 and resolved policy therefore stay local instead of crossing worker channels.
 A forwarded worker must run the same resolver when it handles the forwarded
 `WorkerMessage::Handshake`.
@@ -249,7 +265,7 @@ cross-counter transaction.
 
 | Counter | Operational meaning |
 |---|---|
-| `policy_requests` | Valid-cookie CONCLUSION attempts presented to policy, including retransmissions to a peer that is not yet established (a `Defer`red one). A repeat to an established peer is answered from its stored response and never reaches policy. |
+| `policy_requests` | Verified-cookie CONCLUSION attempts presented to policy, including retransmissions to a peer that is not yet established (a `Defer`red one). A repeat to an established peer is answered from its stored response and never reaches policy. |
 | `policy_configurations` | Typed per-peer configurations successfully applied. Plain `Accept` is not included. |
 | `policy_deferred` | Attempts retained without feeding CONCLUSION or refreshing expiry. |
 | `policy_rejections` | Application policy rejections. |
@@ -257,9 +273,9 @@ cross-counter transaction.
 | `credential_failures` | KM failed after policy selected a credential, or encryption negotiation otherwise failed closed. |
 | `key_derivation_drops` | Encrypted CONCLUSIONs dropped, before policy and protocol work, because the table's key-derivation budget (`max_key_derivations_per_second`) was spent. The caller retransmits. Sustained nonzero values with rising `credential_failures` mean a source is cycling handshakes to burn PBKDF2 time. |
 | `window_memory_rejections` | Peers rejected with `OVERLOAD` (1402) after policy accepted them, because their worst-case window memory did not fit what was left of `max_window_memory_bytes`. A rejection is final for that handshake; the caller connects again later. Sustained nonzero values mean the budget, or the windows policy grants, are too large for the established population. |
-| `expired_half_open` | Incomplete peers removed after their hard inactivity bound. |
-| `invalid_cookies` / `cookie_route_failures` | Cookie validation failures and failed cross-worker delivery. |
-| capacity-drop counters | Total, half-open, established, and per-source limits shedding load. |
+| `expired_half_open` | Incomplete peers (a CONCLUSION deferred, or not yet answered) removed after their hard inactivity bound. |
+| `invalid_cookies` / `cookie_route_failures` | CONCLUSIONs whose cookie failed verification (forged, expired, or issued to another address or caller socket), and failed cross-worker delivery. |
+| capacity-drop counters | Total, half-open, established, and per-source limits shedding load (checked at a verified CONCLUSION), and INDUCTION answers beyond the 4096-answer queue. |
 
 These are attempt counters, not unique-connection counters. Export rates or
 deltas rather than attaching an unbounded StreamID label. Never put StreamID,

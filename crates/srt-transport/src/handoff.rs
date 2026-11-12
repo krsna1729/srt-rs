@@ -27,10 +27,9 @@ pub enum WorkerMessage {
     /// Take ownership of this fully-established connection.
     Handoff(Box<Handoff>),
     /// A handshake datagram the kernel delivered to the wrong acceptor.
-    /// Its SYN cookie names the acceptor that owns the half-open
-    /// handshake, so it is forwarded there rather than answered locally
-    /// (cookie validation would reject it) or dropped (which costs a
-    /// handshake retry). See `srt_lifecycle::cookie_for_worker`.
+    /// Its SYN cookie verified and names the acceptor that issued it, so it
+    /// is forwarded there rather than answered locally. See
+    /// `srt_lifecycle::CookieKey`.
     Handshake {
         peer: std::net::SocketAddr,
         data: Vec<u8>,

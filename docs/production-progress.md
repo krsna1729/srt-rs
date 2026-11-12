@@ -825,3 +825,24 @@ mutation results and numbers in its commit message.
   panicked the Owner. Lent slots now count against `max_peers`, and a failed
   allocation is a `Dropped(Capacity)` (with a debug assertion) instead of a
   panic.
+- Stateless INDUCTION and keyed SYN cookies (RS1, T3, T5, S3, T7). An
+  INDUCTION created a half-open peer, so 1024 forged INDUCTIONs from
+  claimed addresses filled the default half-open table and locked real
+  callers out; the listener then resent its answer on its retry timer, about
+  a dozen datagrams reflected per forged request; and the cookie carried
+  the issuing worker's index in its low byte next to a random hash, and that
+  byte was read before anything was checked: a forged CONCLUSION naming no
+  peer was forwarded to whichever layout member its low byte named, filling
+  that member's inbox. (The resolver itself was protected: a CONCLUSION
+  reached it only by matching the cookie retained in INDUCTION state
+  exactly.) Now INDUCTION is answered statelessly into a bounded
+  queue (4096), a listener never resends unprompted, and the cookie is an
+  HMAC-SHA1 over the caller's address and port, socket ID and a 60 s bucket
+  (accepted for this bucket and the previous one), keyed once per process so
+  every layout member verifies the others' cookies. A CONCLUSION naming no
+  live peer verifies its cookie before capacity, state, forwarding or
+  policy, as libsrt does (core.cpp:11755-11850). The half-open limit now
+  bounds peers whose verified CONCLUSION is not yet answered (a `Defer`).
+  `IngressTelemetrySnapshot::promoted_duplicates` is removed: without
+  INDUCTION state a verified CONCLUSION for a peer that already left the
+  table is indistinguishable from a new attempt, and is admitted as one.

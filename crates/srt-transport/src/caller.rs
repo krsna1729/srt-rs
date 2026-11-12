@@ -2829,6 +2829,7 @@ mod retirement_tests;
 
 #[cfg(test)]
 mod tests {
+    use crate::admission::tests::{conclusion_from, open_half};
     use crate::*;
     use proptest::prelude::*;
     use srt_proto::handshake::HandshakePacket;
@@ -4882,10 +4883,7 @@ mod tests {
         let returned = refused.pop().expect("owned refused leg");
         assert_eq!(
             returned.entry.conn.state(),
-            srt_proto::ConnectionState::Connected
-        );
-        assert!(
-            returned.entry.conn.peek_output().is_some(),
+            srt_proto::ConnectionState::Connected,
             "successful session was not dropped"
         );
         // The Owner's usual failure path receives the intact session and can
@@ -5107,28 +5105,12 @@ mod tests {
         let options = AdmissionOptions::basic(0x3333, 0, true);
         let now = Timestamp::from_micros(5);
         assert_eq!(
-            source.admit(
-                fresh(1),
-                &induction(0x7001),
-                now,
-                &options,
-                1,
-                2,
-                &telemetry
-            ),
-            Admit::Fed,
+            open_half(&mut source, fresh(1), 0x7001, &options, &telemetry, now),
+            Admit::Deferred,
             "the one slot not lent is free"
         );
         assert_eq!(
-            source.admit(
-                fresh(2),
-                &induction(0x7002),
-                now,
-                &options,
-                1,
-                2,
-                &telemetry
-            ),
+            open_half(&mut source, fresh(2), 0x7002, &options, &telemetry, now),
             Admit::Dropped(AdmissionDropReason::Capacity)
         );
     }
@@ -6153,40 +6135,26 @@ mod tests {
             "127.0.0.1:10001".parse().expect("address"),
             "127.0.0.1:10002".parse().expect("address"),
         ];
+        let at = Timestamp::from_micros;
         assert_eq!(
-            table.admit(
-                peers[0],
-                &induction(1),
-                Timestamp::from_micros(0),
-                &options,
-                0,
-                1,
-                &telemetry,
-            ),
-            Admit::Fed
+            open_half(&mut table, peers[0], 1, &options, &telemetry, at(0)),
+            Admit::Deferred
         );
         assert_eq!(
-            table.admit(
-                peers[1],
-                &induction(2),
-                Timestamp::from_micros(1),
-                &options,
-                0,
-                1,
-                &telemetry,
-            ),
-            Admit::Fed
+            open_half(&mut table, peers[1], 2, &options, &telemetry, at(1)),
+            Admit::Deferred
         );
+        // Each admission prunes at most one overdue peer, so the later
+        // CONCLUSIONs are drawn up front, before any peer is overdue; a
+        // refused CONCLUSION keeps no state and can be presented again.
+        let third = conclusion_from(&mut table, peers[2], 3, &options, &telemetry, at(2));
+        let peer_four = "127.0.0.1:10003".parse().expect("address");
+        let fourth = conclusion_from(&mut table, peer_four, 4, &options, &telemetry, at(2));
+        let conclude = |table: &mut PeerTable, peer, conclusion: &[u8], now| {
+            table.admit(peer, conclusion, at(now), &options, 0, 1, &telemetry)
+        };
         assert_eq!(
-            table.admit(
-                peers[2],
-                &induction(3),
-                Timestamp::from_micros(2),
-                &options,
-                0,
-                1,
-                &telemetry,
-            ),
+            conclude(&mut table, peers[2], &third, 2),
             Admit::Dropped(AdmissionDropReason::Capacity)
         );
         assert_eq!(
@@ -6195,15 +6163,7 @@ mod tests {
         );
 
         assert_eq!(
-            table.admit(
-                peers[2],
-                &induction(3),
-                Timestamp::from_micros(101),
-                &options,
-                0,
-                1,
-                &telemetry,
-            ),
+            conclude(&mut table, peers[2], &third, 101),
             Admit::Dropped(AdmissionDropReason::Capacity)
         );
         // Admission prunes only one overdue peer per call. Its physical
@@ -6215,35 +6175,12 @@ mod tests {
 
         // The next admission unroutes the other overdue peer. There is
         // room because the first retirement has physically completed.
-        let peer_four = "127.0.0.1:10003".parse().expect("address");
-        assert_eq!(
-            table.admit(
-                peer_four,
-                &induction(4),
-                Timestamp::from_micros(102),
-                &options,
-                0,
-                1,
-                &telemetry,
-            ),
-            Admit::Fed
-        );
+        assert_eq!(conclude(&mut table, peer_four, &fourth, 102), Admit::Fed);
         assert_eq!(table.len(), 1);
         assert_eq!(telemetry.expired_half_open.load(Ordering::Relaxed), 2);
         assert_eq!(table.retirements_pending(), 1);
         table.reclaim_retired(64);
-        assert_eq!(
-            table.admit(
-                peers[2],
-                &induction(3),
-                Timestamp::from_micros(103),
-                &options,
-                0,
-                1,
-                &telemetry,
-            ),
-            Admit::Fed
-        );
+        assert_eq!(conclude(&mut table, peers[2], &third, 103), Admit::Fed);
         assert_eq!(table.len(), 2);
     }
 
@@ -6259,27 +6196,27 @@ mod tests {
             half_open_timeout: Duration::from_secs(60),
             ..PeerTableConfig::default()
         });
+        let now = Timestamp::default();
+        let at = |address: &str| address.parse().expect("address");
         assert_eq!(
-            half_open.admit(
-                "127.0.0.1:10000".parse().expect("address"),
-                &induction(1),
-                Timestamp::default(),
-                &options,
-                0,
+            open_half(
+                &mut half_open,
+                at("127.0.0.1:10000"),
                 1,
+                &options,
                 &telemetry,
+                now
             ),
-            Admit::Fed
+            Admit::Deferred
         );
         assert_eq!(
-            half_open.admit(
-                "127.0.0.2:10000".parse().expect("address"),
-                &induction(2),
-                Timestamp::default(),
+            open_half(
+                &mut half_open,
+                at("127.0.0.2:10000"),
+                2,
                 &options,
-                0,
-                1,
                 &telemetry,
+                now
             ),
             Admit::Dropped(AdmissionDropReason::HalfOpenCapacity)
         );
@@ -6293,26 +6230,24 @@ mod tests {
             ..PeerTableConfig::default()
         });
         assert_eq!(
-            per_source.admit(
-                "127.0.0.1:10000".parse().expect("address"),
-                &induction(1),
-                Timestamp::default(),
-                &options,
-                0,
+            open_half(
+                &mut per_source,
+                at("127.0.0.1:10000"),
                 1,
+                &options,
                 &telemetry,
+                now
             ),
-            Admit::Fed
+            Admit::Deferred
         );
         assert_eq!(
-            per_source.admit(
-                "127.0.0.1:10001".parse().expect("address"),
-                &induction(2),
-                Timestamp::default(),
+            open_half(
+                &mut per_source,
+                at("127.0.0.1:10001"),
+                2,
                 &options,
-                0,
-                1,
                 &telemetry,
+                now
             ),
             Admit::Dropped(AdmissionDropReason::SourceCapacity)
         );
@@ -6467,12 +6402,13 @@ mod tests {
             .expect_err("caller receives rejection");
         assert_eq!(error.kind, ErrorKind::HandshakeRejected);
 
-        // The rejected connection is retired after its response is drained,
-        // and replaying the authenticated conclusion cannot bypass policy via
-        // the allow-all `admit` convenience path.
+        // The rejected connection is retired after its response is drained.
+        // A replay of the CONCLUSION is a new attempt: its cookie still
+        // verifies, so it meets policy again rather than reviving the peer.
         assert!(!table.contains(&peer));
+        let mut asked = 0;
         assert_eq!(
-            table.admit(
+            table.admit_with_authorizer(
                 peer,
                 &conclusion,
                 Timestamp::from_micros(4),
@@ -6480,10 +6416,14 @@ mod tests {
                 0,
                 1,
                 &telemetry,
+                |_| {
+                    asked += 1;
+                    AdmissionDecision::Reject { reason: 1401 }
+                },
             ),
-            Admit::Dropped(AdmissionDropReason::StaleConclusion)
+            Admit::Rejected
         );
-        assert!(!table.contains(&peer));
+        assert_eq!(asked, 1);
     }
 
     #[test]
@@ -6709,23 +6649,27 @@ mod tests {
             ..PeerTableConfig::default()
         });
         let conclusion = prepare_conclusion(&mut table, peer, 0x1111, &options, &telemetry);
-        assert_eq!(
-            table.admit_with_resolver(
-                peer,
-                &conclusion,
-                Timestamp::from_micros(90),
-                &options,
-                0,
-                1,
-                &telemetry,
-                |_| AdmissionResolution::Defer,
-            ),
-            Admit::Deferred
-        );
+        // The half-open peer starts at its first CONCLUSION (90 us); a
+        // retransmission Deferred again does not move its expiry (190 us).
+        for at in [90, 180] {
+            assert_eq!(
+                table.admit_with_resolver(
+                    peer,
+                    &conclusion,
+                    Timestamp::from_micros(at),
+                    &options,
+                    0,
+                    1,
+                    &telemetry,
+                    |_| AdmissionResolution::Defer,
+                ),
+                Admit::Deferred
+            );
+        }
         assert!(table.contains(&peer));
-        assert_eq!(table.prune_half_open(Timestamp::from_micros(101)), 1);
+        assert_eq!(table.prune_half_open(Timestamp::from_micros(191)), 1);
         assert!(!table.contains(&peer));
-        assert_eq!(telemetry.snapshot().policy_deferred, 1);
+        assert_eq!(telemetry.snapshot().policy_deferred, 2);
     }
 
     #[test]
@@ -6971,16 +6915,15 @@ mod tests {
             let telemetry = IngressTelemetry::new();
             for index in 0..requested {
                 let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 10_000 + index as u16));
-                let result = table.admit(
+                let result = open_half(
+                    &mut table,
                     peer,
-                    &induction(index as u32 + 1),
-                    Timestamp::from_micros(index as u64),
+                    index as u32 + 1,
                     &options,
-                    0,
-                    1,
                     &telemetry,
+                    Timestamp::from_micros(index as u64),
                 );
-                prop_assert!(matches!(result, Admit::Fed | Admit::Dropped(AdmissionDropReason::Capacity)));
+                prop_assert!(matches!(result, Admit::Deferred | Admit::Dropped(AdmissionDropReason::Capacity)));
                 prop_assert!(table.len() <= max_peers);
             }
             prop_assert_eq!(table.len(), requested.min(max_peers));
@@ -7004,14 +6947,13 @@ mod tests {
             let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
             for index in 0..requested {
                 let peer = std::net::SocketAddr::new(ip, 10_000 + index as u16);
-                let _ = table.admit(
+                let _ = open_half(
+                    &mut table,
                     peer,
-                    &induction(index as u32 + 1),
-                    Timestamp::from_micros(index as u64),
+                    index as u32 + 1,
                     &options,
-                    0,
-                    1,
                     &telemetry,
+                    Timestamp::from_micros(index as u64),
                 );
                 prop_assert!(table.peers_for_ip(ip) <= max_per_ip);
             }

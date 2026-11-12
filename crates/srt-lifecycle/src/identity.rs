@@ -20,9 +20,8 @@ pub struct HandshakeIdentity {
     pub group: Option<GroupAffinity>,
     /// The SYN cookie carried by this datagram. On a CONCLUSION this is
     /// the value the listener issued during INDUCTION and the caller
-    /// echoed back, which makes it the one field on the wire that can
-    /// carry listener-chosen routing information through the handshake.
-    /// See [`crate::cookie::cookie_for_worker`].
+    /// echoed back: the listener verifies it statelessly and recovers the
+    /// acceptor that issued it. See [`crate::cookie::CookieKey`].
     pub syn_cookie: u32,
 }
 

@@ -239,7 +239,8 @@ the layout in the config and no runtime rewrites it:
 * `PerPort`: one Owner (also what `Owner::listen` attaches).
 * `ReusePortMulti { acceptors: K }`: K members (`ReusePortMember { index,
   count }`) of one `SO_REUSEPORT` group on one port. Cookie routing is on:
-  every member issues SYN cookies carrying its index.
+  every member issues SYN cookies carrying its index, under one keyed MAC
+  every member of the process verifies.
 * `SharedPool { listeners: K }`: K Owners on ports `P..P+K`.
 
 **The Owners of one layout talk through `ListenerTransfer`s, and the
@@ -248,9 +249,12 @@ application only routes them.** After every service visit it drains
 `accept_listener_transfer`. The payload is opaque. A transfer is one of:
 
 * a CONCLUSION the kernel delivered to the wrong member (the group rehashed
-  while a promotion's socket was in it; see below). Member `to` owns the half-open state and runs the
-  resolver. These are the only transfers the transport drops under backlog
-  (`listener_forwards_dropped`; the caller retries its handshake).
+  while a promotion's socket was in it; see below), after its SYN cookie
+  verified where it arrived: one that fails verification is dropped there and
+  never forwarded. Member `to` issued the cookie, creates the half-open peer
+  and runs the resolver. These are the only transfers the transport drops
+  under backlog (`listener_forwards_dropped`; the caller retries its
+  handshake).
 * under promotion `Relocate` on `ReusePortMulti`, an established bonded leg
   that the kernel hashed to a member other than the one holding its group
   (one router per layout, created by `owner_plans`, decides). The source

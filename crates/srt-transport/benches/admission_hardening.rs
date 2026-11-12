@@ -4,9 +4,11 @@ use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use srt_proto::handshake::{GroupExtensionData, GroupType, HandshakePacket, SRTGROUP_MASK};
+use srt_proto::wire::SrtPacket;
 use srt_proto::{ConnectionOptions, ConnectionOutput, SrtConnection, Timestamp};
 use srt_transport::advanced::admission::{
-    AdmissionOptions, AdmissionResolution, BondedInputPolicy, PeerTable, PeerTableConfig,
+    AdmissionDropReason, AdmissionOptions, AdmissionResolution, Admit, BondedInputPolicy,
+    PeerTable, PeerTableConfig,
 };
 use srt_transport::advanced::telemetry::IngressTelemetry;
 use srt_transport::test_support::{DenseDueIndex, DenseSlotArena, DueIndex, PhysicalPeerKey};
@@ -90,11 +92,53 @@ fn bench_invalid_admission(c: &mut Criterion) {
     group.finish();
 }
 
+/// The first CONCLUSION of a caller with `socket_id` at `peer`, after the
+/// stateless INDUCTION exchange against `scratch`. SYN cookies are keyed once
+/// per process, so it verifies on any table.
+fn conclusion_for(
+    scratch: &mut PeerTable,
+    peer: SocketAddr,
+    socket_id: u32,
+    options: &AdmissionOptions,
+    telemetry: &IngressTelemetry,
+) -> Vec<u8> {
+    let mut caller = SrtConnection::new_caller(ConnectionOptions {
+        socket_id,
+        ..ConnectionOptions::default()
+    });
+    caller.connect(Timestamp::default()).expect("start caller");
+    let _ = scratch.admit(
+        peer,
+        &next_packet(&mut caller),
+        Timestamp::default(),
+        options,
+        0,
+        1,
+        telemetry,
+    );
+    let mut outbound = Vec::new();
+    scratch.poll_outbound(Timestamp::default(), &mut outbound);
+    for (to, packet) in outbound {
+        if to == peer {
+            caller
+                .feed_recv_buf(&packet, Timestamp::from_micros(1))
+                .expect("induction response");
+        }
+    }
+    next_packet(&mut caller)
+}
+
+/// A verified CONCLUSION refused because the table is full: capacity is
+/// checked once the cookie verifies, before any state exists.
 fn bench_bounded_capacity(c: &mut Criterion) {
     let options = AdmissionOptions::basic(7, 120, true);
     let telemetry = IngressTelemetry::new();
-    let packet = induction(1);
-    c.bench_function("admission_capacity_rejection", |b| {
+    let mut scratch = PeerTable::new();
+    let held = SocketAddr::from(([127, 0, 0, 1], 10_000));
+    let refused = SocketAddr::from(([127, 0, 0, 1], 10_001));
+    let held_conclusion = conclusion_for(&mut scratch, held, 1, &options, &telemetry);
+    let refused_conclusion = conclusion_for(&mut scratch, refused, 2, &options, &telemetry);
+    c.bench_function("admission_conclusion_capacity_rejection", |b| {
         b.iter_batched(
             || {
                 let mut table = PeerTable::with_config(PeerTableConfig {
@@ -103,8 +147,8 @@ fn bench_bounded_capacity(c: &mut Criterion) {
                     ..PeerTableConfig::default()
                 });
                 let _ = table.admit(
-                    SocketAddr::from(([127, 0, 0, 1], 10_000)),
-                    &packet,
+                    held,
+                    &held_conclusion,
                     Timestamp::default(),
                     &options,
                     0,
@@ -114,20 +158,78 @@ fn bench_bounded_capacity(c: &mut Criterion) {
                 table
             },
             |mut table| {
-                black_box(table.admit(
-                    SocketAddr::from(([127, 0, 0, 1], 10_001)),
-                    &packet,
+                let admit = table.admit(
+                    refused,
+                    &refused_conclusion,
                     Timestamp::from_micros(1),
                     &options,
                     0,
                     1,
                     &telemetry,
-                ));
+                );
+                assert_eq!(admit, Admit::Dropped(AdmissionDropReason::Capacity));
                 assert_eq!(table.len(), 1);
             },
             BatchSize::SmallInput,
         );
     });
+}
+
+/// Answering an INDUCTION statelessly and draining the answer, and dropping
+/// a CONCLUSION whose cookie fails verification: the per-datagram work any
+/// source can make a listener do without state.
+fn bench_stateless_handshakes(c: &mut Criterion) {
+    let options = AdmissionOptions::basic(7, 120, true);
+    let telemetry = IngressTelemetry::new();
+    let peer = SocketAddr::from(([127, 0, 0, 1], 10_000));
+    let mut group = c.benchmark_group("admission_stateless");
+    group.throughput(Throughput::Elements(1));
+    let request = induction(1);
+    group.bench_function("induction_answer_and_drain", |b| {
+        let mut table = PeerTable::new();
+        let mut outbound = Vec::new();
+        b.iter(|| {
+            black_box(table.admit(
+                peer,
+                black_box(&request),
+                Timestamp::default(),
+                &options,
+                0,
+                1,
+                &telemetry,
+            ));
+            table.poll_outbound(Timestamp::default(), &mut outbound);
+            assert_eq!(outbound.len(), 1);
+        });
+    });
+    let mut scratch = PeerTable::new();
+    let genuine = conclusion_for(&mut scratch, peer, 2, &options, &telemetry);
+    let SrtPacket::Control(control) = SrtPacket::decode(&genuine).expect("conclusion") else {
+        panic!("a handshake control packet");
+    };
+    let mut handshake = HandshakePacket::decode(&control).expect("handshake body");
+    handshake.syn_cookie ^= 0x5A5A_0000;
+    let mut forged = Vec::new();
+    handshake
+        .encode(control.timestamp, control.dest_socket_id)
+        .encode(&mut forged)
+        .expect("handshake fits a datagram");
+    group.bench_function("forged_conclusion_drop", |b| {
+        let mut table = PeerTable::new();
+        b.iter(|| {
+            let admit = table.admit(
+                peer,
+                black_box(&forged),
+                Timestamp::default(),
+                &options,
+                0,
+                1,
+                &telemetry,
+            );
+            assert_eq!(admit, Admit::Dropped(AdmissionDropReason::InvalidCookie));
+        });
+    });
+    group.finish();
 }
 
 fn bench_due_index_churn(c: &mut Criterion) {
@@ -145,10 +247,12 @@ fn bench_due_index_churn(c: &mut Criterion) {
     });
 }
 
+/// A verified CONCLUSION refused by the per-source limit with 4096 peers
+/// held: routing and the source count are index lookups.
 fn bench_per_source_capacity(c: &mut Criterion) {
     let options = AdmissionOptions::basic(7, 120, true);
     let telemetry = IngressTelemetry::new();
-    let packet = induction(1);
+    let mut scratch = PeerTable::new();
     let mut table = PeerTable::with_config(PeerTableConfig {
         max_peers: 4_097,
         max_half_open_peers: 4_097,
@@ -160,9 +264,17 @@ fn bench_per_source_capacity(c: &mut Criterion) {
     for index in 0..4_096_u16 {
         let third = (index / 250) as u8;
         let fourth = (index % 250 + 1) as u8;
+        let peer = SocketAddr::from(([10, 0, third, fourth], 10_000));
+        let conclusion = conclusion_for(
+            &mut scratch,
+            peer,
+            u32::from(index) + 1,
+            &options,
+            &telemetry,
+        );
         let _ = table.admit(
-            SocketAddr::from(([10, 0, third, fourth], 10_000)),
-            &packet,
+            peer,
+            &conclusion,
             Timestamp::default(),
             &options,
             0,
@@ -170,20 +282,27 @@ fn bench_per_source_capacity(c: &mut Criterion) {
             &telemetry,
         );
     }
-    c.bench_function("admission_per_source_rejection_4096_peers", |b| {
-        b.iter(|| {
-            black_box(table.admit(
-                SocketAddr::from(([10, 0, 0, 1], 10_001)),
-                &packet,
-                Timestamp::from_micros(1),
-                &options,
-                0,
-                1,
-                &telemetry,
-            ));
-            assert_eq!(table.len(), 4_096);
-        });
-    });
+    assert_eq!(table.len(), 4_096);
+    let probe = SocketAddr::from(([10, 0, 0, 1], 10_001));
+    let conclusion = conclusion_for(&mut scratch, probe, 0x9999, &options, &telemetry);
+    c.bench_function(
+        "admission_conclusion_per_source_rejection_4096_peers",
+        |b| {
+            b.iter(|| {
+                let admit = table.admit(
+                    probe,
+                    black_box(&conclusion),
+                    Timestamp::from_micros(1),
+                    &options,
+                    0,
+                    1,
+                    &telemetry,
+                );
+                assert_eq!(admit, Admit::Dropped(AdmissionDropReason::SourceCapacity));
+                assert_eq!(table.len(), 4_096);
+            });
+        },
+    );
 }
 
 fn bench_same_tuple_n_callers(c: &mut Criterion) {
@@ -903,6 +1022,7 @@ criterion_group!(
     benches,
     bench_invalid_admission,
     bench_bounded_capacity,
+    bench_stateless_handshakes,
     bench_due_index_churn,
     bench_per_source_capacity,
     bench_same_tuple_n_callers,

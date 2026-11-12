@@ -122,15 +122,6 @@ impl RouteIndex {
             .map(|&(_, slot)| slot)
     }
 
-    /// The slot at `address` when it is the only one there.
-    pub(crate) fn sole_at(&self, address: SocketAddr) -> Option<u32> {
-        count_work!(RouteIndexProbes);
-        let address = Addr::from(address);
-        let mut at = self.by_address.range((address, 0)..=(address, u32::MAX));
-        let (_, slot) = *at.next()?;
-        at.next().is_none().then_some(slot)
-    }
-
     /// Lowest slot at `address` whose peer has SRT socket ID `caller`.
     pub(crate) fn first_for_caller(&self, address: SocketAddr, caller: u32) -> Option<u32> {
         count_work!(RouteIndexProbes);
@@ -177,7 +168,6 @@ mod tests {
         index.sync(4, keys(1, Some(7), Some(70)));
         index.sync(6, keys(1, Some(8), None));
         assert_eq!(index.first_at(at(1)), Some(4));
-        assert_eq!(index.sole_at(at(1)), None);
         assert_eq!(index.first_for_caller(at(1), 7), Some(4));
         assert_eq!(index.first_for_caller(at(1), 8), Some(6));
         assert_eq!(index.first_for_cookie(at(1), 70), Some(4));
@@ -185,7 +175,7 @@ mod tests {
         index.sync(4, None);
         assert_eq!(index.first_for_caller(at(1), 7), Some(9));
         index.sync(9, None);
-        assert_eq!(index.sole_at(at(1)), Some(6));
+        assert_eq!(index.first_at(at(1)), Some(6));
         assert_eq!(index.first_for_cookie(at(1), 70), None);
     }
 
@@ -201,7 +191,7 @@ mod tests {
         index.sync(3, keys(2, Some(8), None));
         assert_eq!(index.first_at(at(1)), None);
         assert_eq!(index.first_for_cookie(at(2), 80), None);
-        assert_eq!(index.sole_at(at(2)), Some(3));
+        assert_eq!(index.first_at(at(2)), Some(3));
         assert_eq!(index.sizes(), (1, 1, 0));
     }
 
@@ -232,7 +222,7 @@ mod tests {
             );
         }
         for (slot, address) in (0..).zip(all) {
-            assert_eq!(index.sole_at(address), Some(slot), "{address}");
+            assert_eq!(index.first_at(address), Some(slot), "{address}");
             assert_eq!(index.first_for_caller(address, 7), Some(slot));
             assert_eq!(index.first_for_cookie(address, 70), Some(slot));
         }

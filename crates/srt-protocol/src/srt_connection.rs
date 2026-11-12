@@ -2324,6 +2324,12 @@ impl SrtConnection {
         if self.state != ConnectionState::Connected {
             if self.handshake_timed_out(now) {
                 self.fail_handshake_timeout();
+            } else if self.role == ConnectionRole::Listener {
+                // A listener answers each request once, as libsrt does
+                // (core.cpp:11769-11810); the caller's retransmissions drive
+                // any repeat. Resending unprompted would reflect ~12 replies
+                // per (possibly forged) request at the claimed source.
+                self.arm_handshake_deadline(now);
             } else {
                 self.handshake_retry_sequence = self.handshake_retry_sequence.saturating_add(1);
                 self.retransmit_handshake();
@@ -4310,7 +4316,36 @@ impl SrtConnection {
         }
         self.send_induction_response(hs.initial_packet_seq, now);
         self.handshake_state = HandshakeState::InductionReceived;
-        self.arm_handshake_timer(now);
+        self.arm_handshake_deadline(now);
+        Ok(())
+    }
+
+    /// Start a listener handshake at its CONCLUSION. The INDUCTION was
+    /// answered without connection state, with a SYN cookie the caller of
+    /// this method has already verified and passed as
+    /// [`ConnectionOptions::syn_cookie`]; libsrt likewise keeps nothing
+    /// before a CONCLUSION whose cookie checks out (core.cpp:11755-11850).
+    /// The CONCLUSION from `peer_socket_id` is then fed as usual. The
+    /// session clock starts here, as libsrt's accepted socket's does, so
+    /// the CONCLUSION response's timestamp gives the caller its TSBPD base.
+    pub fn begin_listener_handshake_at_conclusion(
+        &mut self,
+        peer_socket_id: u32,
+        now: Timestamp,
+    ) -> Result<(), Error> {
+        if self.role != ConnectionRole::Listener || self.handshake_state != HandshakeState::Initial
+        {
+            return Err(Error::invalid_state(
+                "a stateless listener handshake starts on a fresh listener",
+            ));
+        }
+        self.peer_socket_id = peer_socket_id;
+        self.syn_cookie = self.options.syn_cookie.unwrap_or(0);
+        self.handshake_started_at = Some(now);
+        self.handshake_retry_sequence = 0;
+        self.start_time.get_or_insert(now);
+        self.handshake_state = HandshakeState::InductionReceived;
+        self.arm_handshake_deadline(now);
         Ok(())
     }
 
@@ -5344,6 +5379,43 @@ impl SrtConnection {
         self.queue_handshake_control_packet(pkt, now);
     }
 
+    /// The INDUCTION response a listener sends without connection state
+    /// (libsrt rewrites the request in place and keeps nothing,
+    /// core.cpp:11768-11811): addressed to and naming the caller's socket,
+    /// echoing its ISN and flow window, carrying `syn_cookie` and, when the
+    /// listener requires encryption, its advertised key length. `peer_ip`
+    /// fills the peer-IP field ([`Self::set_peer_address`]). Encode it with
+    /// [`HandshakePacket::encode`]`(timestamp, request.socket_id)`.
+    ///
+    /// # Errors
+    ///
+    /// A request that is not an INDUCTION or whose flow window is unusable,
+    /// which a listener with state refuses too.
+    pub fn stateless_induction_response(
+        request: &HandshakePacket,
+        syn_cookie: u32,
+        encryption: Option<KeyLength>,
+        peer_ip: std::net::IpAddr,
+    ) -> Result<HandshakePacket, Error> {
+        if request.handshake_type != HandshakeType::Induction {
+            return Err(Error::invalid_data("not an INDUCTION request"));
+        }
+        if !Self::peer_flow_window_is_usable(request.flow_window) {
+            return Err(Error::invalid_data(
+                "peer flow window must be between 2 and i32::MAX packets",
+            ));
+        }
+        let mut hs = HandshakePacket::new_induction_response(
+            request.socket_id,
+            syn_cookie,
+            encryption.map_or(0, KeyLength::to_encryption_field),
+        );
+        hs.initial_packet_seq = request.initial_packet_seq;
+        hs.flow_window = request.flow_window;
+        hs.peer_ip = peer_ip;
+        Ok(hs)
+    }
+
     fn send_conclusion_request(&mut self, now: Timestamp) -> Result<(), Error> {
         // Advertise the key length the KMREQ actually uses: the crypto
         // context may have adopted the listener's advertised length, as
@@ -5549,18 +5621,31 @@ impl SrtConnection {
             .handshake_retry_interval_micros
             .saturating_add(jitter % spread.saturating_add(1));
         // The final timer is a deadline wake-up, not another early retry.
-        let remaining = self
-            .handshake_started_at
+        let remaining = self.handshake_time_remaining(now);
+        self.queue_output(QueuedOutput::SetTimer {
+            id: TimerId::Handshake,
+            duration_micros: interval.min(remaining),
+        });
+    }
+
+    /// Wake only at the end of the attempt: a listener never resends a
+    /// handshake response unprompted.
+    fn arm_handshake_deadline(&mut self, now: Timestamp) {
+        let remaining = self.handshake_time_remaining(now);
+        self.queue_output(QueuedOutput::SetTimer {
+            id: TimerId::Handshake,
+            duration_micros: remaining,
+        });
+    }
+
+    fn handshake_time_remaining(&self, now: Timestamp) -> u64 {
+        self.handshake_started_at
             .map(|started| {
                 started
                     .add_micros(self.handshake_timeout_micros)
                     .saturating_sub(now)
             })
-            .unwrap_or(self.handshake_timeout_micros);
-        self.queue_output(QueuedOutput::SetTimer {
-            id: TimerId::Handshake,
-            duration_micros: interval.min(remaining),
-        });
+            .unwrap_or(self.handshake_timeout_micros)
     }
 
     /// Send a Keepalive packet.
@@ -6617,6 +6702,43 @@ mod tests {
             let response = next_wire(&mut listener);
             assert_eq!(handshake_sequence(&response), initial);
         }
+    }
+
+    /// T5: a listener answers each handshake request once and leaves any
+    /// repeat to the caller's retransmissions, as libsrt does
+    /// (core.cpp:11769-11810); its handshake timer only bounds the attempt.
+    /// Resending on that timer reflected about a dozen answers per (possibly
+    /// forged) INDUCTION at the address it claimed.
+    #[test]
+    fn a_listener_never_resends_a_handshake_answer_unprompted() {
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id: 0x1111,
+            ..ConnectionOptions::default()
+        });
+        let mut listener = SrtConnection::new_listener(ConnectionOptions {
+            socket_id: 0x2222,
+            ..ConnectionOptions::default()
+        });
+        caller.connect(Timestamp::default()).unwrap();
+        listener
+            .feed_recv_buf(&next_wire(&mut caller), Timestamp::from_micros(1))
+            .unwrap();
+        let mut answers = 0;
+        let mut drain = |listener: &mut SrtConnection| {
+            while let Some(output) = listener.poll_output().unwrap() {
+                if matches!(output, ConnectionOutput::SendPacket(_)) {
+                    answers += 1;
+                }
+            }
+        };
+        drain(&mut listener);
+        let retries = DEFAULT_HANDSHAKE_TIMEOUT_MICROS / DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS;
+        for retry in 1..=retries {
+            let now = Timestamp::from_micros(1 + retry * DEFAULT_HANDSHAKE_RETRY_INTERVAL_MICROS);
+            listener.handle_timer(TimerId::Handshake, now).unwrap();
+            drain(&mut listener);
+        }
+        assert_eq!(answers, 1, "datagrams the listener sent for one INDUCTION");
     }
 
     /// A caller refuses a CONCLUSION response carrying another ISN, as a

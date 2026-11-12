@@ -42,7 +42,7 @@ Four crates, layered so that dependencies only ever point downward:
   │ owns things:                 │   │ owns no state:            │
   │  · PeerTable / AdmissionPeer │   │  · WorkerRouter           │
   │  · ManualTimerStore          │   │  · decide_promotion()     │
-  │  · Handoff / WorkerMessage   │   │  · cookie_for_worker()    │
+  │  · Handoff / WorkerMessage   │   │  · CookieKey (SYN cookie) │
   │  · IngressTelemetry          │   │  · is_terminal()          │
   │  · bind_reuseport, recvmmsg  │   │  · handshake identity     │
   │  · per-runtime Conn (feature)│   │                           │
