@@ -34,6 +34,10 @@ pub(crate) const STALE_RETRANSMITS_CHECKED_PER_CALL: usize = 256;
 pub(crate) const STALE_RETRANSMITS_CHECKED_PER_PUSH: usize = 2;
 /// Retransmission-list entries one `pop_retransmit` call may inspect.
 pub(crate) const MAX_STALE_RETRANSMITS_SKIPPED_PER_POP: usize = 64;
+/// Pacing slots a retransmission may repay from the past (see
+/// `SenderBuffer::record_retransmit_send_time`): one connection visit's
+/// worth of retransmissions (`MAX_RETRANSMITS_PER_VISIT`).
+const RETRANSMIT_PACING_BURST: u64 = 32;
 
 /// Largest DATA message number (26 bits).
 const MESSAGE_NUMBER_MAX: u32 = 0x03FF_FFFF;
@@ -101,6 +105,12 @@ struct SentPacket {
     payload: Bytes,
     sent_time: Timestamp,
     retransmit_count: u32,
+    /// When this packet was last retransmitted, in microseconds after
+    /// `sent_time`; meaningful only once `retransmit_count` is nonzero.
+    /// Saturates, which only ever makes a retransmission look older (so a
+    /// later NAK re-sends rather than being held back). Sits in what was
+    /// padding, so the entry does not grow.
+    retransmitted_at: u32,
     /// The cryptographic reservation this packet's FIRST transmission used.
     ///
     /// Retransmission reproduces the first transmission's protected bytes
@@ -140,6 +150,21 @@ struct SentPacket {
     /// the other half of what makes a position ACK-justified: see
     /// `SenderBuffer::justified_frontier`.
     drop_notified: bool,
+}
+
+impl SentPacket {
+    /// Record a retransmission at `now`.
+    fn note_retransmitted(&mut self, now: Timestamp) {
+        self.retransmit_count += 1;
+        self.retransmitted_at = u32::try_from(now - self.sent_time).unwrap_or(u32::MAX);
+    }
+
+    /// Whether this packet was retransmitted less than `interval`
+    /// microseconds before `now`.
+    fn retransmitted_within(&self, now: Timestamp, interval: u64) -> bool {
+        self.retransmit_count != 0
+            && now - (self.sent_time + u64::from(self.retransmitted_at)) < interval
+    }
 }
 
 /// A message dropped by sender-side TLPKTDROP.
@@ -1364,6 +1389,7 @@ impl SenderBuffer {
                     payload: retained,
                     sent_time: now,
                     retransmit_count: 0,
+                    retransmitted_at: 0,
                     crypto_stamp: None,
                     dropped: false,
                     submitted: false,
@@ -1436,6 +1462,7 @@ impl SenderBuffer {
                         payload: retained,
                         sent_time: now,
                         retransmit_count: 0,
+                        retransmitted_at: 0,
                         crypto_stamp: None,
                         dropped: false,
                         submitted: false,
@@ -1491,7 +1518,10 @@ impl SenderBuffer {
         Some(pushed)
     }
 
-    /// Get a packet to retransmit.
+    /// Get a packet to retransmit at `now`, charging it to the pacing
+    /// schedule (see [`Self::retransmit_pacing_wait`]) and recording when it
+    /// went, so a NAK the peer sent before it could have arrived does not
+    /// queue it again (see [`Self::retransmit_suppression_micros`]).
     ///
     /// `entry.sent_time` is left at its original send time and never
     /// updated (the same intent as libsrt's `CSndBuffer::Block::m_tsOriginTime`
@@ -1502,7 +1532,11 @@ impl SenderBuffer {
     /// also defeats TLPKTDROP's purpose -- cleanly giving up once the
     /// delivery deadline passes, to bound latency -- since a packet
     /// retransmitted repeatedly would then never expire.)
-    pub fn pop_retransmit(&mut self, dest_socket_id: u32) -> Option<(DataHeader, Bytes)> {
+    pub fn pop_retransmit(
+        &mut self,
+        dest_socket_id: u32,
+        now: Timestamp,
+    ) -> Option<(DataHeader, Bytes)> {
         // A NAK storm followed by an ACK can leave a long run of stale
         // entries at the front; one call skips a bounded number of them and
         // leaves the rest for the next (the caller continues while
@@ -1518,15 +1552,9 @@ impl SenderBuffer {
                     self.stale_retransmits = self.stale_retransmits.saturating_sub(1);
                     continue;
                 }
-                entry.retransmit_count += 1;
-                self.total_retransmits += 1;
+                entry.note_retransmitted(now);
                 let wire_bytes = (entry.payload.len() + SRT_HEADER_SIZE) as u64;
-                self.total_srt_bytes_sent = self.total_srt_bytes_sent.saturating_add(wire_bytes);
-                self.total_retransmitted_srt_bytes = self
-                    .total_retransmitted_srt_bytes
-                    .saturating_add(wire_bytes);
-
-                return Some((
+                let retransmission = (
                     DataHeader {
                         sequence_number: seq,
                         position: entry.position,
@@ -1537,11 +1565,77 @@ impl SenderBuffer {
                         dest_socket_id,
                     },
                     entry.payload.clone(),
-                ));
+                );
+                self.total_retransmits += 1;
+                self.total_srt_bytes_sent = self.total_srt_bytes_sent.saturating_add(wire_bytes);
+                self.total_retransmitted_srt_bytes = self
+                    .total_retransmitted_srt_bytes
+                    .saturating_add(wire_bytes);
+                self.record_retransmit_send_time(now);
+                return Some(retransmission);
             }
             self.stale_retransmits = self.stale_retransmits.saturating_sub(1);
         }
         None
+    }
+
+    /// Microseconds until the pacing schedule has a slot for a
+    /// retransmission (0: one may go now).
+    ///
+    /// Retransmissions share the send-period schedule with new data, as
+    /// libsrt's `CUDT::packData` (core.cpp:10250-10413) advances
+    /// `m_tsNextSendTime` for every packet it sends, retransmissions
+    /// included: a peer's loss reports cannot make this sender transmit
+    /// faster than its configured bandwidth.
+    pub fn retransmit_pacing_wait(&self, now: Timestamp) -> u64 {
+        if self.packet_send_period == 0 {
+            return 0;
+        }
+        self.next_send_due.map_or(0, |due| due - now)
+    }
+
+    /// Charge one retransmission at `now` to the pacing schedule.
+    ///
+    /// Unlike a first transmission (see [`Self::record_send_time`]), a
+    /// retransmission keeps the schedule's phase and repays missed slots,
+    /// as libsrt repays its accumulated `m_tdSendTimeDiff` while it has
+    /// packets to send: a transport that wakes once a millisecond would
+    /// otherwise cap retransmission at one packet per wake. The repaid debt
+    /// is capped at `RETRANSMIT_PACING_BURST` slots, so after an idle
+    /// schedule at most that many go at once.
+    fn record_retransmit_send_time(&mut self, now: Timestamp) {
+        let period = self.packet_send_period;
+        if period == 0 {
+            self.next_send_due = Some(now);
+            return;
+        }
+        let oldest_slot = now
+            .as_micros()
+            .saturating_sub(period.saturating_mul(RETRANSMIT_PACING_BURST - 1));
+        let slot = self
+            .next_send_due
+            .map_or(oldest_slot, |due| due.as_micros().max(oldest_slot));
+        self.next_send_due = Some(Timestamp::from_micros(slot.saturating_add(period)));
+    }
+
+    /// How long after a packet's retransmission a peer loss report naming it
+    /// is held back instead of queuing it again: this sender's own smoothed
+    /// RTT estimate.
+    ///
+    /// A report arriving within one RTT of the retransmission left the peer
+    /// before the retransmission could have reached it, so it carries no
+    /// news. Both srt-rs and libsrt receivers repeat their whole loss list
+    /// every `P = max((RTT + 4*RTTVar) / 2, 20 ms)` (`srt_receiver.rs`
+    /// `nak_interval`, libsrt `LiveCC::updateNAKInterval`), so when
+    /// `P < RTT` the next report is such a duplicate and is held back. The
+    /// one after it arrives `2P >= RTT + 4*RTTVar` after the retransmission,
+    /// past the interval, and re-sends: a lost retransmission is repaired by
+    /// the first report the peer sent after it should have arrived. libsrt's
+    /// own rule (`CUDT::checkRexmitRightTime`, core.cpp:9827-9862) holds back
+    /// for `RTT - 4*RTTVar`, which is nothing once the variance reaches a
+    /// quarter of the RTT.
+    pub fn retransmit_suppression_micros(&self) -> u64 {
+        u64::from(self.sender_rtt_micros)
     }
 
     /// Process an ACK and release the buffer.
@@ -1665,7 +1759,7 @@ impl SenderBuffer {
                 last_seq: sequence,
             })
             .collect();
-        let _ = self.handle_nak_ranges(&ranges);
+        let _ = self.handle_nak_ranges(&ranges, Timestamp::default());
     }
 
     /// Validate a peer loss report completely, then commit it: either every
@@ -1691,9 +1785,10 @@ impl SenderBuffer {
     pub fn handle_nak_ranges(
         &mut self,
         loss_ranges: &[LossRange],
+        now: Timestamp,
     ) -> Result<Vec<DroppedMessage>, InvalidNak> {
         let span = self.nak_span(loss_ranges)?;
-        let mut report = self.pending_nak(loss_ranges.to_vec(), span, Timestamp::default());
+        let mut report = self.pending_nak(loss_ranges.to_vec(), span, now);
         loop {
             let mut budget = u32::MAX;
             match self.advance_nak(&mut report, &mut budget) {
@@ -1893,7 +1988,7 @@ impl SenderBuffer {
             let chunk = remaining.min(*budget);
             let chunk_last = report.next.wrapping_add(chunk - 1) & SEQUENCE_MASK;
             count_work!(NakPositionsVisited, u64::from(chunk));
-            self.queue_loss_range(report.next, chunk_last);
+            self.queue_loss_range(report.next, chunk_last, report.arrived_at);
             *budget -= chunk;
             if chunk == remaining {
                 report.range += 1;
@@ -2019,15 +2114,22 @@ impl SenderBuffer {
         served
     }
 
-    /// Queue retained, live, transmitted packets intersecting one loss range.
-    fn queue_loss_range(&mut self, first_seq: u32, last_seq: u32) {
+    /// Queue retained, live, transmitted packets intersecting one loss range
+    /// that a report arriving at `arrived_at` may re-send: not retransmitted
+    /// within [`Self::retransmit_suppression_micros`] before it. Counts each
+    /// position queued as lost, as libsrt counts the positions a report
+    /// newly inserts into its loss list (core.cpp:9194, 9218).
+    fn queue_loss_range(&mut self, first_seq: u32, last_seq: u32, arrived_at: Timestamp) {
+        let suppression = self.retransmit_suppression_micros();
         let packets = &mut self.packets;
         let loss_list = &mut self.loss_list;
         let mut queued = 0usize;
         packets.queue_loss_range(
             first_seq & SEQUENCE_MASK,
             last_seq & SEQUENCE_MASK,
-            |entry: &SentPacket| !entry.dropped,
+            |entry: &SentPacket| {
+                !entry.dropped && !entry.retransmitted_within(arrived_at, suppression)
+            },
             |sequence| {
                 loss_list.push_back(sequence);
                 queued += 1;
@@ -2592,10 +2694,13 @@ mod tests {
             "the single-packet record retired"
         );
         let answer = buf
-            .handle_nak_ranges(&[LossRange {
-                first_seq: 3,
-                last_seq: 3,
-            }])
+            .handle_nak_ranges(
+                &[LossRange {
+                    first_seq: 3,
+                    last_seq: 3,
+                }],
+                Timestamp::default(),
+            )
             .unwrap();
         assert_eq!(
             answer
@@ -2663,7 +2768,8 @@ mod tests {
                 let acked = round * step;
                 acks.push(WorkCounters::measure(|| buf.handle_ack(acked)).1);
                 for _ in 0..4 {
-                    let (popped, work) = WorkCounters::measure(|| buf.pop_retransmit(1));
+                    let (popped, work) =
+                        WorkCounters::measure(|| buf.pop_retransmit(1, Timestamp::default()));
                     if let Some((header, _)) = popped {
                         assert!(!sequence_less_than(header.sequence_number, acked));
                     }
@@ -2805,7 +2911,7 @@ mod tests {
                     assert!(probe.is_some(), "window {window}, tick {tick}");
                     probes += 1;
                     steps = steps.max(work.rto_candidate_steps);
-                    assert!(buf.pop_retransmit(1).is_some());
+                    assert!(buf.pop_retransmit(1, Timestamp::default()).is_some());
                 }
             }
             results.push((window, probes, steps));
@@ -3033,7 +3139,7 @@ mod tests {
         // (libsrt exempts retransmissions from the flow-window gate the same
         // way, `core.cpp` `packACK`/`packUniqueData`).
         let (header, _) = buf
-            .pop_retransmit(1)
+            .pop_retransmit(1, Timestamp::default())
             .expect("a NAKed packet is retransmitted despite the closed window");
         assert_eq!(header.sequence_number, 0);
     }
@@ -3065,7 +3171,7 @@ mod tests {
         assert!(buf.has_retransmit());
 
         // 再送パケットを取得
-        let retransmit = buf.pop_retransmit(1);
+        let retransmit = buf.pop_retransmit(1, Timestamp::default());
         assert!(retransmit.is_some());
         let (hdr, _) = retransmit.expect("再送パケットは Some になる想定");
         assert_eq!(hdr.sequence_number, 1001);
@@ -3084,14 +3190,24 @@ mod tests {
             );
         }
         dense
-            .handle_nak_ranges(&[LossRange {
-                first_seq: 0,
-                last_seq: 8_191,
-            }])
+            .handle_nak_ranges(
+                &[LossRange {
+                    first_seq: 0,
+                    last_seq: 8_191,
+                }],
+                Timestamp::default(),
+            )
             .unwrap();
         assert_eq!(dense.stats().packets_in_loss_list, 8_192);
         for expected in 0..8_192 {
-            assert_eq!(dense.pop_retransmit(1).unwrap().0.sequence_number, expected);
+            assert_eq!(
+                dense
+                    .pop_retransmit(1, Timestamp::default())
+                    .unwrap()
+                    .0
+                    .sequence_number,
+                expected
+            );
         }
 
         let mut wrapped = SenderBuffer::new(0x7FFF_FFFD, 8, 120);
@@ -3099,12 +3215,15 @@ mod tests {
             assert!(wrapped.push_submitted(vec![1], 1, 1, now).is_some());
         }
         wrapped
-            .handle_nak_ranges(&[LossRange {
-                first_seq: 0x7FFF_FFFE,
-                last_seq: 1,
-            }])
+            .handle_nak_ranges(
+                &[LossRange {
+                    first_seq: 0x7FFF_FFFE,
+                    last_seq: 1,
+                }],
+                Timestamp::default(),
+            )
             .unwrap();
-        let queued = std::iter::from_fn(|| wrapped.pop_retransmit(1))
+        let queued = std::iter::from_fn(|| wrapped.pop_retransmit(1, Timestamp::default()))
             .map(|(header, _)| header.sequence_number)
             .collect::<Vec<_>>();
         assert_eq!(queued, [0x7FFF_FFFE, 0x7FFF_FFFF, 0, 1]);
@@ -3169,8 +3288,14 @@ mod tests {
         buf.handle_ack(1);
 
         assert_eq!(buf.stats().packets_in_loss_list, 1);
-        assert_eq!(buf.pop_retransmit(1).unwrap().0.sequence_number, 1);
-        assert!(buf.pop_retransmit(1).is_none());
+        assert_eq!(
+            buf.pop_retransmit(1, Timestamp::default())
+                .unwrap()
+                .0
+                .sequence_number,
+            1
+        );
+        assert!(buf.pop_retransmit(1, Timestamp::default()).is_none());
     }
 
     #[test]
@@ -3193,8 +3318,14 @@ mod tests {
         }
         buf.handle_nak(&[32]);
 
-        assert_eq!(buf.pop_retransmit(1).unwrap().0.sequence_number, 32);
-        assert!(buf.pop_retransmit(1).is_none());
+        assert_eq!(
+            buf.pop_retransmit(1, Timestamp::default())
+                .unwrap()
+                .0
+                .sequence_number,
+            32
+        );
+        assert!(buf.pop_retransmit(1, Timestamp::default()).is_none());
     }
 
     #[test]
@@ -3214,7 +3345,13 @@ mod tests {
         );
         buf.handle_nak(&[1_000]);
 
-        assert_eq!(buf.pop_retransmit(1).unwrap().0.sequence_number, 1_000);
+        assert_eq!(
+            buf.pop_retransmit(1, Timestamp::default())
+                .unwrap()
+                .0
+                .sequence_number,
+            1_000
+        );
     }
 
     #[test]
@@ -3228,7 +3365,7 @@ mod tests {
             [0]
         );
         assert!(!buf.has_retransmit());
-        assert!(buf.pop_retransmit(1).is_none());
+        assert!(buf.pop_retransmit(1, Timestamp::default()).is_none());
     }
 
     #[test]
@@ -3389,7 +3526,7 @@ mod tests {
         buf.push_submitted(vec![3], 100, 1, now);
 
         buf.handle_nak(&[1001]);
-        let retransmit = buf.pop_retransmit(1);
+        let retransmit = buf.pop_retransmit(1, Timestamp::default());
         assert!(retransmit.is_some());
         assert_eq!(buf.stats().total_retransmits, 1);
 
@@ -3993,7 +4130,7 @@ mod tests {
 
         buf.handle_nak(&[0]);
         // 元の送信からほぼ 1 秒経った時点で再送を試みる。
-        let retransmitted = buf.pop_retransmit(1);
+        let retransmitted = buf.pop_retransmit(1, Timestamp::default());
         assert!(retransmitted.is_some());
 
         // 元の送信から 1_000_001us -- 再送直後からはまだ 100_001us しか
@@ -4170,15 +4307,18 @@ mod tests {
         // again -- the peer either lost the first one or has not removed the
         // range yet -- and never with a retransmission of released media.
         let repeated = buf
-            .handle_nak_ranges(&[LossRange {
-                first_seq: 0,
-                last_seq: 0,
-            }])
+            .handle_nak_ranges(
+                &[LossRange {
+                    first_seq: 0,
+                    last_seq: 0,
+                }],
+                Timestamp::default(),
+            )
             .unwrap();
         assert_eq!(repeated.len(), 1);
         assert_eq!((repeated[0].first_seq, repeated[0].last_seq), (0, 0));
         assert_eq!(buf.stats().packets_in_loss_list, 0);
-        assert!(buf.pop_retransmit(1).is_none());
+        assert!(buf.pop_retransmit(1, Timestamp::default()).is_none());
 
         // The cumulative ACK is what retires it.
         buf.handle_ack(1);
@@ -4228,10 +4368,13 @@ mod tests {
         // The message number is shared by every fragment, so naming the
         // middle one recovers the whole DROPREQ range.
         let repeated = buf
-            .handle_nak_ranges(&[LossRange {
-                first_seq: 1,
-                last_seq: 1,
-            }])
+            .handle_nak_ranges(
+                &[LossRange {
+                    first_seq: 1,
+                    last_seq: 1,
+                }],
+                Timestamp::default(),
+            )
             .unwrap();
         assert_eq!(repeated.len(), 1);
         assert_eq!((repeated[0].first_seq, repeated[0].last_seq), (0, 2));
@@ -4259,10 +4402,13 @@ mod tests {
         // dropped messages (each `push` is its own message), so each gets its
         // own DROPREQ.
         let across_the_wrap = buf
-            .handle_nak_ranges(&[LossRange {
-                first_seq: 0x7FFF_FFFE,
-                last_seq: 0x7FFF_FFFF,
-            }])
+            .handle_nak_ranges(
+                &[LossRange {
+                    first_seq: 0x7FFF_FFFE,
+                    last_seq: 0x7FFF_FFFF,
+                }],
+                Timestamp::default(),
+            )
             .unwrap();
         assert_eq!(across_the_wrap.len(), 2);
         assert_eq!(
@@ -4273,10 +4419,13 @@ mod tests {
             [(0x7FFF_FFFE, 0x7FFF_FFFE), (0x7FFF_FFFF, 0x7FFF_FFFF)]
         );
         let past_the_wrap = buf
-            .handle_nak_ranges(&[LossRange {
-                first_seq: 0,
-                last_seq: 0,
-            }])
+            .handle_nak_ranges(
+                &[LossRange {
+                    first_seq: 0,
+                    last_seq: 0,
+                }],
+                Timestamp::default(),
+            )
             .unwrap();
         assert_eq!(past_the_wrap.len(), 1);
         assert_eq!(past_the_wrap[0].first_seq, 0);
@@ -4309,17 +4458,23 @@ mod tests {
         // One report cannot be amplified without bound: the DROPREQ batch is
         // capped, and repeating the request produces the same bounded work.
         let answered = buf
-            .handle_nak_ranges(&[LossRange {
-                first_seq: 0,
-                last_seq: WINDOW - 1,
-            }])
+            .handle_nak_ranges(
+                &[LossRange {
+                    first_seq: 0,
+                    last_seq: WINDOW - 1,
+                }],
+                Timestamp::default(),
+            )
             .unwrap();
         assert_eq!(answered.len(), MAX_DROPREQ_PER_NAK);
         assert_eq!(
-            buf.handle_nak_ranges(&[LossRange {
-                first_seq: 0,
-                last_seq: WINDOW - 1,
-            }])
+            buf.handle_nak_ranges(
+                &[LossRange {
+                    first_seq: 0,
+                    last_seq: WINDOW - 1,
+                }],
+                Timestamp::default()
+            )
             .unwrap()
             .len(),
             MAX_DROPREQ_PER_NAK
@@ -4360,10 +4515,13 @@ mod tests {
         let mut ever_served: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for _ in 0..(MESSAGES as usize).div_ceil(MAX_DROPREQ_PER_NAK) + 1 {
             let served = buf
-                .handle_nak_ranges(&[LossRange {
-                    first_seq: 0,
-                    last_seq: MESSAGES - 1,
-                }])
+                .handle_nak_ranges(
+                    &[LossRange {
+                        first_seq: 0,
+                        last_seq: MESSAGES - 1,
+                    }],
+                    Timestamp::default(),
+                )
                 .unwrap();
             assert_eq!(
                 served.len(),
@@ -4397,10 +4555,13 @@ mod tests {
         let mut ever_served: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for _ in 0..(MESSAGES as usize).div_ceil(MAX_DROPREQ_PER_NAK) + 1 {
             let served = buf
-                .handle_nak_ranges(&[LossRange {
-                    first_seq: 0,
-                    last_seq: MESSAGES - 1,
-                }])
+                .handle_nak_ranges(
+                    &[LossRange {
+                        first_seq: 0,
+                        last_seq: MESSAGES - 1,
+                    }],
+                    Timestamp::default(),
+                )
                 .unwrap();
             assert_eq!(served.len(), MAX_DROPREQ_PER_NAK);
             ever_served.extend(served.iter().map(|msg| msg.first_seq));
@@ -4436,10 +4597,13 @@ mod tests {
 
         let calls_before = buf.tombstone_range_calls();
         let served = buf
-            .handle_nak_ranges(&[LossRange {
-                first_seq: 0,
-                last_seq: FRAGMENTS - 1,
-            }])
+            .handle_nak_ranges(
+                &[LossRange {
+                    first_seq: 0,
+                    last_seq: FRAGMENTS - 1,
+                }],
+                Timestamp::default(),
+            )
             .unwrap();
         assert_eq!(
             served.len(),
@@ -4490,10 +4654,13 @@ mod tests {
         assert_eq!(dropped.len() as u32, MESSAGES);
 
         let calls_before = buf.tombstone_range_calls();
-        let _ = buf.handle_nak_ranges(&[LossRange {
-            first_seq: 0,
-            last_seq: MESSAGES - 1,
-        }]);
+        let _ = buf.handle_nak_ranges(
+            &[LossRange {
+                first_seq: 0,
+                last_seq: MESSAGES - 1,
+            }],
+            Timestamp::default(),
+        );
         assert_eq!(
             buf.tombstone_range_calls() - calls_before,
             MESSAGES,
@@ -4512,58 +4679,82 @@ mod tests {
 
         // Valid prefix, impossible tail: the whole report is rejected, and
         // the valid-looking prefix leaves no retransmission behind.
-        let rejected = buf.handle_nak_ranges(&[
-            LossRange {
-                first_seq: 0,
-                last_seq: 0,
-            },
-            LossRange {
-                first_seq: 1_000,
-                last_seq: 1_000,
-            },
-        ]);
+        let rejected = buf.handle_nak_ranges(
+            &[
+                LossRange {
+                    first_seq: 0,
+                    last_seq: 0,
+                },
+                LossRange {
+                    first_seq: 1_000,
+                    last_seq: 1_000,
+                },
+            ],
+            Timestamp::default(),
+        );
         assert!(rejected.is_err());
         assert_eq!(buf.stats().packets_in_loss_list, 0);
-        assert!(buf.pop_retransmit(1).is_none());
+        assert!(buf.pop_retransmit(1, Timestamp::default()).is_none());
 
         // A position this sender accepted but never transmitted is not a loss
         // a peer could have observed.
         buf.push(vec![9], 1, 1, now);
-        let rejected = buf.handle_nak_ranges(&[LossRange {
-            first_seq: 4,
-            last_seq: 4,
-        }]);
+        let rejected = buf.handle_nak_ranges(
+            &[LossRange {
+                first_seq: 4,
+                last_seq: 4,
+            }],
+            Timestamp::default(),
+        );
         assert!(rejected.is_err());
         assert_eq!(buf.stats().packets_in_loss_list, 0);
 
         // A live, transmitted position is retransmitted.
         let dropped = buf
-            .handle_nak_ranges(&[LossRange {
-                first_seq: 2,
-                last_seq: 2,
-            }])
+            .handle_nak_ranges(
+                &[LossRange {
+                    first_seq: 2,
+                    last_seq: 2,
+                }],
+                Timestamp::default(),
+            )
             .unwrap();
         assert!(dropped.is_empty());
-        assert_eq!(buf.pop_retransmit(1).expect("queued").0.sequence_number, 2);
+        assert_eq!(
+            buf.pop_retransmit(1, Timestamp::default())
+                .expect("queued")
+                .0
+                .sequence_number,
+            2
+        );
 
         // A repeated valid report is idempotent.
-        let _ = buf.handle_nak_ranges(&[LossRange {
-            first_seq: 1,
-            last_seq: 1,
-        }]);
+        let _ = buf.handle_nak_ranges(
+            &[LossRange {
+                first_seq: 1,
+                last_seq: 1,
+            }],
+            Timestamp::default(),
+        );
         let queued = buf.stats().packets_in_loss_list;
-        let _ = buf.handle_nak_ranges(&[LossRange {
-            first_seq: 1,
-            last_seq: 1,
-        }]);
+        let _ = buf.handle_nak_ranges(
+            &[LossRange {
+                first_seq: 1,
+                last_seq: 1,
+            }],
+            Timestamp::default(),
+        );
         assert_eq!(buf.stats().packets_in_loss_list, queued);
 
         // A report that names more positions than the negotiated window is
         // impossible, not merely large.
-        let rejected = buf.handle_nak_ranges(&[LossRange {
-            first_seq: 0,
-            last_seq: 1 << 20,
-        }]);
+        let rejected = buf.handle_nak_ranges(
+            &[LossRange {
+                first_seq: 0,
+                last_seq: 1 << 20,
+            }],
+            Timestamp::default(),
+        );
         assert!(rejected.is_err());
     }
 
@@ -4578,18 +4769,30 @@ mod tests {
         }
 
         let dropped = buf
-            .handle_nak_ranges(&[LossRange {
-                first_seq: 0x7FFF_FFFF,
-                last_seq: 0,
-            }])
+            .handle_nak_ranges(
+                &[LossRange {
+                    first_seq: 0x7FFF_FFFF,
+                    last_seq: 0,
+                }],
+                Timestamp::default(),
+            )
             .unwrap();
         assert!(dropped.is_empty());
         assert_eq!(buf.stats().packets_in_loss_list, 2);
         assert_eq!(
-            buf.pop_retransmit(1).expect("queued").0.sequence_number,
+            buf.pop_retransmit(1, Timestamp::default())
+                .expect("queued")
+                .0
+                .sequence_number,
             0x7FFF_FFFF
         );
-        assert_eq!(buf.pop_retransmit(1).expect("queued").0.sequence_number, 0);
+        assert_eq!(
+            buf.pop_retransmit(1, Timestamp::default())
+                .expect("queued")
+                .0
+                .sequence_number,
+            0
+        );
     }
 
     fn submitted_sender(count: u32) -> SenderBuffer {
@@ -4816,7 +5019,7 @@ mod tests {
         assert_eq!(stats.total_lost, 1, "a queued loss is not counted twice");
         assert_eq!(stats.total_srt_bytes_sent, 20);
 
-        assert!(buf.pop_retransmit(1).is_some());
+        assert!(buf.pop_retransmit(1, Timestamp::default()).is_some());
         let stats = buf.stats();
         assert_eq!(stats.total_retransmits, 1);
         assert_eq!(stats.total_retransmitted_srt_bytes, 20);

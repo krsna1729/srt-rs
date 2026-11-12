@@ -115,7 +115,7 @@ fuzz_target!(|data: &[u8]| {
                 // report is now rejected outright rather than answered with
                 // an empty batch, so there is nothing to check against
                 // `tombstones` when it is.
-                if let Ok(answered) = sender.handle_nak_ranges(&report) {
+                if let Ok(answered) = sender.handle_nak_ranges(&report, now) {
                     assert!(
                         answered.len() <= 16,
                         "one report cannot be amplified into unbounded DROPREQ batches"
@@ -145,7 +145,7 @@ fuzz_target!(|data: &[u8]| {
                 }
             }
             7 => {
-                if let Some((header, payload)) = sender.pop_retransmit(1) {
+                if let Some((header, payload)) = sender.pop_retransmit(1, now) {
                     assert!(
                         !tombstones.contains(&header.sequence_number),
                         "a tombstone was DATA-retransmitted"
@@ -164,7 +164,7 @@ fuzz_target!(|data: &[u8]| {
                     first_seq: second,
                     last_seq: first.wrapping_sub(1) & SEQUENCE_MASK,
                 }];
-                let _ = sender.handle_nak_ranges(&wrapped);
+                let _ = sender.handle_nak_ranges(&wrapped, now);
                 let _ = sender.can_send_message((second % 8) as usize + 1);
             }
         }

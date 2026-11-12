@@ -1544,19 +1544,35 @@ fn test_dropped_packet_triggers_nak_then_retransmit() {
     );
 
     let stats = caller.sender_stats().expect("stats");
-    assert!(
-        stats.total_retransmits > 0,
-        "caller should have retransmitted the lost packet after receiving the NAK"
-    );
     // Gap detection emits an immediate NAK and the timer emits a periodic
-    // retry. The first retransmission was already dequeued when the second
-    // report arrived, so both loss occurrences are observable.
+    // retry; both reach the caller at `now2`. The retry left the peer before
+    // the retransmission could have arrived, so it re-sends nothing and
+    // reports no new loss.
     assert_eq!(stats.total_naks_received, 2);
-    assert_eq!(stats.total_lost, 2);
+    assert_eq!(stats.total_retransmits, 1);
+    assert_eq!(stats.total_lost, 1);
     assert!(stats.total_retransmitted_srt_bytes > 0);
 
+    // The retransmission never reached the listener either. Its next report,
+    // more than the caller's RTT estimate (initially 100 ms) after the
+    // retransmission, is evidence it was lost and re-sends it.
+    let now3 = ts(260_000);
+    listener
+        .handle_timer(TimerId::Nak, now3)
+        .expect("nak timer");
+    while let Some(output) = listener.poll_output().unwrap() {
+        if let ConnectionOutput::SendPacket(data) = output {
+            let _ = caller.feed_recv_buf(&data, now3);
+        }
+    }
+    while caller.poll_output().unwrap().is_some() {}
+    let stats = caller.sender_stats().expect("stats");
+    assert_eq!(stats.total_naks_received, 3);
+    assert_eq!(stats.total_retransmits, 2);
+    assert_eq!(stats.total_lost, 2);
+
     let receiver = listener.receiver_stats().expect("receiver stats");
-    assert_eq!(receiver.total_naks_sent, 2);
+    assert_eq!(receiver.total_naks_sent, 3);
     assert_eq!(receiver.total_lost, 1);
 }
 
@@ -2081,7 +2097,10 @@ fn a_retransmission_keeps_the_first_transmission_crypto_identity() {
             "{cipher_mode:?}: the fixture must actually have rotated the key"
         );
 
-        // The peer reports the still-retained sequence as lost.
+        // The peer reports the still-retained sequence as lost. Not about
+        // pacing: the rotation fixture's later sends must not hold the
+        // retransmission back.
+        caller.set_packet_send_period(0);
         caller
             .feed_recv_buf(&single_loss_nak(caller.socket_id(), sequence), now)
             .expect("the loss report is accepted");
@@ -2149,8 +2168,13 @@ fn a_retransmission_does_not_advance_the_first_transmission_crypto_counter() {
         )
         .expect("seed below the pre-announcement threshold");
 
+    // Past the first transmission's pacing slot, so the retransmission goes
+    // at once.
     caller
-        .feed_recv_buf(&single_loss_nak(caller.socket_id(), sequence), now)
+        .feed_recv_buf(
+            &single_loss_nak(caller.socket_id(), sequence),
+            ts(1_001_000),
+        )
         .expect("the loss report is accepted");
     let retransmission = drain_data_datagrams(&mut caller);
     assert_eq!(retransmission.len(), 1);

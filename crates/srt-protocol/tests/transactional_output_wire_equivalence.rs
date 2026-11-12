@@ -394,8 +394,14 @@ fn wire_equivalence_retransmits() {
     let mut nak_bytes = Vec::new();
     nak_ctrl.encode(&mut nak_bytes).expect("encode nak");
 
-    caller_a.feed_recv_buf(&nak_bytes, now).expect("feed nak a");
-    caller_b.feed_recv_buf(&nak_bytes, now).expect("feed nak b");
+    // Past the three sends' pacing slots, so the retransmission goes at once.
+    let nak_at = ts(310_000);
+    caller_a
+        .feed_recv_buf(&nak_bytes, nak_at)
+        .expect("feed nak a");
+    caller_b
+        .feed_recv_buf(&nak_bytes, nak_at)
+        .expect("feed nak b");
     // Path A: legacy poll_output()
     let mut retx_a = None;
     while let Some(out) = caller_a.poll_output().unwrap() {
