@@ -63,16 +63,6 @@ fn is_conclusion(packet: &[u8]) -> bool {
     )
 }
 
-/// A copy of `packet` addressed to `dest_socket_id`, so a replay can reach a
-/// socket that has already admitted the connection.
-fn retarget(packet: &[u8], dest_socket_id: u32) -> Vec<u8> {
-    let SrtPacket::Control(mut control) = SrtPacket::decode(packet).expect("control packet") else {
-        panic!("expected a control packet");
-    };
-    control.dest_socket_id = dest_socket_id;
-    encode(control)
-}
-
 /// A copy of `packet` whose handshake initial sequence is altered, which is
 /// what an on-path mutation of an otherwise valid conclusion looks like. The
 /// identity guard compares the CIF fields, so the patch lands inside it: the
@@ -328,27 +318,13 @@ fn a_replayed_conclusion_request_is_answered_without_re_admitting_the_listener()
         "the receiver holds what it received before the replay"
     );
 
-    // The raw request cannot belong to this socket once the connection is
-    // admitted: the destination check refuses it.
-    let refused = established
-        .listener
-        .feed_recv_buf(&established.conclusion_request, ts(200_000))
-        .expect_err("a zero-destination conclusion is refused after admission");
-    assert_eq!(refused.kind, ErrorKind::InvalidData);
-    assert!(
-        refused
-            .to_string()
-            .contains("destination socket ID mismatch"),
-        "the destination check refused it, not the handshake state: {refused}"
-    );
-
-    // Addressed to this socket, the replay reaches the handshake state, which
-    // must answer it without admitting the connection again.
-    let addressed = retarget(&established.conclusion_request, LISTENER_SOCKET_ID);
+    // The replay arrives as the caller sends it, addressed to socket 0: a
+    // connected listener passes it to the handshake state, which must
+    // answer it without admitting the connection again.
     established
         .listener
-        .feed_recv_buf(&addressed, ts(200_001))
-        .expect("an addressed conclusion is delivered to the handshake state");
+        .feed_recv_buf(&established.conclusion_request, ts(200_000))
+        .expect("a repeated conclusion is delivered to the handshake state");
 
     assert_eq!(established.listener.state(), ConnectionState::Connected);
     assert_eq!(
