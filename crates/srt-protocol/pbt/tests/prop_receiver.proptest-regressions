@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc f61a2054d4420f2a2b7829823ca9f30e8d96f836db566595b02d69ea45e73032 # shrinks to target = 0
+cc 3ba4ba6192061533fe15190cfaa27f2c7307f4c702dfa8a2fa920142df128b6f # shrinks to lead = 30000002, local_epoch = 0, gaps = [30000002], delay_ms = 20
+cc 3a2912b6348c49cf7f1fa972aa970093e8eba802f15ad3f15c06693dbbb67144 # shrinks to lead = 44535340, local_epoch = 0, gaps = [30535340, 44000001], delay_ms = 44000

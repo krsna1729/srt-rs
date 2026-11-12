@@ -3726,7 +3726,10 @@ impl SrtConnection {
         validate_control_information(&pkt)?;
         match pkt.control_type {
             ControlType::Handshake => self.handle_handshake(pkt, now),
-            ControlType::Keepalive => Ok(()), // キープアライブは特に処理不要
+            ControlType::Keepalive => {
+                self.handle_keepalive(&pkt);
+                Ok(())
+            }
             ControlType::Ack => self.handle_ack(pkt, now),
             ControlType::Nak => return self.handle_nak(pkt, now),
             ControlType::Shutdown => self.handle_shutdown(now),
@@ -3736,6 +3739,14 @@ impl SrtConnection {
             ControlType::CongestionWarning | ControlType::PeerError => Ok(()),
         }
         .map(|()| true)
+    }
+
+    /// A KEEPALIVE's timestamp still tracks the peer clock across the TSBPD
+    /// wrap while DATA pauses (libsrt core.cpp:12673).
+    fn handle_keepalive(&mut self, pkt: &ControlPacket) {
+        if let Some(receiver) = self.receiver.as_mut() {
+            receiver.handle_keepalive(pkt.timestamp);
+        }
     }
 
     fn handle_handshake(&mut self, pkt: ControlPacket, now: Timestamp) -> Result<(), Error> {
@@ -6862,22 +6873,16 @@ mod tests {
         assert_eq!(caller.initial_seq, 0x11);
     }
 
-    /// A bonded member's handshake timestamp is the group's age (libsrt
-    /// members share the group start time, group.h:768-782,
-    /// core.cpp:3621-3622), which can exceed a freshly started listener's
-    /// clock. libsrt derives the peer start on the steady clock and never
-    /// clamps it (core.cpp:2253/2490), so the TSBPD base must stay negative
-    /// here instead of saturating to zero and holding every packet for the
-    /// clock difference.
-    #[test]
-    fn handshake_timestamp_beyond_the_local_clock_keeps_tsbpd_on_schedule() {
-        const CALLER_EPOCH: u64 = 3_600_000_000;
-        const LISTENER_EPOCH: u64 = 1_000_000;
-        let caller_at = |t: u64| Timestamp::from_micros(CALLER_EPOCH + t);
-        let listener_at = |t: u64| Timestamp::from_micros(LISTENER_EPOCH + t);
-        let latency = u64::from(ConnectionOptions::default().tsbpd_delay) * 1_000;
+    /// One-way delay of [`group_member_pair`]'s path, each way.
+    const GROUP_MEMBER_ONE_WAY_US: u64 = 5_000;
 
-        // The group clock started at zero, an hour before this member joins.
+    /// A connected caller/listener pair whose caller is a bonded member
+    /// inheriting a group clock that started at zero, so its timestamps
+    /// are its own clock (`caller_epoch + t`) while the listener's clock
+    /// reads `listener_epoch + t` at the same moment.
+    fn group_member_pair(caller_epoch: u64, listener_epoch: u64) -> (SrtConnection, SrtConnection) {
+        let caller_at = |t: u64| Timestamp::from_micros(caller_epoch + t);
+        let listener_at = |t: u64| Timestamp::from_micros(listener_epoch + t);
         let (group_peer, _) = connected_pair();
         let group_time = group_peer.group_time().expect("connected member clock");
         let mut caller = SrtConnection::new_caller(ConnectionOptions {
@@ -6892,47 +6897,136 @@ mod tests {
         caller.inherit_group_time(group_time);
         crate::test_support::wire_checker::check_pair(&mut caller, &mut listener);
         caller.connect(caller_at(0)).expect("caller starts");
-        // A symmetric 5 ms one-way delay each way.
         for round in 0..4 {
-            forward_handshake_round(&mut caller, &mut listener, listener_at(round * 10_000));
+            let at = round * 2 * GROUP_MEMBER_ONE_WAY_US;
+            forward_handshake_round(&mut caller, &mut listener, listener_at(at));
             forward_handshake_round(
                 &mut listener,
                 &mut caller,
-                caller_at(round * 10_000 + 5_000),
+                caller_at(at + GROUP_MEMBER_ONE_WAY_US),
             );
         }
         assert_eq!(caller.state(), ConnectionState::Connected);
         assert_eq!(listener.state(), ConnectionState::Connected);
         let _ = drain_outputs(&mut listener);
+        (caller, listener)
+    }
 
-        caller
-            .send(b"due", caller_at(100_000))
-            .expect("DATA queued");
-        let data = drain_datagrams(&mut caller)
+    /// The single DATA datagram `conn` queued.
+    fn sole_data_datagram(conn: &mut SrtConnection) -> Vec<u8> {
+        drain_datagrams(conn)
             .into_iter()
             .find(|bytes| matches!(SrtPacket::decode(bytes), Ok(SrtPacket::Data(_))))
-            .expect("DATA sent");
-        let arrival = 105_000;
+            .expect("DATA sent")
+    }
+
+    /// Run delivery at `now` and count the DATA events it released.
+    fn deliver_due(conn: &mut SrtConnection, now: Timestamp) -> usize {
+        conn.handle_timer(TimerId::DeliveryContinue, now)
+            .expect("delivery");
+        std::iter::from_fn(|| conn.poll_event())
+            .filter(|event| matches!(event, ConnectionEvent::DataReceived { .. }))
+            .count()
+    }
+
+    /// A bonded member's handshake timestamp is the group's age (libsrt
+    /// members share the group start time, group.h:768-782,
+    /// core.cpp:3621-3622), which can exceed a freshly started listener's
+    /// clock. libsrt derives the peer start on the steady clock and never
+    /// clamps it (core.cpp:2253/2490), so the TSBPD base must stay negative
+    /// here instead of saturating to zero and holding every packet for the
+    /// clock difference.
+    #[test]
+    fn handshake_timestamp_beyond_the_local_clock_keeps_tsbpd_on_schedule() {
+        const CALLER_EPOCH: u64 = 3_600_000_000;
+        const LISTENER_EPOCH: u64 = 1_000_000;
+        let latency = u64::from(ConnectionOptions::default().tsbpd_delay) * 1_000;
+        let (mut caller, mut listener) = group_member_pair(CALLER_EPOCH, LISTENER_EPOCH);
+
+        caller
+            .send(b"due", Timestamp::from_micros(CALLER_EPOCH + 100_000))
+            .expect("DATA queued");
+        let data = sole_data_datagram(&mut caller);
+        let arrival = LISTENER_EPOCH + 100_000 + GROUP_MEMBER_ONE_WAY_US;
         listener
-            .feed_recv_buf(&data, listener_at(arrival))
+            .feed_recv_buf(&data, Timestamp::from_micros(arrival))
             .expect("DATA accepted");
-        let delivered = |listener: &mut SrtConnection, now: Timestamp| {
-            listener
-                .handle_timer(TimerId::DeliveryContinue, now)
-                .expect("delivery");
-            std::iter::from_fn(|| listener.poll_event())
-                .filter(|event| matches!(event, ConnectionEvent::DataReceived { .. }))
-                .count()
-        };
         assert_eq!(
-            delivered(&mut listener, listener_at(arrival + latency - 1)),
+            deliver_due(&mut listener, Timestamp::from_micros(arrival + latency - 1)),
             0,
             "held for its latency"
         );
         assert_eq!(
-            delivered(&mut listener, listener_at(arrival + latency)),
+            deliver_due(&mut listener, Timestamp::from_micros(arrival + latency)),
             1,
             "delivered at its play time, not an hour late"
+        );
+    }
+
+    /// A DATA pause across the 32-bit timestamp wrap (71.6 minutes into the
+    /// sender's clock): no DATA is stamped in the 30 seconds before it, so
+    /// only the peer's idle KEEPALIVEs cover the wrap. libsrt feeds every
+    /// KEEPALIVE timestamp to `CTsbpdTime::updateBaseTime`
+    /// (core.cpp:12673); DATA after the pause must keep its latency instead
+    /// of playing on arrival as if it were 71.6 minutes old.
+    #[test]
+    fn keepalives_carry_the_tsbpd_wrap_across_a_data_pause() {
+        const WRAP: u64 = 1 << 32;
+        const CALLER_EPOCH: u64 = WRAP - 40_000_000;
+        const LISTENER_EPOCH: u64 = 1_000_000;
+        let latency = u64::from(ConnectionOptions::default().tsbpd_delay) * 1_000;
+        let (mut caller, mut listener) = group_member_pair(CALLER_EPOCH, LISTENER_EPOCH);
+        // The strict epoch rule compares raw 32-bit stamps and does not
+        // model the 2^32 wrap this test crosses on purpose, so the
+        // caller's checker stays out once the handshake is checked.
+        caller.wire_checker = None;
+        let arrival_of = |caller_us: u64| {
+            Timestamp::from_micros(
+                LISTENER_EPOCH + caller_us - CALLER_EPOCH + GROUP_MEMBER_ONE_WAY_US,
+            )
+        };
+
+        let before = CALLER_EPOCH + 100_000;
+        caller
+            .send(b"before", Timestamp::from_micros(before))
+            .expect("DATA queued");
+        let data = sole_data_datagram(&mut caller);
+        listener
+            .feed_recv_buf(&data, arrival_of(before))
+            .expect("DATA accepted");
+        assert_eq!(
+            deliver_due(&mut listener, arrival_of(before).add_micros(latency)),
+            1
+        );
+
+        let resume = WRAP + 61_000_000;
+        for at in (before + 1_000_000..resume).step_by(1_000_000) {
+            caller
+                .handle_timer(TimerId::Keepalive, Timestamp::from_micros(at))
+                .expect("keepalive timer");
+            for bytes in drain_datagrams(&mut caller) {
+                listener
+                    .feed_recv_buf(&bytes, arrival_of(at))
+                    .expect("KEEPALIVE accepted");
+            }
+        }
+
+        caller
+            .send(b"after", Timestamp::from_micros(resume))
+            .expect("DATA queued");
+        let data = sole_data_datagram(&mut caller);
+        listener
+            .feed_recv_buf(&data, arrival_of(resume))
+            .expect("DATA accepted");
+        assert_eq!(
+            deliver_due(&mut listener, arrival_of(resume).add_micros(latency - 1)),
+            0,
+            "post-wrap DATA keeps its latency"
+        );
+        assert_eq!(
+            deliver_due(&mut listener, arrival_of(resume).add_micros(latency)),
+            1,
+            "and plays at its deadline"
         );
     }
 

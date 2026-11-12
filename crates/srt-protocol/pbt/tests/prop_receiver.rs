@@ -67,6 +67,58 @@ fn wrap_around_run() -> impl Strategy<Value = (Vec<u32>, Vec<u32>)> {
     })
 }
 
+/// The peer's 32-bit timestamp wrap, in microseconds.
+const TIMESTAMP_WRAP: u64 = 1 << 32;
+/// libsrt and srt-rs send a KEEPALIVE after one idle second.
+const KEEPALIVE_INTERVAL_US: u64 = 1_000_000;
+
+/// What the receiver sees or is checked for at one local instant.
+#[derive(Debug, Clone, Copy)]
+enum WrapEvent {
+    Keepalive { timestamp: u32 },
+    Data { seq: u32, timestamp: u32 },
+    NotYet { seq: u32 },
+    Plays { seq: u32 },
+}
+
+/// A monotone sender clock (unwrapped, starting at `sender_start`) sends
+/// one packet per entry of `gaps` after the first; in every pause longer
+/// than a second it sends a KEEPALIVE each idle second. With no path delay
+/// or drift the receiver clock reads `local_epoch + (t - sender_start)` at
+/// sender time `t`. Returns the time-ordered stream of arrivals plus, per
+/// packet, a check 1 µs before and exactly at arrival + `delay_us`.
+fn wrap_crossing_events(
+    sender_start: u64,
+    local_epoch: u64,
+    gaps: &[u64],
+    delay_us: u64,
+) -> Vec<(u64, WrapEvent)> {
+    let local = |t: u64| local_epoch + (t - sender_start);
+    let mut events = Vec::new();
+    let mut sent = sender_start;
+    for (seq, gap) in std::iter::once(0).chain(gaps.iter().copied()).enumerate() {
+        let seq = seq as u32;
+        let previous = sent;
+        sent += gap;
+        events.extend(
+            (1..)
+                .map(|idle| previous + idle * KEEPALIVE_INTERVAL_US)
+                .take_while(|&at| at < sent)
+                .map(|at| {
+                    let timestamp = at as u32;
+                    (local(at), WrapEvent::Keepalive { timestamp })
+                }),
+        );
+        let timestamp = sent as u32;
+        events.push((local(sent), WrapEvent::Data { seq, timestamp }));
+        let play = local(sent) + delay_us;
+        events.push((play - 1, WrapEvent::NotYet { seq }));
+        events.push((play, WrapEvent::Plays { seq }));
+    }
+    events.sort_by_key(|&(at, event)| (at, matches!(event, WrapEvent::Plays { .. })));
+    events
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
@@ -843,6 +895,50 @@ proptest! {
             prop_assert!(buf.pop_ready(Timestamp::from_micros(play - 1)).is_none());
         }
         prop_assert!(buf.pop_ready(Timestamp::from_micros(play)).is_some());
+    }
+
+    /// A live sender crossing the 32-bit wrap with arbitrary DATA pauses,
+    /// covered only by its idle KEEPALIVEs: every packet still plays
+    /// exactly `delay` after it arrived, whether the wrap fell inside a
+    /// pause, while a pre-wrap packet was held for a latency of up to
+    /// 65 s, or both.
+    #[test]
+    fn tsbpd_play_time_survives_the_wrap_across_keepalive_covered_pauses(
+        lead in 1u64..120_000_000,
+        local_epoch in 0u64..10_000_000_000,
+        gaps in prop::collection::vec(
+            prop_oneof![1_000u64..121_000, 121_000u64..100_000_000],
+            1..40,
+        ),
+        delay_ms in prop_oneof![20u16..2_000, 30_000u16..65_000],
+    ) {
+        let sender_start = TIMESTAMP_WRAP - lead;
+        let base = local_epoch as i64 - sender_start as i64;
+        let mut buf =
+            ReceiverBuffer::new(0, delay_ms, Timestamp::from_micros(local_epoch), base);
+        let events =
+            wrap_crossing_events(sender_start, local_epoch, &gaps, u64::from(delay_ms) * 1_000);
+        for (at, event) in events {
+            let now = Timestamp::from_micros(at);
+            match event {
+                WrapEvent::Keepalive { timestamp } => buf.handle_keepalive(timestamp),
+                WrapEvent::Data { seq, timestamp } => {
+                    buf.receive(make_packet(seq, timestamp), now);
+                }
+                WrapEvent::NotYet { seq } => prop_assert!(
+                    buf.pop_ready(now).is_none(),
+                    "packet {} played early at {}",
+                    seq,
+                    at
+                ),
+                WrapEvent::Plays { seq } => prop_assert_eq!(
+                    buf.pop_ready(now).map(|packet| packet.sequence_number),
+                    Some(seq),
+                    "packet did not play at {}",
+                    at
+                ),
+            }
+        }
     }
 
     /// DROPREQ removes exactly its circular interval, preserves every packet

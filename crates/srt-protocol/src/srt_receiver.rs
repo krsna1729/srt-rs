@@ -533,21 +533,22 @@ const MAX_TIMESTAMP: u64 = 0xFFFF_FFFF;
 /// TSBPD wraparound period: begins 30 seconds before MAX_TIMESTAMP is reached.
 const WRAPPING_PERIOD_START: u64 = MAX_TIMESTAMP - 30_000_000;
 
-/// TSBPD wraparound period: ends once the timestamp is within this range.
+/// TSBPD wraparound period: a post-wrap timestamp at or above this ends it.
+/// libsrt's `CTsbpdTime::updateBaseTime` ends it only within [30 s, 60 s];
+/// this receiver accepts any post-wrap timestamp up to
+/// `WRAPPING_CARRYOVER_BELOW`, where the carry it folds into the base is
+/// the one `packet_base_time` was already adding, so a run of [30 s, 60 s]
+/// packets that was dropped, skipped or never sent cannot leave the period
+/// open past the carryover boundary.
 const WRAPPING_PERIOD_END_MIN: u64 = 30_000_000;
-
-/// TSBPD wraparound period: the inclusive upper bound at which the timestamp
-/// ends the period, matching libsrt's `CTsbpdTime::updateBaseTime`.
-const WRAPPING_PERIOD_END_MAX: u64 = 60_000_000;
 
 /// During the wraparound period a timestamp below this is post-wrap and gets
 /// the `MAX_TIMESTAMP + 1` carryover; one at or above it is pre-wrap. Half
 /// the range separates the two with margin: the period starts at
 /// `WRAPPING_PERIOD_START`, so pre-wrap packets still buffered then are within
-/// one latency of it, and it ends when a post-wrap packet of at most
-/// `WRAPPING_PERIOD_END_MAX` is delivered, so post-wrap timestamps stay within
-/// one latency of that. libsrt ends the period on receipt and can use 30 s;
-/// this receiver ends it on delivery, so the post-wrap side reaches past 60 s.
+/// one latency of it, and it ends at the first delivered post-wrap packet or
+/// peer KEEPALIVE stamped at least `WRAPPING_PERIOD_END_MIN`, so post-wrap
+/// timestamps stay within one latency of that.
 const WRAPPING_CARRYOVER_BELOW: u64 = MAX_TIMESTAMP.div_ceil(2);
 
 /// Tracks ACK send times and acknowledged positions (for RTT calculation
@@ -1351,6 +1352,44 @@ impl ReceiverBuffer {
         }
     }
 
+    /// Feed a peer KEEPALIVE's timestamp to the TSBPD wrap tracking, as
+    /// libsrt feeds it to `CTsbpdTime::updateBaseTime` (core.cpp:12673): a
+    /// sender idle across the 32-bit wrap stamps no DATA near it, and
+    /// without this the first DATA after the pause plays ~71.6 minutes
+    /// early, or the period opened before the pause never closes.
+    ///
+    /// Unlike libsrt, a KEEPALIVE does not close the period while a
+    /// pre-wrap packet is still held or a loss is still unresolved (either
+    /// could be pre-wrap): closing folds the carry into the base, which
+    /// would push such a packet ~71.6 minutes late. Delivery or a later
+    /// KEEPALIVE closes it once they are gone.
+    pub fn handle_keepalive(&mut self, timestamp: u32) {
+        if !self.tsbpd_enabled {
+            return;
+        }
+        if !self.wrapping_period_active {
+            self.check_tsbpd_wrap(timestamp);
+            return;
+        }
+        let pre_wrap_held = self
+            .oldest_retained_seq
+            .and_then(|seq| self.packets.get(seq))
+            .is_some_and(|entry| u64::from(entry.timestamp) >= WRAPPING_CARRYOVER_BELOW);
+        if !pre_wrap_held && self.loss_list.is_empty() {
+            self.end_wrapping_period_at(timestamp);
+        }
+    }
+
+    /// Close an open wrap period when post-wrap `timestamp` is past
+    /// `WRAPPING_PERIOD_END_MIN`, folding the carry into the base.
+    fn end_wrapping_period_at(&mut self, timestamp: u32) {
+        if (WRAPPING_PERIOD_END_MIN..WRAPPING_CARRYOVER_BELOW).contains(&u64::from(timestamp)) {
+            self.tsbpd_time_base += MAX_TIMESTAMP as i64 + 1;
+            self.wrap_generation += 1;
+            self.wrapping_period_active = false;
+        }
+    }
+
     /// Classify the newly exposed interval ending at received packet `seq`.
     ///
     /// The frontier makes the cost proportional to sequence positions exposed
@@ -1551,18 +1590,14 @@ impl ReceiverBuffer {
         // provably identical whichever side of the mutation it's read on.
         let source_time = self.source_time(&entry);
 
-        // Detect the end of the TSBPD wraparound period.
-        // Per spec (draft-sharabayko-srt.md, #tsbpd-time-base section):
-        // "ends once the packet with timestamp within (30, 60) seconds interval is delivered".
-        // libsrt treats the upper endpoint as inclusive, which we mirror for
-        // trace-level compatibility.
+        // Detect the end of the TSBPD wraparound period. The spec
+        // (draft-sharabayko-srt.md, #tsbpd-time-base) and libsrt end it on a
+        // packet stamped within [30 s, 60 s]; any later post-wrap packet
+        // below `WRAPPING_CARRYOVER_BELOW` ends it here too (see
+        // `WRAPPING_PERIOD_END_MIN`), since that run may have been dropped
+        // or never sent.
         if self.tsbpd_enabled && self.wrapping_period_active {
-            let ts = entry.timestamp as u64;
-            if (WRAPPING_PERIOD_END_MIN..=WRAPPING_PERIOD_END_MAX).contains(&ts) {
-                self.tsbpd_time_base += MAX_TIMESTAMP as i64 + 1;
-                self.wrap_generation += 1;
-                self.wrapping_period_active = false;
-            }
+            self.end_wrapping_period_at(entry.timestamp);
         }
 
         Some((
@@ -4792,15 +4827,16 @@ mod tests {
 
     #[test]
     fn wrapping_period_ends_at_libsrt_inclusive_upper_boundary() {
+        const LIBSRT_END_MAX: u64 = 60_000_000;
         let start = Timestamp::from_micros(0);
         let mut buf = ReceiverBuffer::new(1000, 120, start, 0);
         let now = Timestamp::from_micros(1_000_000);
         buf.receive(make_packet(1000, WRAPPING_PERIOD_START as u32), now);
-        buf.receive(make_packet(1001, WRAPPING_PERIOD_END_MAX as u32), now);
+        buf.receive(make_packet(1001, LIBSRT_END_MAX as u32), now);
 
         // The wrapped 60-second packet is deliverable after its adjusted
         // timestamp plus the configured TSBPD delay.
-        let late = Timestamp::from_micros(MAX_TIMESTAMP + 1 + WRAPPING_PERIOD_END_MAX + 120_000);
+        let late = Timestamp::from_micros(MAX_TIMESTAMP + 1 + LIBSRT_END_MAX + 120_000);
         assert_eq!(
             buf.pop_ready(late).map(|packet| packet.sequence_number),
             Some(1000)
@@ -4812,6 +4848,133 @@ mod tests {
         assert!(
             !buf.wrapping_period_active,
             "the 60-second endpoint closes the wrapping period"
+        );
+    }
+
+    /// The wrap period must end even when no delivered packet is stamped
+    /// in [30 s, 60 s]: here that run was dropped by DROPREQ, as it could
+    /// be by a forced advance or simply never sent during a DATA pause.
+    /// Otherwise the carry stops at `WRAPPING_CARRYOVER_BELOW` and every
+    /// later packet plays ~71.6 minutes early, without its jitter buffer.
+    #[test]
+    fn wrap_period_ends_on_a_later_post_wrap_delivery() {
+        let at = Timestamp::from_micros;
+        let wrap = MAX_TIMESTAMP + 1;
+        let mut buf = ReceiverBuffer::new(1000, 120, at(0), 0);
+        let pre = MAX_TIMESTAMP - 10_000_000;
+        buf.receive(make_packet(1000, pre as u32), at(pre));
+        assert!(buf.pop_ready(at(pre + 120_000)).is_some());
+        assert!(buf.wrapping_period_active);
+
+        buf.receive(make_packet(1001, 40_000_000), at(wrap + 40_000_000));
+        buf.drop_range(1001, 1001)
+            .expect("DROPREQ inside the window");
+        buf.receive(make_packet(1002, 61_000_000), at(wrap + 61_000_000));
+        assert_eq!(
+            buf.pop_ready(at(wrap + 61_120_000))
+                .map(|packet| packet.sequence_number),
+            Some(1002)
+        );
+
+        let late = WRAPPING_CARRYOVER_BELOW + 1;
+        buf.receive(make_packet(1003, late as u32), at(wrap + late));
+        assert!(
+            buf.pop_ready(at(wrap + late + 119_999)).is_none(),
+            "keeps its latency"
+        );
+        assert!(buf.pop_ready(at(wrap + late + 120_000)).is_some());
+    }
+
+    /// A sender idle across the wrap stamps only KEEPALIVEs near it: one
+    /// past `WRAPPING_PERIOD_START` opens the period and one at 35 s closes
+    /// it, so DATA resuming even past `WRAPPING_CARRYOVER_BELOW` (a pause
+    /// of over 35 minutes) keeps its latency.
+    #[test]
+    fn keepalives_open_and_close_the_wrap_period_during_a_data_pause() {
+        let at = Timestamp::from_micros;
+        let wrap = MAX_TIMESTAMP + 1;
+        let mut buf = ReceiverBuffer::new(1000, 120, at(0), 0);
+        let pre = MAX_TIMESTAMP - 40_000_000;
+        buf.receive(make_packet(1000, pre as u32), at(pre));
+        assert!(buf.pop_ready(at(pre + 120_000)).is_some());
+        assert!(!buf.wrapping_period_active);
+
+        buf.handle_keepalive((MAX_TIMESTAMP - 20_000_000) as u32);
+        assert!(buf.wrapping_period_active, "a pre-wrap KEEPALIVE opens it");
+        buf.handle_keepalive(35_000_000);
+        assert!(
+            !buf.wrapping_period_active,
+            "a post-wrap KEEPALIVE closes it"
+        );
+
+        let resume = WRAPPING_CARRYOVER_BELOW + 1;
+        buf.receive(make_packet(1001, resume as u32), at(wrap + resume));
+        assert!(
+            buf.pop_ready(at(wrap + resume + 119_999)).is_none(),
+            "keeps its latency"
+        );
+        assert!(buf.pop_ready(at(wrap + resume + 120_000)).is_some());
+    }
+
+    /// libsrt closes the period on any [30 s, 60 s] KEEPALIVE. With a 60 s
+    /// latency a pre-wrap packet can still be buffered then, and folding
+    /// the carry into the base would hold it ~71.6 minutes: the KEEPALIVE
+    /// must wait until it is delivered.
+    #[test]
+    fn keepalive_keeps_the_wrap_period_open_while_a_pre_wrap_packet_is_held() {
+        let at = Timestamp::from_micros;
+        let latency = 60_000_000;
+        let mut buf = ReceiverBuffer::new(1000, 60_000, at(0), 0);
+        let pre = MAX_TIMESTAMP - 5_000_000;
+        buf.receive(make_packet(1000, pre as u32), at(pre));
+        assert!(buf.wrapping_period_active);
+
+        buf.handle_keepalive(35_000_000);
+        assert!(buf.pop_ready(at(pre + latency - 1)).is_none());
+        assert!(
+            buf.pop_ready(at(pre + latency)).is_some(),
+            "the held pre-wrap packet plays at its own deadline"
+        );
+        buf.handle_keepalive(56_000_000);
+        assert!(
+            !buf.wrapping_period_active,
+            "and then a KEEPALIVE closes it"
+        );
+    }
+
+    /// An unresolved loss may be a pre-wrap packet still to be
+    /// retransmitted: a KEEPALIVE must not close the period under it even
+    /// when the buffered head is already post-wrap.
+    #[test]
+    fn keepalive_keeps_the_wrap_period_open_while_a_loss_is_unresolved() {
+        let at = Timestamp::from_micros;
+        let wrap = MAX_TIMESTAMP + 1;
+        let latency = 60_000_000;
+        let mut buf = ReceiverBuffer::new(1000, 60_000, at(0), 0);
+        let pre = MAX_TIMESTAMP - 5_000_000;
+        buf.receive(make_packet(1000, pre as u32), at(pre));
+        assert!(
+            buf.receive(make_packet(1002, 1_000_000), at(wrap + 1_000_000))
+                .is_some(),
+            "1001 is lost"
+        );
+        assert_eq!(
+            buf.pop_ready(at(pre + latency))
+                .map(|packet| packet.sequence_number),
+            Some(1000)
+        );
+
+        buf.handle_keepalive(56_000_000);
+        let retransmitted = pre + 1_000_000;
+        buf.receive(
+            make_packet(1001, retransmitted as u32),
+            at(wrap + 57_000_000),
+        );
+        assert_eq!(
+            buf.pop_ready(at(retransmitted + latency))
+                .map(|packet| packet.sequence_number),
+            Some(1001),
+            "the retransmitted pre-wrap packet plays at its own deadline"
         );
     }
 

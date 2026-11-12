@@ -934,3 +934,16 @@ Each item below was reproduced by a regression test that failed on
   base on the steady clock and never clamps (`core.cpp:2253/2490`). The base
   is now an `i64` through delivery, source-time, drift and wrap arithmetic;
   only the final instant is floored at the epoch.
+- TSBPD wrap across a DATA pause (R2). The receiver started the 32-bit
+  wrap period only on DATA stamped in the last 30 s before the wrap and
+  ended it only on delivering DATA stamped within [30 s, 60 s] after it. A
+  sender idle across the wrap stamps only KEEPALIVEs there, which were
+  ignored, so the first DATA after the pause played on arrival (~71.6
+  minutes early); and a period whose [30 s, 60 s] run was dropped or never
+  sent stayed open, so DATA past half the range played early. libsrt feeds
+  KEEPALIVE timestamps to `updateBaseTime` (`core.cpp:12673`). KEEPALIVEs
+  now open and close the period, and any delivered post-wrap packet below
+  half the range closes it. A KEEPALIVE does not close it while a pre-wrap
+  packet is held (a latency of up to 65 s allows that) or a loss is
+  unresolved, where libsrt's unconditional close would hold that packet
+  ~71.6 minutes.
