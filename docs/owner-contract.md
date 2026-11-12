@@ -263,7 +263,11 @@ application only routes them.** After every service visit it drains
   application. Member `to` joins the leg to its group, drives it on that
   socket, and reports it like any other listener peer. One bonded publisher
   therefore stays one stream. If the socket cannot be made, the leg stays
-  where it is, as under `Never`.
+  where it is, as under `Never`. A connected socket receives only its leg's
+  4-tuple, so a handshake arriving there never creates a peer: a CONCLUSION
+  passes only when it belongs to a live peer (a retransmission that peer
+  answers), and any other is dropped and counted as `invalid_datagrams`.
+  The socket closes when the last peer at its address leaves the table.
 * a slot release. Members allocate socket IDs from disjoint slot residues,
   so a relocated leg keeps its ID on its new member. The source member holds
   the leg's slot until the new member reports that the session ended.

@@ -1106,7 +1106,8 @@ fn drain_side_recv(
 
 /// Drain the promoted sockets that reported readiness, through the
 /// listener's admission path (the table demultiplexes by socket ID, so a
-/// datagram is handled exactly as if it had reached the listener socket).
+/// datagram is handled as if it had reached the listener socket, except that
+/// it never creates a peer: `ListenerRouting::admit_private_bytes`).
 fn drain_promoted_recv(side: &mut OwnerListenerSide, now: Timestamp) -> io::Result<()> {
     let mut ready = std::mem::take(&mut side.promoted.ready);
     let mut first_error = None;
@@ -1134,7 +1135,7 @@ fn drain_promoted_recv(side: &mut OwnerListenerSide, now: Timestamp) -> io::Resu
             now,
             |addr, data, at| {
                 let Some(peer) = addr else { return };
-                routing.admit_bytes(peers, resolver, peer, data, at, admission, telemetry);
+                routing.admit_private_bytes(peers, resolver, peer, data, at, admission, telemetry);
             },
         ) {
             // A connected socket reports an ICMP port-unreachable as

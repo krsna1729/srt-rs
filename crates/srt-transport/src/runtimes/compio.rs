@@ -1430,8 +1430,9 @@ pub struct ListenerSide {
     /// each. Preallocated; no per-call allocation.
     rx_batch: crate::RecvBatch,
     /// Application admission policy (see [`crate::ListenerAdmissionResolver`]),
-    /// stored once per listener. Both receive paths reach it through
-    /// [`admit_listener_datagram`] and nowhere else.
+    /// stored once per listener. Both listener-socket receive paths reach it
+    /// through [`admit_listener_datagram`]; promoted sockets through
+    /// `ListenerRouting::admit_private`, which never creates a peer.
     resolver: Option<crate::ListenerAdmissionResolver>,
     /// Layout membership and the transfers owed to other members.
     routing: ListenerRouting,
@@ -1577,8 +1578,8 @@ use crate::owner_layout::{
     listener_socket_bytes, listener_table,
 };
 
-/// The ONE place a listener datagram enters admission, whichever receive
-/// datapath (readiness or managed multishot) delivered it.
+/// The ONE place a listener-socket datagram enters admission, whichever
+/// receive datapath (readiness or managed multishot) delivered it.
 #[allow(clippy::too_many_arguments)]
 fn admit_listener_datagram(
     table: &mut PeerTable,
@@ -5455,15 +5456,14 @@ impl Owner {
                         ..
                     } = listener;
                     Self::charge_rx_batch(rx_batch, received, report, |peer, datagram| {
-                        admit_listener_datagram(
+                        routing.admit_private(
                             table,
                             resolver.as_ref(),
-                            options,
-                            telemetry,
                             peer,
                             datagram,
                             now,
-                            routing,
+                            options,
+                            telemetry,
                         );
                     });
                     if received < requested {

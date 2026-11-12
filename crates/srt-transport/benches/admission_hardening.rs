@@ -639,6 +639,37 @@ fn bench_established_data_progression(c: &mut Criterion) {
     group.finish();
 }
 
+/// The gate every datagram from a promoted session's connected socket passes
+/// before admission: DATA and non-handshake control pass on their first two
+/// bytes; a CONCLUSION naming no live peer is decoded and refused.
+fn bench_promoted_socket_gate(c: &mut Criterion) {
+    let options = AdmissionOptions::basic(7, 120, true);
+    let telemetry = IngressTelemetry::new();
+    let peer = SocketAddr::from(([127, 0, 0, 1], 10_000));
+    let mut table = PeerTable::new();
+    let foreign = conclusion_for(&mut table, peer, 7, &options, &telemetry);
+    let mut data = vec![0u8; 1_332];
+    data[15] = 1;
+    let mut keepalive = vec![0u8; 16];
+    keepalive[..2].copy_from_slice(&[0x80, 0x01]);
+    let mut group = c.benchmark_group("promoted_socket_gate");
+    group.throughput(Throughput::Elements(1));
+    for (name, datagram, admitted) in [
+        ("data", &data, true),
+        ("keepalive", &keepalive, true),
+        ("foreign_conclusion", &foreign, false),
+    ] {
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                let pass = table
+                    .admits_from_private_socket_for_bench(black_box(peer), black_box(datagram));
+                assert_eq!(pass, admitted);
+            });
+        });
+    }
+    group.finish();
+}
+
 fn bench_ready_queue_scaling(c: &mut Criterion) {
     let mut group = c.benchmark_group("ready_queue_scaling");
     let options = AdmissionOptions::basic(100, 120, true);
@@ -1032,6 +1063,7 @@ criterion_group!(
     bench_established_data_progression,
     bench_ready_queue_scaling,
     bench_dense_due_index_scaling,
-    bench_generic_due_index_scaling
+    bench_generic_due_index_scaling,
+    bench_promoted_socket_gate
 );
 criterion_main!(benches);
