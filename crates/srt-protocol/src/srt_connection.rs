@@ -2085,9 +2085,9 @@ impl SrtConnection {
     /// membership and FIFO ordering are untouched, and a follow-up visit
     /// picks up right where this one left off.
     ///
-    /// Paced: each retransmission takes a slot of the send-period schedule
-    /// new data uses (`SenderBuffer::retransmit_pacing_wait`), so a visit
-    /// also stops when the schedule has no slot left at `now`.
+    /// Paced: each retransmission takes a slot of the retransmission
+    /// schedule (`SenderBuffer::retransmit_pacing_wait`), so a visit also
+    /// stops when that schedule has no slot left at `now`.
     pub fn process_retransmit(&mut self, now: Timestamp) {
         let dest_socket_id = self.peer_socket_id;
         // This function only *drains* what is already queued: whatever put a
@@ -7801,9 +7801,7 @@ mod tests {
         // *retransmit* path, not the original transmission.
         while caller.poll_output().unwrap().is_some() {}
 
-        // Simulate the peer NAK-ing every one of them in one range, once the
-        // pacing slots those sends took have passed (retransmissions share
-        // that schedule).
+        // Simulate the peer NAK-ing every one of them in one range.
         let first_visit = Timestamp::from_micros(10_000);
         let last_seq = first_seq.wrapping_add(SENT as u32 - 1);
         caller
@@ -8324,10 +8322,11 @@ mod tests {
         assert_eq!(caller.sender_stats().expect("sender").total_lost, 128);
     }
 
-    /// Retransmissions share the send-period schedule with new data, as
-    /// libsrt's `packData` advances `m_tsNextSendTime` for every packet it
-    /// sends: one window-wide NAK goes out at the configured rate (after at
-    /// most one visit's burst), not as fast as the continuation can run.
+    /// Retransmissions are paced at the configured bandwidth, as libsrt's
+    /// `packData` paces every packet it sends: one window-wide NAK goes out
+    /// as one visit's burst (32, the missed slots a retransmission may
+    /// repay), then one per pacing period -- neither faster than the
+    /// configured rate nor slower.
     #[test]
     fn retransmissions_are_paced_at_the_configured_bandwidth() {
         const PAYLOAD: usize = 1_000;
@@ -8349,19 +8348,72 @@ mod tests {
         let retransmitted = drain_retransmissions(&mut caller, &mut at);
         assert_eq!(retransmitted.len(), 64, "every loss is still repaired");
 
-        // The pacing period is at least one header plus payload at the
-        // configured rate.
-        let min_period = (PAYLOAD + SRT_HEADER_SIZE) as u64 * 1_000_000 / BYTES_PER_SECOND;
-        for window in [0, 50_000, 200_000] {
-            let within = retransmitted
+        let burst = MAX_RETRANSMITS_PER_VISIT;
+        assert!(
+            retransmitted[..burst]
                 .iter()
-                .filter(|&&(emitted, _)| emitted - start <= window)
-                .count() as u64;
-            assert!(
-                within <= MAX_RETRANSMITS_PER_VISIT as u64 + window / min_period + 1,
-                "{within} retransmissions within {window} us"
+                .all(|&(emitted, _)| emitted == start),
+            "one visit's burst goes at once: {:?}",
+            &retransmitted[..=burst]
+        );
+        // The pacing period is one header plus the average payload at the
+        // configured rate: the payloads sent are 1000 bytes, and the average
+        // starts no larger than a full 1456-byte payload.
+        let min_period = (PAYLOAD + SRT_HEADER_SIZE) as u64 * 1_000_000 / BYTES_PER_SECOND;
+        let max_period = (1_456 + SRT_HEADER_SIZE) as u64 * 1_000_000 / BYTES_PER_SECOND;
+        let period = retransmitted[burst].0 - start;
+        assert!(
+            (min_period..=max_period).contains(&period),
+            "period {period} us"
+        );
+        for (index, &(emitted, _)) in retransmitted.iter().enumerate().skip(burst) {
+            assert_eq!(
+                emitted,
+                start + period * (index - burst + 1) as u64,
+                "retransmission {index} leaves on its pacing slot"
             );
         }
+    }
+
+    /// New data sent through the unpaced `send` path (what an application
+    /// calls after only `can_send`) pushes the new-data pacing schedule one
+    /// period ahead per packet. Retransmissions keep their own schedule, so
+    /// a NAK right after a burst of N such packets is answered at once, not
+    /// N periods later (at 100 kB/s, 64 packets are about 0.65 s, past any
+    /// live latency).
+    #[test]
+    fn a_nak_right_after_an_unpaced_burst_is_answered_at_once() {
+        const PAYLOAD: usize = 1_000;
+        let (mut caller, _listener) = connected_pair();
+        caller
+            .sender
+            .as_mut()
+            .expect("sender")
+            .set_max_bandwidth(100_000);
+        let start = 2_000_000;
+        let first = caller.next_sequence_number().expect("connected sender");
+        for _ in 0..64 {
+            caller
+                .send(&[0u8; PAYLOAD], Timestamp::from_micros(start))
+                .expect("send admits the payload");
+        }
+        drain_outputs(&mut caller);
+        assert!(
+            !caller.can_send_with_pacing(Timestamp::from_micros(start)),
+            "the burst ran the new-data schedule ahead"
+        );
+
+        caller
+            .feed_recv_buf(
+                &nak_datagram(caller.socket_id(), &[first, first]),
+                Timestamp::from_micros(start),
+            )
+            .expect("a credible NAK is accepted");
+        let mut at = start;
+        assert_eq!(
+            drain_retransmissions(&mut caller, &mut at),
+            [(start, first)]
+        );
     }
 
     /// A cumulative ACK of a large flight retires it at once and leaves only

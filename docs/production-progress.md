@@ -897,9 +897,18 @@ Each item below was reproduced by a regression test that failed on
   A position retransmitted less than the sender's smoothed RTT before a
   report arrives is no longer queued (the peer sent that report before the
   retransmission could reach it; its next periodic NAK re-reports and
-  re-sends), and retransmissions take slots of the new-data pacing
-  schedule, repaying at most one visit (32) of missed slots, as libsrt's
-  `packData` does. The stamp sits in `SentPacket` padding (still 64 B).
+  re-sends), and retransmissions are paced at the configured bandwidth,
+  repaying at most one visit (32) of missed slots. The stamp sits in
+  `SentPacket` padding (still 64 B).
+- Retransmissions behind an unpaced burst (review of the above). They first
+  took slots of the new-data schedule, as libsrt's `packData` does, but the
+  unpaced `send`/`send_shared` paths (Restream's egress sends after only
+  `can_send`) push that schedule one period ahead per packet without
+  waiting for it, so a NAK right after a burst of N packets waited N
+  periods: 879 ms for 64 packets at 100 kB/s. Retransmissions now keep a
+  schedule of their own (`retransmit_due`) and that NAK is answered at
+  once. With paced new data the two schedules together allow up to twice
+  the configured rate.
 - `total_lost` counted repeats (R6). It counts positions a report newly
   queues, so a held-back repeat adds nothing (3,392 before, 64 after), as
   libsrt counts newly inserted losses (core.cpp:9194, 9218).

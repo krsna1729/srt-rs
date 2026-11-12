@@ -407,6 +407,12 @@ pub struct SenderBuffer {
     /// This is a *deadline*, not a record of the last send. It was previously
     /// named `last_send_time`, which described neither its value nor its use.
     next_send_due: Option<Timestamp>,
+    /// Instant at which the next retransmission becomes eligible (0 before
+    /// the first): the retransmissions' own pacing schedule (see
+    /// [`Self::retransmit_pacing_wait`]). Kept apart from `next_send_due`,
+    /// which the unpaced `send` paths push one period ahead per packet
+    /// without waiting for it, so a burst of new data cannot delay a repair.
+    retransmit_due: Timestamp,
     packet_send_period_overridden: bool,
     /// When set, a late send keeps the ideal slot even if that slot is already
     /// in the past, so a caller looping while eligible can repay missed
@@ -609,6 +615,7 @@ impl SenderBuffer {
             latency_us: latency_ms as u64 * 1000,
             packet_send_period: 0,
             next_send_due: None,
+            retransmit_due: Timestamp::from_micros(0),
             packet_send_period_overridden: false,
             repay_pacing_debt: false,
             total_sent: 0,
@@ -1601,22 +1608,27 @@ impl SenderBuffer {
         None
     }
 
-    /// Microseconds until the pacing schedule has a slot for a
-    /// retransmission (0: one may go now).
+    /// Microseconds until the retransmission schedule has a slot (0: one
+    /// may go now).
     ///
-    /// Retransmissions share the send-period schedule with new data, as
-    /// libsrt's `CUDT::packData` (core.cpp:10250-10413) advances
-    /// `m_tsNextSendTime` for every packet it sends, retransmissions
-    /// included: a peer's loss reports cannot make this sender transmit
-    /// faster than its configured bandwidth.
+    /// Retransmissions are paced at the configured bandwidth, so a peer's
+    /// loss reports cannot make them leave faster than that; libsrt's
+    /// `CUDT::packData` (core.cpp:10250-10413) paces every packet it sends,
+    /// retransmissions included. They keep their own schedule rather than
+    /// the new-data one (`next_send_due`): `send`/`send_shared` do not wait
+    /// for that one and push it one period ahead per packet, so an unpaced
+    /// burst of N packets would hold the first retransmission back N
+    /// periods (at 6 Mbit/s, a 300-packet I-frame is about 0.5 s). With
+    /// paced new data the two schedules together allow up to twice the
+    /// configured rate.
     pub fn retransmit_pacing_wait(&self, now: Timestamp) -> u64 {
         if self.packet_send_period == 0 {
             return 0;
         }
-        self.next_send_due.map_or(0, |due| due - now)
+        self.retransmit_due - now
     }
 
-    /// Charge one retransmission at `now` to the pacing schedule.
+    /// Charge one retransmission at `now` to the retransmission schedule.
     ///
     /// Unlike a first transmission (see [`Self::record_send_time`]), a
     /// retransmission keeps the schedule's phase and repays missed slots,
@@ -1628,16 +1640,13 @@ impl SenderBuffer {
     fn record_retransmit_send_time(&mut self, now: Timestamp) {
         let period = self.packet_send_period;
         if period == 0 {
-            self.next_send_due = Some(now);
             return;
         }
         let oldest_slot = now
             .as_micros()
             .saturating_sub(period.saturating_mul(RETRANSMIT_PACING_BURST - 1));
-        let slot = self
-            .next_send_due
-            .map_or(oldest_slot, |due| due.as_micros().max(oldest_slot));
-        self.next_send_due = Some(Timestamp::from_micros(slot.saturating_add(period)));
+        let slot = self.retransmit_due.as_micros().max(oldest_slot);
+        self.retransmit_due = Timestamp::from_micros(slot.saturating_add(period));
     }
 
     /// How long after a packet's retransmission a peer loss report naming it
@@ -3521,8 +3530,11 @@ mod tests {
         // instead of a walk of its tombstones -- 32 bytes, deliberate. A
         // ninth added the retransmission list's two compaction cursors, so
         // dropping stale entries is a bounded step per call instead of a
-        // whole-list pass -- 16 bytes, deliberate.
-        assert!(inline_bytes <= 464);
+        // whole-list pass -- 16 bytes, deliberate. A tenth added
+        // `retransmit_due` (a `Timestamp`), the retransmissions' own pacing
+        // schedule, so an unpaced burst of new data cannot hold a repair
+        // back -- 8 bytes, deliberate.
+        assert!(inline_bytes <= 472);
         assert_eq!(window.heap_bytes(), 8_320);
     }
 
