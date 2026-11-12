@@ -88,10 +88,11 @@ mod srt_rs {
     pub const RETIRED_RECEIVE_KEYS: usize = 4;
     /// HARDENING: independently bounded retired transmit identities.
     pub const RETIRED_TRANSMIT_KEYS: usize = 4;
-    /// HARDENING: fresh-salt KEK derivations available at once per
-    /// connection, and the interval that restores one.
+    /// HARDENING: fresh-salt KEK derivations a connection allows in its
+    /// lifetime; never refilled.
     pub const DERIVATION_BURST: u64 = 2;
-    pub const DERIVATION_REFILL_MICROS: u64 = 1_000_000;
+    /// How far a `Wait` step moves time; it restores no derivation.
+    pub const WAIT_MICROS: u64 = 1_000_000;
     /// RETRY: an unanswered KMREQ is resent every second, this many times,
     /// then the connection closes. (libsrt: 1.5 x SRTT, ten times.)
     pub const RETRY_INTERVAL_MICROS: u64 = 1_000_000;
@@ -179,7 +180,7 @@ enum Step {
     Kmrsp(Response),
     /// This many times: past the retry interval, then the ACK timer.
     Ticks(u8),
-    /// Past the derivation refill interval.
+    /// One second passes, which restores no derivation.
     Wait,
     SwitchThreshold,
     LocalData,
@@ -231,7 +232,6 @@ struct Model {
     retired: VecDeque<Vec<u8>>,
     rx_kek_salt: Option<[u8; 16]>,
     tokens: u64,
-    tokens_at: Option<u64>,
     tx: [Vec<u8>; 2],
     tx_retired: VecDeque<Vec<u8>>,
     tx_postannounce: bool,
@@ -254,7 +254,6 @@ impl Model {
             retired: VecDeque::from([initial.clone()]),
             rx_kek_salt: None,
             tokens: srt_rs::DERIVATION_BURST,
-            tokens_at: None,
             tx: [directional_sek, vec![0; len]],
             tx_retired: VecDeque::from([initial]),
             tx_postannounce: false,
@@ -270,14 +269,8 @@ impl Model {
         *salt != SESSION_SALT && self.rx_kek_salt != Some(*salt)
     }
 
-    /// HARDENING: the derivation token bucket.
-    fn take_token(&mut self, now: u64) -> bool {
-        let at = *self.tokens_at.get_or_insert(now);
-        let restored = (now - at) / srt_rs::DERIVATION_REFILL_MICROS;
-        if restored > 0 {
-            self.tokens = (self.tokens + restored).min(srt_rs::DERIVATION_BURST);
-            self.tokens_at = Some(at + restored * srt_rs::DERIVATION_REFILL_MICROS);
-        }
+    /// HARDENING: the lifetime derivation budget.
+    fn take_token(&mut self) -> bool {
         if self.tokens == 0 {
             return false;
         }
@@ -287,7 +280,7 @@ impl Model {
 
     /// Checks before any key is looked at: shape, suite (libsrt), the
     /// derivation budget (srt-rs), unwrap and one-SEK-twice.
-    fn admits(&mut self, a: &Announcement, now: u64) -> bool {
+    fn admits(&mut self, a: &Announcement) -> bool {
         let len = a.suite.key_length.len();
         if a.seks.len() != a.keys.key_count() || a.seks.iter().any(|sek| sek.len() != len) {
             return false;
@@ -295,7 +288,7 @@ impl Model {
         if a.suite != self.suite {
             return false;
         }
-        if self.needs_derivation(&a.salt) && !self.take_token(now) {
+        if self.needs_derivation(&a.salt) && !self.take_token() {
             return false;
         }
         !(a.corrupt || (a.keys == KmKeySelection::Both && a.seks[0] == a.seks[1]))
@@ -325,9 +318,9 @@ impl Model {
     }
 
     /// Apply a peer KMREQ; whether the listener must echo it.
-    fn announce(&mut self, a: &Announcement, now: u64) -> bool {
+    fn announce(&mut self, a: &Announcement) -> bool {
         let derived = self.needs_derivation(&a.salt);
-        if !self.admits(a, now) {
+        if !self.admits(a) {
             return false;
         }
         let Some(fresh) = self.fresh_keys(a) else {
@@ -732,7 +725,7 @@ impl Harness {
             Step::Kmrsp(response) => self.kmrsp(*response),
             Step::Ticks(count) => (0..*count).try_for_each(|_| self.tick()),
             Step::Wait => {
-                self.now += srt_rs::DERIVATION_REFILL_MICROS;
+                self.now += srt_rs::WAIT_MICROS;
                 Ok(())
             }
             Step::SwitchThreshold => self.switch_threshold(),
@@ -843,7 +836,7 @@ impl Harness {
         };
         let kek = self.kek(a.salt, a.suite.key_length.len());
         let body = km_body(&a, &kek);
-        let echo = self.model.announce(&a, self.now);
+        let echo = self.model.announce(&a);
         let datagram = control_datagram(self.sut.socket_id(), SRT_CMD_KMREQ, &body, self.now);
         let result = self.sut.feed_recv_buf(&datagram, ts(self.now));
         let outputs = take_outputs(&mut self.sut);
