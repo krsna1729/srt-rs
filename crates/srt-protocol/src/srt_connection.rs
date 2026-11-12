@@ -30,7 +30,9 @@ use crate::srt_packet::{
 use crate::srt_receiver::{
     GroupReceiveTime, LossRange, MAX_EXPIRED_GAPS_PER_VISIT, ReceiverBuffer,
 };
-use crate::srt_sender::{NakReceipt, PeerRateFeedback, SenderBuffer};
+use crate::srt_sender::{
+    DroppedMessage, MAX_DROPREQ_PER_NAK, NakReceipt, PeerRateFeedback, SenderBuffer,
+};
 use crate::stats::ConnectionStats;
 use crate::time::Timestamp;
 
@@ -425,6 +427,49 @@ fn output_bytes(output: &QueuedOutput) -> usize {
     match output {
         QueuedOutput::Datagram(packet) => packet.wire_len(),
         QueuedOutput::SetTimer { .. } | QueuedOutput::ClearTimer { .. } => 0,
+    }
+}
+
+/// Outputs a peer's ACKs and NAKs trigger that are waiting in the output
+/// queue (S4).
+///
+/// A peer can send ACKs and NAKs faster than a transport with no TX capacity
+/// drains the queue, and an overflowing queue disconnects. So each such
+/// answer waits at most once (DROPREQ answers: at most one report's worth):
+/// a later request is answered once the waiting one has gone out, and the
+/// peer repeats its requests anyway. libsrt sends these as best-effort
+/// datagrams and never queues them (`CUDT::sendCtrl`).
+///
+/// Set where each is queued (`send_ackack`, `send_drop_req` for every
+/// DROPREQ, `arm_retransmit_continue`), cleared when `poll_output_into`
+/// hands it to the transport, and reset with the queue on overflow.
+#[derive(Debug, Default)]
+struct WaitingReplies {
+    /// An ACKACK waits.
+    ackack: bool,
+    /// DROPREQs waiting, TLPKTDROP's own included.
+    dropreqs: usize,
+    /// A `RetransmitContinue` arm waits.
+    retransmit_continue: bool,
+}
+
+impl WaitingReplies {
+    /// Account for `pkt` leaving the queue for the transport.
+    fn sent(&mut self, pkt: &PendingDatagram) {
+        if let PendingDatagram::Control(ctrl) = pkt {
+            match ctrl.control_type {
+                ControlType::AckAck => self.ackack = false,
+                ControlType::DropReq => self.dropreqs = self.dropreqs.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+
+    /// Account for a timer action leaving the queue for the transport.
+    fn timer_sent(&mut self, id: TimerId) {
+        if id == TimerId::RetransmitContinue {
+            self.retransmit_continue = false;
+        }
     }
 }
 
@@ -836,6 +881,8 @@ pub struct SrtConnection {
     /// front, so this stays an accurate count of how many leading slots are
     /// priority actions without re-scanning the queue.
     output_queue_priority: usize,
+    /// See [`WaitingReplies`].
+    waiting_replies: WaitingReplies,
     /// Outstanding delayed-materialization crypto reservations per key flag.
     /// Incremented when a DATA packet reserves a `TxCryptoStamp` at admission,
     /// decremented when the stamped datagram is materialized via
@@ -1094,6 +1141,7 @@ impl SrtConnection {
             self.output_queue.clear();
             self.output_queue_bytes = 0;
             self.output_queue_priority = 0;
+            self.waiting_replies = WaitingReplies::default();
             self.output_overflowed = true;
             self.set_state(ConnectionState::Disconnected);
             self.queue_event(ConnectionEvent::Error(
@@ -1405,6 +1453,7 @@ impl SrtConnection {
             output_queue: VecDeque::new(),
             output_queue_bytes: 0,
             output_queue_priority: 0,
+            waiting_replies: WaitingReplies::default(),
             pending_tx_even: 0,
             pending_tx_odd: 0,
             receive_window_reopen_pending: false,
@@ -1468,6 +1517,7 @@ impl SrtConnection {
             output_queue: VecDeque::new(),
             output_queue_bytes: 0,
             output_queue_priority: 0,
+            waiting_replies: WaitingReplies::default(),
             pending_tx_even: 0,
             pending_tx_odd: 0,
             receive_window_reopen_pending: false,
@@ -2128,7 +2178,13 @@ impl SrtConnection {
         }
     }
 
+    /// Arm the continuation, unless an arm still waits in the output queue
+    /// (see [`WaitingReplies`]): its visit re-arms while work remains.
     fn arm_retransmit_continue(&mut self, duration_micros: u64) {
+        if self.waiting_replies.retransmit_continue {
+            return;
+        }
+        self.waiting_replies.retransmit_continue = true;
         self.queue_output(QueuedOutput::SetTimer {
             id: TimerId::RetransmitContinue,
             duration_micros,
@@ -3171,6 +3227,7 @@ impl SrtConnection {
                 // drop from one still sitting queued (see
                 // `SenderBuffer::note_dropreq_submitted`).
                 let dropreq_range = dropreq_range(pkt);
+                self.waiting_replies.sent(pkt);
                 let class = pkt.class();
                 let source_due_micros = pkt.source_due_micros();
                 self.pop_output_front();
@@ -3198,6 +3255,7 @@ impl SrtConnection {
             } => {
                 let id = *id;
                 let duration_micros = *duration_micros;
+                self.waiting_replies.timer_sent(id);
                 self.pop_output_front();
                 Ok(Some(OutputInto::SetTimer {
                     id,
@@ -4645,9 +4703,7 @@ impl SrtConnection {
             self.process_retransmit(now);
             return Ok(false);
         };
-        for msg in &dropped {
-            self.send_drop_req(msg.message_number, msg.first_seq, msg.last_seq, now);
-        }
+        self.answer_drop_reqs(&dropped, now);
 
         // 即座に再送処理
         self.process_retransmit(now);
@@ -4664,9 +4720,7 @@ impl SrtConnection {
             return;
         }
         let progress = sender.continue_naks();
-        for msg in &progress.dropped {
-            self.send_drop_req(msg.message_number, msg.first_seq, msg.last_seq, now);
-        }
+        self.answer_drop_reqs(&progress.dropped, now);
         if let Some(arrived_at) = progress.credible_at {
             self.last_recv_time = self.last_recv_time.max(Some(arrived_at));
         }
@@ -4805,7 +4859,21 @@ impl SrtConnection {
         write_u32(&mut cif, first_seq);
         write_u32(&mut cif, last_seq);
         pkt.control_info = cif;
+        self.waiting_replies.dropreqs += 1;
         self.queue_control_packet(pkt, now);
+    }
+
+    /// Answer a peer loss report naming dropped messages with their
+    /// DROPREQs, as long as no more than one report's answer
+    /// (`MAX_DROPREQ_PER_NAK`) already waits for TX capacity (see
+    /// [`WaitingReplies`]).
+    fn answer_drop_reqs(&mut self, dropped: &[DroppedMessage], now: Timestamp) {
+        for msg in dropped {
+            if self.waiting_replies.dropreqs >= MAX_DROPREQ_PER_NAK {
+                return;
+            }
+            self.send_drop_req(msg.message_number, msg.first_seq, msg.last_seq, now);
+        }
     }
 
     /// Process a UserDefined packet (KM Refresh).
@@ -5227,7 +5295,14 @@ impl SrtConnection {
     /// Per the SRT spec it's a 16-byte packet with a 0-byte data section, but
     /// for libsrt compatibility this sends 20 bytes with 4 bytes of zero
     /// padding added. See [`LIBSRT_COMPAT_PADDING`] for details.
+    ///
+    /// Skipped while an earlier ACKACK still waits for TX capacity (see
+    /// [`WaitingReplies`]): the peer measures its RTT from that one.
     fn send_ackack(&mut self, ack_number: u32, now: Timestamp) {
+        if self.waiting_replies.ackack {
+            return;
+        }
+        self.waiting_replies.ackack = true;
         let pkt = ControlPacket {
             control_type: ControlType::AckAck,
             subtype: 0,
@@ -7621,6 +7696,195 @@ mod tests {
         drain_outputs(&mut caller);
         let last = first.wrapping_add(count - 1) & SEQUENCE_MASK;
         (caller, first, last)
+    }
+
+    /// How many outputs waiting in `conn`'s queue `kind` matches.
+    fn waiting(conn: &SrtConnection, kind: impl Fn(&QueuedOutput) -> bool) -> usize {
+        conn.output_queue
+            .iter()
+            .filter(|output| kind(output))
+            .count()
+    }
+
+    fn is_control(control_type: ControlType) -> impl Fn(&QueuedOutput) -> bool {
+        move |output| {
+            matches!(output, QueuedOutput::Datagram(PendingDatagram::Control(ctrl))
+                if ctrl.control_type == control_type)
+        }
+    }
+
+    fn is_retransmit_continue(output: &QueuedOutput) -> bool {
+        matches!(
+            output,
+            QueuedOutput::SetTimer {
+                id: TimerId::RetransmitContinue,
+                ..
+            }
+        )
+    }
+
+    /// The sequence of every DATA datagram waiting in `conn`'s queue.
+    fn waiting_data(conn: &SrtConnection) -> Vec<u32> {
+        conn.output_queue
+            .iter()
+            .filter_map(|output| match output {
+                QueuedOutput::Datagram(PendingDatagram::Data(data)) => {
+                    Some(data.header.sequence_number)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A peer can send ACKs faster than a blocked transport drains the
+    /// output queue, and every numbered ACK asks for an ACKACK. One waits at
+    /// a time: the peer measures its RTT from the one that goes out, and the
+    /// first ACK after it went out gets its own. libsrt sends ACKACK as a
+    /// best-effort datagram and never queues it (`CUDT::sendCtrl`).
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "cap-scale loop (MAX_OUTPUT_QUEUE_ACTIONS ACKs); proven outside Miri"
+    )]
+    fn an_ack_storm_while_tx_is_blocked_keeps_one_ackack_waiting() {
+        let (mut caller, first, _) = sent_unacknowledged(64, 100);
+        let id = caller.socket_id();
+        let ack =
+            |number| ack_datagram_with_feedback(id, first, number, &[1_000, 100, 64, 0, 0, 0]);
+        let at = Timestamp::from_micros(20_000);
+        let storm = MAX_OUTPUT_QUEUE_ACTIONS as u32 + 1;
+        for number in 1..=storm {
+            caller
+                .feed_recv_buf(&ack(number), at)
+                .expect("a duplicate ACK is accepted");
+        }
+        assert_eq!(caller.state(), ConnectionState::Connected);
+        assert_eq!(waiting(&caller, is_control(ControlType::AckAck)), 1);
+
+        drain_outputs(&mut caller);
+        caller
+            .feed_recv_buf(&ack(storm + 1), at)
+            .expect("a duplicate ACK is accepted");
+        assert_eq!(waiting(&caller, is_control(ControlType::AckAck)), 1);
+    }
+
+    /// A NAK naming a packet whose retransmission still waits for TX
+    /// capacity queues it no second time, however small an RTT the peer
+    /// reports: the waiting copy answers it. libsrt has no such state (it
+    /// sends a retransmission the moment it takes it off the loss list).
+    /// Once the copy has gone out, a later report re-sends.
+    #[test]
+    fn a_nak_storm_while_tx_is_blocked_queues_each_retransmission_once() {
+        let (mut caller, first, last) = sent_unacknowledged(64, 100);
+        let id = caller.socket_id();
+        // An RTT report of 1 us, repeated until the sender's estimate is
+        // down to it, collapses the repeat interval.
+        for number in 1..=200 {
+            caller
+                .feed_recv_buf(
+                    &ack_datagram_with_feedback(id, first, number, &[1, 1, 64, 0, 0, 0]),
+                    Timestamp::from_micros(10_000),
+                )
+                .expect("a duplicate ACK is accepted");
+        }
+        drain_outputs(&mut caller);
+        let srtt = caller
+            .sender
+            .as_ref()
+            .expect("sender")
+            .rtt_estimate_micros()
+            .0;
+        assert!(srtt <= 1, "estimate {srtt} us");
+
+        let nak = nak_datagram(id, &[first, last]);
+        let mut at = 20_000;
+        for _ in 0..200 {
+            at += 10;
+            caller
+                .feed_recv_buf(&nak, Timestamp::from_micros(at))
+                .expect("a credible NAK is accepted");
+        }
+        let mut queued = waiting_data(&caller);
+        let waiting_copies = queued.len();
+        queued.sort_unstable();
+        queued.dedup();
+        assert_eq!(
+            waiting_copies,
+            queued.len(),
+            "each retransmission waits once"
+        );
+        assert_eq!(queued.len(), 64);
+
+        drain_outputs(&mut caller);
+        caller
+            .feed_recv_buf(&nak, Timestamp::from_micros(at + 10))
+            .expect("a credible NAK is accepted");
+        assert!(
+            !waiting_data(&caller).is_empty(),
+            "a report after the copy went out re-sends"
+        );
+    }
+
+    /// Every NAK runs the retransmit visit, which arms its continuation
+    /// while work remains. With TX blocked, one arm waits at a time.
+    #[test]
+    fn a_nak_storm_while_tx_is_blocked_keeps_one_continuation_waiting() {
+        let (mut caller, first, last) = sent_unacknowledged(64, 100);
+        let nak = nak_datagram(caller.socket_id(), &[first, last]);
+        for _ in 0..100 {
+            caller
+                .feed_recv_buf(&nak, Timestamp::from_micros(20_000))
+                .expect("a credible NAK is accepted");
+        }
+        assert_eq!(waiting(&caller, is_retransmit_continue), 1);
+
+        // Once it went out, the next visit that leaves work behind arms
+        // again: a report past the repeat interval re-queues all 64, more
+        // than one visit sends.
+        drain_outputs(&mut caller);
+        caller
+            .feed_recv_buf(&nak, Timestamp::from_micros(1_000_000))
+            .expect("a credible NAK is accepted");
+        assert_eq!(waiting(&caller, is_retransmit_continue), 1);
+    }
+
+    /// A NAK into messages TLPKTDROP gave up is answered with up to
+    /// `MAX_DROPREQ_PER_NAK` DROPREQs. With TX blocked, at most one report's
+    /// answer waits; a later report is answered once it has gone out (the
+    /// peer repeats its NAK until the range is gone).
+    #[test]
+    fn a_nak_storm_into_dropped_messages_keeps_one_reports_dropreqs_waiting() {
+        let (mut caller, first, last) = sent_unacknowledged(64, 100);
+        caller
+            .handle_timer(TimerId::Ack, Timestamp::from_micros(2_000_000))
+            .expect("ACK tick");
+        assert_eq!(
+            drain_drop_requests(&mut caller).len(),
+            64,
+            "every message expired"
+        );
+
+        let nak = nak_datagram(caller.socket_id(), &[first, last]);
+        let at = Timestamp::from_micros(2_000_100);
+        for _ in 0..100 {
+            caller
+                .feed_recv_buf(&nak, at)
+                .expect("a NAK into dropped messages is accepted");
+        }
+        assert_eq!(caller.state(), ConnectionState::Connected);
+        assert_eq!(
+            waiting(&caller, is_control(ControlType::DropReq)),
+            MAX_DROPREQ_PER_NAK
+        );
+
+        assert_eq!(drain_drop_requests(&mut caller).len(), MAX_DROPREQ_PER_NAK);
+        caller
+            .feed_recv_buf(&nak, at)
+            .expect("a NAK into dropped messages is accepted");
+        assert_eq!(
+            waiting(&caller, is_control(ControlType::DropReq)),
+            MAX_DROPREQ_PER_NAK
+        );
     }
 
     /// A NAK repeated before the sender's own RTT estimate has elapsed since

@@ -435,7 +435,7 @@ proptest! {
     fn prop_sender_differential_state_machine(
         initial_seq in 0u32..0x7FFF_FFFFu32,
         window_size in 64u32..256u32,
-        operations in prop::collection::vec(0u8..9u8, 1..100),
+        operations in prop::collection::vec(0u8..10u8, 1..100),
     ) {
         const MASK: u32 = 0x7FFF_FFFF;
         let mut buf = SenderBuffer::new(initial_seq, window_size, 10);
@@ -456,6 +456,9 @@ proptest! {
         let mut model_retransmitted_at = std::collections::HashMap::new();
         let suppression = u64::from(buf.rtt_estimate_micros().0);
         let mut model_lost = 0u64;
+        // Retransmissions popped but not yet submitted, in pop order. A loss
+        // report naming one must not queue it again until it is submitted.
+        let mut model_waiting = std::collections::VecDeque::new();
 
         let mut current_time_us = 1_000u64;
 
@@ -512,6 +515,7 @@ proptest! {
                         while cur != ack_seq {
                             model_packets.remove(&cur);
                             model_retransmit_set.remove(&cur);
+                            model_waiting.retain(|&waiting| waiting != cur);
                             // A tombstone is retired by the same cumulative
                             // ACK that retires a live packet.
                             model_dropped.remove(&cur);
@@ -550,10 +554,11 @@ proptest! {
                         let queued_before = buf.stats().packets_in_loss_list;
                         report_losses(&mut buf, &[nak_seq], now);
                         // A repeat within the interval of the last
-                        // retransmission never re-sends; one after it always
-                        // does.
+                        // retransmission, or while it still waits to go out,
+                        // never re-sends; one after it always does.
                         let queues = model_packets.contains_key(&nak_seq)
                             && !model_retransmit_set.contains(&nak_seq)
+                            && !model_waiting.contains(&nak_seq)
                             && may_queue(nak_seq, &model_retransmitted_at);
                         prop_assert_eq!(
                             buf.stats().packets_in_loss_list,
@@ -584,6 +589,7 @@ proptest! {
                         }
                         prop_assert!(found);
                         model_retransmitted_at.insert(seq, current_time_us);
+                        model_waiting.push_back(seq);
                     }
                 }
                 7 => {
@@ -596,6 +602,7 @@ proptest! {
                         loop {
                             model_packets.remove(&cur);
                             model_retransmit_set.remove(&cur);
+                            model_waiting.retain(|&waiting| waiting != cur);
                             model_dropped.insert(cur);
                             if cur == msg.last_seq {
                                 break;
@@ -607,6 +614,12 @@ proptest! {
                 8 => {
                     // Time passes: up to one and a half suppression intervals.
                     current_time_us += current_time_us % (suppression * 3 / 2);
+                }
+                9 => {
+                    // The oldest waiting retransmission goes out.
+                    if let Some(seq) = model_waiting.pop_front() {
+                        buf.note_data_submitted(seq);
+                    }
                 }
                 _ => unreachable!(),
             }

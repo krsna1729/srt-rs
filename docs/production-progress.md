@@ -899,3 +899,11 @@ Each item below was reproduced by a regression test that failed on
 - `total_lost` counted repeats (R6). It counts positions a report newly
   queues, so a held-back repeat adds nothing (3,392 before, 64 after), as
   libsrt counts newly inserted losses (core.cpp:9194, 9218).
+- Output-queue overflow under an ACK/NAK storm (S4). With TX blocked, every
+  numbered ACK queued an ACKACK, every NAK a `RetransmitContinue` arm, every
+  NAK into dropped messages up to 16 DROPREQs, and every NAK a fresh copy of
+  a retransmission still waiting to go out (once the peer's RTT reports had
+  collapsed the repeat interval). 8,193 ACKs, about 500 NAKs into dropped
+  messages, or 200 NAKs at 10 µs disconnected the connection. Each answer
+  now waits at most once (DROPREQ answers: one report's worth); a later
+  request is answered once the waiting one has gone out.
