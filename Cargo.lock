@@ -1419,7 +1419,9 @@ dependencies = [
 name = "srt-lifecycle"
 version = "0.1.0"
 dependencies = [
+ "hmac",
  "proptest",
+ "sha1",
  "srt-proto",
 ]
 

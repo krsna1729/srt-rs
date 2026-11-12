@@ -2,9 +2,10 @@ use super::tests::{
     finish_conclusion, new_connected_caller_connection, next_packet,
     prepare_conclusion_with_options,
 };
+use crate::admission::tests::conclusion_from;
 use crate::*;
 use bytes::Bytes;
-use srt_proto::{ConnectionOptions, SrtConnection, Timestamp};
+use srt_proto::{ConnectionOptions, Timestamp};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -219,17 +220,19 @@ fn peer_retirement_keeps_window_credit_and_monotonic_totals_until_storage_is_gon
         ),
         Admit::Dropped(_)
     ));
-    let mut second = SrtConnection::new_caller(ConnectionOptions {
-        socket_id: 0x4447,
-        ..Default::default()
-    });
-    second.connect(Timestamp::default()).unwrap();
-    let induction = next_packet(&mut second);
     let second_peer = "127.0.0.1:19003".parse().unwrap();
+    let second = conclusion_from(
+        &mut table,
+        second_peer,
+        0x4447,
+        &options,
+        &telemetry,
+        Timestamp::from_micros(8),
+    );
     assert!(matches!(
         table.admit(
             second_peer,
-            &induction,
+            &second,
             Timestamp::from_micros(8),
             &options,
             0,
@@ -253,7 +256,7 @@ fn peer_retirement_keeps_window_credit_and_monotonic_totals_until_storage_is_gon
     assert_eq!(
         table.admit(
             second_peer,
-            &induction,
+            &second,
             Timestamp::from_micros(9),
             &options,
             0,

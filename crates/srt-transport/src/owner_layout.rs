@@ -7,7 +7,7 @@
 //! choice reaches the runtime unchanged. The Owners of one layout exchange
 //! [`ListenerTransfer`]s, which the application carries between threads:
 //! CONCLUSIONs the kernel delivered to the wrong reuseport member (routed by
-//! the SYN cookie, [`srt_lifecycle::cookie_for_worker`]), bonded legs
+//! the SYN cookie, [`srt_lifecycle::CookieKey`]), bonded legs
 //! relocated to the Owner that holds their group, and the slot releases that
 //! keep socket IDs unique across the layout.
 

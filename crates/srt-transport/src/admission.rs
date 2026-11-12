@@ -14,6 +14,46 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
+/// Most INDUCTION answers queued for [`PeerTable::poll_outbound`] at once;
+/// an INDUCTION beyond them is dropped as a capacity drop and its caller
+/// retries. The queue only grows between two output drains.
+const MAX_PENDING_INDUCTION_REPLIES: usize = 4096;
+
+/// An INDUCTION response datagram: the header and an extension-free
+/// handshake body (fixed fields and the 16-byte peer-IP field).
+const INDUCTION_REPLY_LEN: usize = srt_proto::wire::SRT_HEADER_SIZE + 48;
+
+/// One stateless INDUCTION answer awaiting output.
+struct InductionReply {
+    peer: std::net::SocketAddr,
+    len: usize,
+    datagram: [u8; INDUCTION_REPLY_LEN],
+}
+
+/// The SYN-cookie key and the epoch of its time buckets, one per process:
+/// every table shares them, so any member of a listener layout, or worker
+/// of [`PeerTable::admit_and_forward`], verifies the cookies the others
+/// issue and can drop a forged one before forwarding it.
+struct SynCookies {
+    key: srt_lifecycle::CookieKey,
+    epoch: Instant,
+}
+
+impl SynCookies {
+    fn bucket(&self) -> u64 {
+        self.epoch.elapsed().as_secs() / srt_lifecycle::COOKIE_BUCKET_SECS
+    }
+}
+
+static SYN_COOKIES: std::sync::LazyLock<SynCookies> = std::sync::LazyLock::new(|| {
+    let mut secret = zeroize::Zeroizing::new([0u8; 32]);
+    getrandom::fill(secret.as_mut()).expect("OS randomness for the SYN-cookie key");
+    SynCookies {
+        key: srt_lifecycle::CookieKey::new(&secret),
+        epoch: Instant::now(),
+    }
+});
+
 // ---------------------------------------------------------------------------
 // Admission peer table — shared by every reuseport ingress strategy
 // ---------------------------------------------------------------------------
@@ -388,31 +428,37 @@ impl AdmissionPayload<'_> {
     }
 }
 
+#[derive(Default)]
 struct AdmissionFeedResult {
     fed: bool,
     feed_error_kind: Option<srt_proto::ErrorKind>,
-    inserted: bool,
     became_established: bool,
     became_terminal: bool,
 }
 
-struct KnownConclusionContext<'a> {
+/// A CONCLUSION addressed to the not yet established direct peer at
+/// `physical`.
+#[derive(Clone, Copy)]
+struct ConclusionContext<'a> {
     peer: std::net::SocketAddr,
-    physical: Option<PhysicalPeerKey>,
-    handshake: Option<&'a srt_proto::handshake::HandshakePacket>,
-    identity: Option<&'a srt_lifecycle::HandshakeIdentity>,
+    physical: PhysicalPeerKey,
+    packet: &'a srt_proto::handshake::HandshakePacket,
+    identity: &'a srt_lifecycle::HandshakeIdentity,
     now: Timestamp,
     options: &'a AdmissionOptions,
     telemetry: &'a IngressTelemetry,
 }
 
-struct AdmissionFeedContext<'a> {
+/// Where a datagram admitted to a direct peer goes: a CONCLUSION naming no
+/// live peer creates one, after its SYN cookie verified.
+#[derive(Clone, Copy)]
+struct AdmissionScope<'a> {
     peer: std::net::SocketAddr,
-    data: &'a [u8],
     now: Timestamp,
     options: &'a AdmissionOptions,
     worker_index: usize,
-    new_logical_peer: Option<LogicalPeerId>,
+    worker_count: usize,
+    telemetry: &'a IngressTelemetry,
 }
 
 /// One GCRA step at `rate` per second with a burst of `rate`: the next
@@ -1042,7 +1088,11 @@ impl PeerSlotTarget {
 /// live protocol state, which that crate deliberately does not.
 pub struct PeerTable {
     slots: DenseSlotArena<PeerSlotTarget>,
-    half_open_by_caller: HashMap<(std::net::SocketAddr, u32), usize>,
+    /// Stateless INDUCTION answers, oldest first (at most
+    /// [`MAX_PENDING_INDUCTION_REPLIES`]).
+    induction_replies: VecDeque<InductionReply>,
+    /// Reused body buffer for encoding INDUCTION answers.
+    reply_scratch: Vec<u8>,
     /// Address, caller-ID and cookie indexes of every occupied slot, so a
     /// handshake that names no slot routes without walking the arena.
     routes: crate::route_index::RouteIndex,
@@ -1243,9 +1293,13 @@ impl PeerTable {
         config.max_key_derivations_per_source_per_second = config
             .max_key_derivations_per_source_per_second
             .clamp(1, 1_000_000);
+        // Draw the process's cookie key now rather than on the first
+        // datagram, so a missing OS RNG fails construction, not traffic.
+        std::sync::LazyLock::force(&SYN_COOKIES);
         Self {
             slots: DenseSlotArena::with_partition(config.max_peers, index, count),
-            half_open_by_caller: HashMap::new(),
+            induction_replies: VecDeque::new(),
+            reply_scratch: Vec::new(),
             routes: crate::route_index::RouteIndex::default(),
             logical_peers: HashMap::new(),
             next_logical_peer: 1,
@@ -1519,67 +1573,67 @@ impl PeerTable {
         Some(socket_id)
     }
 
+    /// The live peer a CONCLUSION addressed to socket 0 belongs to: the one
+    /// expecting its cookie, or a leg of the same caller socket at that
+    /// address (a bonded leg keeps no cookie route).
     #[inline]
-    fn resolve_conclusion_route(
+    fn route_conclusion(
         &self,
         peer: std::net::SocketAddr,
-        physical: Option<PhysicalPeerKey>,
-        conclusion: Option<&srt_lifecycle::HandshakeIdentity>,
+        caller_socket_id: u32,
+        syn_cookie: u32,
     ) -> Option<PhysicalPeerKey> {
-        if physical.is_some() {
-            return physical;
-        }
-        let identity = conclusion?;
         self.routes
-            .first_for_cookie(peer, identity.syn_cookie)
-            .or_else(|| self.routes.sole_at(peer))
+            .first_for_cookie(peer, syn_cookie)
+            .or_else(|| self.routes.first_for_caller(peer, caller_socket_id))
             .and_then(|slot| self.physical_at_slot(slot))
     }
 
-    fn stale_conclusion(
+    /// Whether a CONCLUSION naming no live peer is admitted here (`Ok`), or
+    /// the outcome otherwise. Its SYN cookie must be one a member of this
+    /// layout issued to this caller socket at this address within the
+    /// cookie's lifetime (libsrt core.cpp:11829-11850), so a forged, expired
+    /// or replayed-elsewhere CONCLUSION creates no state, never reaches the
+    /// resolver and is never forwarded to another member.
+    fn verify_new_conclusion(
+        packet: &srt_proto::handshake::HandshakePacket,
         identity: &srt_lifecycle::HandshakeIdentity,
-        options: &AdmissionOptions,
-        worker_index: usize,
-        worker_count: usize,
-        telemetry: &IngressTelemetry,
-    ) -> Admit {
-        let owner = srt_lifecycle::worker_from_cookie(identity.syn_cookie, worker_count);
+        scope: AdmissionScope<'_>,
+    ) -> Result<(), Admit> {
+        let owner = SYN_COOKIES.key.verify(
+            identity.syn_cookie,
+            scope.peer,
+            packet.socket_id,
+            SYN_COOKIES.bucket(),
+            scope.worker_count,
+        );
         match owner {
-            Some(owner) if owner != worker_index => {
-                if options.cookie_routing {
-                    telemetry.record_cookie_routed();
-                    return Admit::ForwardTo(owner);
-                }
-                // Routing disabled: it will be answered here and fail
-                // cookie validation, which is the cost being measured.
-                telemetry.record_stranded_conclusion();
+            None => {
+                scope.telemetry.record_invalid_cookie();
+                Err(Admit::Dropped(AdmissionDropReason::InvalidCookie))
             }
-            // The cookie names this acceptor, but the peer is gone --
-            // it was already promoted off the shared listener, so
-            // this is a late or duplicate CONCLUSION rather than a
-            // stranded handshake. Conflating the two makes the
-            // routing measurement meaningless.
-            Some(_) => telemetry.record_promoted_duplicate(),
-            None => telemetry.record_stranded_conclusion(),
+            Some(owner) if owner == scope.worker_index => Ok(()),
+            Some(owner) if scope.options.cookie_routing => {
+                scope.telemetry.record_cookie_routed();
+                Err(Admit::ForwardTo(owner))
+            }
+            // Issued by another member, but routing is disabled: the
+            // handshake is stranded here, which is the cost being measured.
+            Some(_) => {
+                scope.telemetry.record_stranded_conclusion();
+                Err(Admit::Dropped(AdmissionDropReason::StaleConclusion))
+            }
         }
-        Admit::Dropped(AdmissionDropReason::StaleConclusion)
     }
 
+    /// The table limits a new peer must fit, checked before its state is
+    /// created.
     #[inline]
     fn reject_new_peer(
         &self,
         peer: std::net::SocketAddr,
-        handshake: Option<&srt_proto::handshake::HandshakePacket>,
         telemetry: &IngressTelemetry,
     ) -> Option<Admit> {
-        let Some(packet) = handshake else {
-            telemetry.record_invalid_datagram();
-            return Some(Admit::Dropped(AdmissionDropReason::InvalidPacket));
-        };
-        if packet.handshake_type != srt_proto::handshake::HandshakeType::Induction {
-            telemetry.record_invalid_datagram();
-            return Some(Admit::Dropped(AdmissionDropReason::InvalidPacket));
-        }
         // Slots lent to sessions relocated to other members stay this
         // member's until released, so they are taken as much as occupied
         // ones: counting them keeps a local slot free for every admission.
@@ -1605,34 +1659,24 @@ impl PeerTable {
         None
     }
 
+    /// The peer a datagram addressed to `destination_socket_id` belongs to,
+    /// matched by socket ID and source address.
     fn physical_for_datagram(
         &self,
         address: std::net::SocketAddr,
         destination_socket_id: u32,
-        induction_socket_id: Option<u32>,
     ) -> Option<PhysicalPeerKey> {
-        if destination_socket_id != 0 {
-            let slot_idx = self.slots.slot_index_for_socket_id(destination_socket_id);
-            let slot = self.slots.get_by_slot(slot_idx)?;
-            if slot.socket_id == destination_socket_id && slot.address == address {
-                return Some(PhysicalPeerKey {
-                    address,
-                    local_socket_id: destination_socket_id,
-                });
-            }
+        if destination_socket_id == 0 {
             return None;
         }
-        let caller_socket_id = induction_socket_id?;
-        if let Some(&slot_idx) = self.half_open_by_caller.get(&(address, caller_socket_id)) {
-            let slot = self.slots.get_by_slot(slot_idx)?;
-            return Some(PhysicalPeerKey {
-                address: slot.address,
-                local_socket_id: slot.socket_id,
-            });
-        }
-        self.routes
-            .first_for_caller(address, caller_socket_id)
-            .and_then(|slot| self.physical_at_slot(slot))
+        let slot_idx = self.slots.slot_index_for_socket_id(destination_socket_id);
+        let slot = self.slots.get_by_slot(slot_idx)?;
+        (slot.socket_id == destination_socket_id && slot.address == address).then_some(
+            PhysicalPeerKey {
+                address,
+                local_socket_id: destination_socket_id,
+            },
+        )
     }
 
     /// The lowest-slot peer at `address`; an address alone does not tell
@@ -1765,76 +1809,72 @@ impl PeerTable {
     /// repeat from existing state before its accept hook, api.cpp:646-676).
     fn is_established_repeat(
         &self,
-        physical: Option<PhysicalPeerKey>,
-        conclusion: Option<&srt_lifecycle::HandshakeIdentity>,
+        physical: PhysicalPeerKey,
+        identity: &srt_lifecycle::HandshakeIdentity,
     ) -> bool {
-        let (Some(physical), Some(identity)) = (physical, conclusion) else {
-            return false;
-        };
         self.get_peer(&physical).is_some_and(|entry| {
             entry.admission_established && identity.syn_cookie == entry.conn.syn_cookie()
         })
     }
 
-    fn apply_known_conclusion_policy<F>(
+    /// The table limits a CONCLUSION must pass before policy runs for a peer
+    /// that is not yet established: `existing` is the half-open peer it
+    /// names, or `None` when it would create one.
+    fn reject_before_policy(
         &mut self,
-        context: KnownConclusionContext<'_>,
-        hook: F,
-    ) -> Option<Admit>
+        packet: &srt_proto::handshake::HandshakePacket,
+        identity: &srt_lifecycle::HandshakeIdentity,
+        existing: Option<PhysicalPeerKey>,
+        scope: AdmissionScope<'_>,
+    ) -> Option<Admit> {
+        let entry = existing.and_then(|physical| self.get_peer(&physical));
+        if entry.is_none_or(|entry| !entry.admission_established)
+            && self.established_count() + self.retired_protocols.established
+                >= self.config.max_established_peers
+        {
+            scope.telemetry.record_established_capacity_drop();
+            return Some(Admit::Dropped(AdmissionDropReason::EstablishedCapacity));
+        }
+        // A CONCLUSION asking for encryption makes the listener derive a
+        // key-encryption key (PBKDF2) once policy has chosen its credentials.
+        // Charge it only for a new peer or a half-open one whose cookie
+        // matches, so a retransmission to an established peer or a forged
+        // cookie costs nothing, and drop it before policy runs when the
+        // budget is spent.
+        let derives_key = packet
+            .extensions
+            .iter()
+            .any(|extension| extension.ext_type == srt_proto::handshake::ExtensionType::KmReq)
+            && entry.is_none_or(|entry| {
+                !entry.admission_established
+                    && !entry.rejected
+                    && identity.syn_cookie == entry.conn.syn_cookie()
+            });
+        if derives_key && !self.take_key_derivation(source_key(scope.peer.ip()), scope.now) {
+            scope.telemetry.record_key_derivation_drop();
+            return Some(Admit::Dropped(AdmissionDropReason::KeyDerivationBudget));
+        }
+        None
+    }
+
+    /// Run admission policy for the CONCLUSION of a direct peer that is not
+    /// yet established; `None` lets the CONCLUSION through to its
+    /// connection.
+    fn run_conclusion_policy<F>(&mut self, context: ConclusionContext<'_>, hook: F) -> Option<Admit>
     where
         F: FnOnce(&AdmissionRequest, &mut SrtConnection) -> AdmissionHookResult,
     {
-        let KnownConclusionContext {
+        let ConclusionContext {
             peer,
             physical,
-            handshake,
+            packet,
             identity,
             now,
             options,
             telemetry,
         } = context;
-        let identity = identity?;
-        // SEC-04: `known` guarantees `physical.is_some()` and
-        // `identity` is derived from `handshake`, so both must be
-        // `Some` here. Bind them once with defensive early returns
-        // instead of panicking on the network-facing hot path.
-        let Some(physical) = physical else {
-            debug_assert!(false, "known peer lost physical route");
-            return Some(Admit::Dropped(AdmissionDropReason::InvalidPacket));
-        };
-        let Some(packet) = handshake else {
-            debug_assert!(false, "conclusion identity without decoded handshake");
-            return Some(Admit::Dropped(AdmissionDropReason::InvalidPacket));
-        };
         let group_admission_allowed =
             self.group_admission_allowed(identity, packet, options, Some(physical));
-        if self
-            .get_peer(&physical)
-            .is_some_and(|entry| !entry.admission_established)
-            && self.established_count() + self.retired_protocols.established
-                >= self.config.max_established_peers
-        {
-            telemetry.record_established_capacity_drop();
-            return Some(Admit::Dropped(AdmissionDropReason::EstablishedCapacity));
-        }
-        // A CONCLUSION asking for encryption makes the listener derive a
-        // key-encryption key (PBKDF2) once policy has chosen its credentials.
-        // Charge it only for a half-open peer whose cookie matches, so a
-        // retransmission to an established peer or a forged cookie costs
-        // nothing, and drop it before policy runs when the budget is spent.
-        let derives_key = packet
-            .extensions
-            .iter()
-            .any(|extension| extension.ext_type == srt_proto::handshake::ExtensionType::KmReq)
-            && self.get_peer(&physical).is_some_and(|entry| {
-                !entry.admission_established
-                    && !entry.rejected
-                    && identity.syn_cookie == entry.conn.syn_cookie()
-            });
-        if derives_key && !self.take_key_derivation(source_key(peer.ip()), now) {
-            telemetry.record_key_derivation_drop();
-            return Some(Admit::Dropped(AdmissionDropReason::KeyDerivationBudget));
-        }
         let window_room = self
             .config
             .max_window_memory_bytes
@@ -1959,33 +1999,34 @@ impl PeerTable {
         true
     }
 
+    /// The half-open peer a verified CONCLUSION creates: a listener
+    /// connection already past the INDUCTION it answered statelessly.
     fn new_admission_peer(
         logical_peer: LogicalPeerId,
         physical: PhysicalPeerKey,
-        peer: std::net::SocketAddr,
+        caller_socket_id: u32,
+        syn_cookie: u32,
         options: &AdmissionOptions,
-        worker_index: usize,
         now: Timestamp,
     ) -> AdmissionPeer {
         let mut connection_options = options.connection_template.clone().unwrap_or_default();
         connection_options.socket_id = physical.local_socket_id;
         connection_options.tsbpd_delay = options.tsbpd_delay;
-        // Encode who owns this handshake, so a CONCLUSION the kernel
-        // rehashes elsewhere can be routed back here.
-        connection_options.syn_cookie = Some(srt_lifecycle::cookie_for_worker(
-            worker_index,
-            peer_entropy(peer),
-        ));
+        connection_options.syn_cookie = Some(syn_cookie);
         let mut conn = SrtConnection::new_listener(connection_options);
         // The peer's MSS is an IP-layer MTU: the path family (from the real
         // source address, not the handshake's advisory peer-IP field) turns
         // it into a datagram budget. The source IP fills the peer-IP field of
         // this side's handshakes.
-        conn.set_peer_address(peer);
+        conn.set_peer_address(physical.address);
         conn.set_handshake_timing(
             u64::try_from(options.handshake_retry_interval.as_micros()).unwrap_or(u64::MAX),
             u64::try_from(options.handshake_timeout.as_micros()).unwrap_or(u64::MAX),
         );
+        // A fresh listener is always in the state this needs; were it not,
+        // the CONCLUSION would go unanswered and the peer expire half-open.
+        let begun = conn.begin_listener_handshake_at_conclusion(caller_socket_id, now);
+        debug_assert!(begun.is_ok(), "a fresh listener begins at CONCLUSION");
         AdmissionPeer {
             logical_peer,
             conn,
@@ -2006,59 +2047,92 @@ impl PeerTable {
         }
     }
 
+    /// Create the half-open peer for a CONCLUSION naming no live peer, once
+    /// its cookie verified and the table limits allow it.
+    fn admit_new_conclusion(
+        &mut self,
+        packet: &srt_proto::handshake::HandshakePacket,
+        identity: &srt_lifecycle::HandshakeIdentity,
+        scope: AdmissionScope<'_>,
+    ) -> Result<PhysicalPeerKey, Admit> {
+        Self::verify_new_conclusion(packet, identity, scope)?;
+        if let Some(drop) = self.reject_new_peer(scope.peer, scope.telemetry) {
+            return Err(drop);
+        }
+        if let Some(drop) = self.reject_before_policy(packet, identity, None, scope) {
+            return Err(drop);
+        }
+        // `reject_new_peer` counted every local slot that is taken.
+        let Some(local_socket_id) = self.allocate_listener_socket_id(scope.options.socket_id)
+        else {
+            debug_assert!(false, "capacity checked before allocating a socket ID");
+            scope.telemetry.record_admission_capacity_drop();
+            return Err(Admit::Dropped(AdmissionDropReason::Capacity));
+        };
+        let physical = PhysicalPeerKey {
+            address: scope.peer,
+            local_socket_id,
+        };
+        let logical_peer = self.allocate_logical_peer(LogicalPeerTarget::Direct(physical));
+        let entry = Self::new_admission_peer(
+            logical_peer,
+            physical,
+            packet.socket_id,
+            identity.syn_cookie,
+            scope.options,
+            scope.now,
+        );
+        let slot_idx = self.slots.slot_index_for_socket_id(local_socket_id);
+        self.slots.insert_at_slot(
+            slot_idx,
+            local_socket_id,
+            scope.peer,
+            PeerSlotTarget::Direct(entry),
+        );
+        *self
+            .source_counts
+            .entry(source_key(scope.peer.ip()))
+            .or_default() += 1;
+        self.half_open_peers += 1;
+        self.half_open_deadlines.set(
+            physical,
+            scope
+                .now
+                .add_micros(duration_micros_saturating(self.config.half_open_timeout)),
+        );
+        self.sync_route(slot_idx);
+        Ok(physical)
+    }
+
     fn feed_admission_datagram(
         &mut self,
         physical: PhysicalPeerKey,
-        context: AdmissionFeedContext<'_>,
+        data: &[u8],
+        now: Timestamp,
     ) -> AdmissionFeedResult {
-        let AdmissionFeedContext {
-            peer,
-            data,
-            now,
-            options,
-            worker_index,
-            new_logical_peer,
-        } = context;
-        let mut inserted = false;
-        let entry_slot = if let Some(idx) = self.slot_index_for_key(&physical) {
-            idx
-        } else {
-            let idx = self
-                .slots
-                .slot_index_for_socket_id(physical.local_socket_id);
-            let logical_peer = new_logical_peer.unwrap_or_else(|| {
-                unreachable!("or_insert_with runs only for new peers, which set new_logical_peer")
-            });
-            let entry =
-                Self::new_admission_peer(logical_peer, physical, peer, options, worker_index, now);
-            self.slots.insert_at_slot(
-                idx,
-                physical.local_socket_id,
-                peer,
-                PeerSlotTarget::Direct(entry),
-            );
-            inserted = true;
-            idx
+        let Some(entry_slot) = self.slot_index_for_key(&physical) else {
+            debug_assert!(false, "admission feeds a peer the table holds");
+            return AdmissionFeedResult::default();
         };
-        let slot = self.slots.get_by_slot_mut(entry_slot).expect("slot exists");
-        let entry = slot.value.direct_mut().expect("direct peer in slot");
+        let Some(entry) = self
+            .slots
+            .get_by_slot_mut(entry_slot)
+            .and_then(|slot| slot.value.direct_mut())
+        else {
+            debug_assert!(false, "admission feeds a direct peer");
+            return AdmissionFeedResult::default();
+        };
         let feed_result = entry.conn.feed_recv_buf(data, now);
         let feed_error_kind = feed_result.as_ref().err().map(|error| error.kind);
         let fed = feed_result.is_ok();
         if fed {
             entry.last_datagram_at = now;
-            if inserted {
-                self.half_open_by_caller
-                    .insert((peer, entry.conn.peer_socket_id()), entry_slot);
-            }
         }
         let became_established = fed
             && !entry.admission_established
             && entry.conn.state() == srt_proto::ConnectionState::Connected;
         if became_established {
             entry.admission_established = true;
-            self.half_open_by_caller
-                .remove(&(peer, entry.conn.peer_socket_id()));
         }
         let became_terminal =
             !fed && entry.conn.state() == srt_proto::ConnectionState::Disconnected;
@@ -2070,16 +2144,17 @@ impl PeerTable {
         AdmissionFeedResult {
             fed,
             feed_error_kind,
-            inserted,
             became_established,
             became_terminal,
         }
     }
 
+    /// A datagram its peer's connection refused. A peer this datagram
+    /// created keeps no state unless it ended in a rejection to send.
     fn finish_admission_failure(
         &mut self,
         physical: PhysicalPeerKey,
-        known: bool,
+        created: bool,
         conclusion: Option<&srt_lifecycle::HandshakeIdentity>,
         feed: AdmissionFeedResult,
         telemetry: &IngressTelemetry,
@@ -2088,10 +2163,10 @@ impl PeerTable {
             telemetry.record_credential_failure();
         }
         telemetry.record_invalid_datagram();
-        if !known {
-            self.retire_physical(physical);
-        } else if feed.became_terminal {
+        if feed.became_terminal {
             self.mark_ready_physical(physical);
+        } else if created {
+            self.retire_physical(physical);
         }
         Admit::Dropped(AdmissionDropReason::InvalidPacket)
     }
@@ -2833,10 +2908,10 @@ impl PeerTable {
             }
         };
         // RFC stream multiplexing routes established SRT sockets by the
-        // fixed-header Destination SRT Socket ID. INDUCTION is the sole
-        // exception: it targets socket ID zero and carries the caller's
-        // source SRT Socket ID in the handshake body.
-        if handshake.is_none() {
+        // fixed-header Destination SRT Socket ID. Handshakes addressed to
+        // socket ID zero are the exception: INDUCTION is answered without
+        // state, and CONCLUSION routes by its cookie and caller socket ID.
+        let Some(packet) = handshake else {
             return self.admit_established_datagram(
                 peer,
                 destination_socket_id,
@@ -2844,98 +2919,166 @@ impl PeerTable {
                 now,
                 telemetry,
             );
+        };
+        let scope = AdmissionScope {
+            peer,
+            now,
+            options,
+            worker_index,
+            worker_count,
+            telemetry,
+        };
+        if packet.handshake_type == srt_proto::handshake::HandshakeType::Induction
+            && destination_socket_id == 0
+        {
+            return self.answer_induction(&packet, scope);
         }
         let data = payload.as_slice();
-        let mut physical = self.physical_for_datagram(
-            peer,
-            destination_socket_id,
-            handshake
-                .as_ref()
-                .filter(|packet| {
-                    packet.handshake_type == srt_proto::handshake::HandshakeType::Induction
+        let identity = srt_lifecycle::handshake_identity_from_handshake(&packet);
+        let conclusion = identity.is_conclusion.then_some(&identity);
+        let physical = self
+            .physical_for_datagram(peer, destination_socket_id)
+            .or_else(|| {
+                conclusion.and_then(|identity| {
+                    self.route_conclusion(peer, packet.socket_id, identity.syn_cookie)
                 })
-                .map(|packet| packet.socket_id),
-        );
+            });
         if let Some(physical) = physical
             && self.is_group_leg(&physical)
         {
             return self.admit_group_leg(physical, data, now);
         }
-        let identity = handshake
-            .as_ref()
-            .map(srt_lifecycle::handshake_identity_from_handshake);
-        let conclusion = identity.as_ref().filter(|identity| identity.is_conclusion);
-        physical = self.resolve_conclusion_route(peer, physical, conclusion);
-        let known = physical.is_some_and(|physical| self.get_peer(&physical).is_some());
-
-        if !known && let Some(identity) = conclusion {
-            return Self::stale_conclusion(
-                identity,
-                options,
-                worker_index,
-                worker_count,
-                telemetry,
-            );
-        }
-
-        if !known {
-            if let Some(result) = self.reject_new_peer(peer, handshake.as_ref(), telemetry) {
-                return result;
+        let known = physical.filter(|physical| self.get_peer(physical).is_some());
+        let (physical, created) = match (known, conclusion) {
+            (Some(physical), _) => (physical, false),
+            (None, Some(identity)) => match self.admit_new_conclusion(&packet, identity, scope) {
+                Ok(physical) => (physical, true),
+                Err(admit) => return admit,
+            },
+            (None, None) => {
+                telemetry.record_invalid_datagram();
+                return Admit::Dropped(AdmissionDropReason::InvalidPacket);
             }
-        } else if !self.is_established_repeat(physical, conclusion)
-            && let Some(result) = self.apply_known_conclusion_policy(
-                KnownConclusionContext {
-                    peer,
-                    physical,
-                    handshake: handshake.as_ref(),
-                    identity: conclusion,
-                    now,
-                    options,
-                    telemetry,
-                },
-                hook,
-            )
+        };
+        if let Some(identity) = conclusion
+            && let Some(result) =
+                self.conclusion_policy(&packet, identity, physical, created, scope, hook)
         {
             return result;
         }
-
-        let physical = match physical {
-            Some(physical) => physical,
-            None => {
-                // `reject_new_peer` counted every local slot that is taken.
-                let Some(local_socket_id) = self.allocate_listener_socket_id(options.socket_id)
-                else {
-                    debug_assert!(false, "capacity checked before allocating a socket ID");
-                    telemetry.record_admission_capacity_drop();
-                    return Admit::Dropped(AdmissionDropReason::Capacity);
-                };
-                PhysicalPeerKey {
-                    address: peer,
-                    local_socket_id,
-                }
-            }
-        };
-        let new_logical_peer =
-            (!known).then(|| self.allocate_logical_peer(LogicalPeerTarget::Direct(physical)));
-        let feed = self.feed_admission_datagram(
-            physical,
-            AdmissionFeedContext {
-                peer,
-                data,
-                now,
-                options,
-                worker_index,
-                new_logical_peer,
-            },
-        );
-        if feed.inserted {
-            *self.source_counts.entry(source_key(peer.ip())).or_default() += 1;
-            self.half_open_peers += 1;
-        }
+        let feed = self.feed_admission_datagram(physical, data, now);
         if !feed.fed {
-            return self.finish_admission_failure(physical, known, conclusion, feed, telemetry);
+            return self.finish_admission_failure(physical, created, conclusion, feed, telemetry);
         }
         self.finish_admission_success(physical, now, feed.became_established)
+    }
+
+    /// Policy for a CONCLUSION to the direct peer at `physical` (`created`
+    /// by it, or already known); `None` lets it through to the connection.
+    /// A peer this CONCLUSION created keeps no state when policy drops it.
+    fn conclusion_policy<F>(
+        &mut self,
+        packet: &srt_proto::handshake::HandshakePacket,
+        identity: &srt_lifecycle::HandshakeIdentity,
+        physical: PhysicalPeerKey,
+        created: bool,
+        scope: AdmissionScope<'_>,
+        hook: F,
+    ) -> Option<Admit>
+    where
+        F: FnOnce(&AdmissionRequest, &mut SrtConnection) -> AdmissionHookResult,
+    {
+        if self.is_established_repeat(physical, identity) {
+            return None;
+        }
+        if !created
+            && let Some(drop) = self.reject_before_policy(packet, identity, Some(physical), scope)
+        {
+            return Some(drop);
+        }
+        let result = self.run_conclusion_policy(
+            ConclusionContext {
+                peer: scope.peer,
+                physical,
+                packet,
+                identity,
+                now: scope.now,
+                options: scope.options,
+                telemetry: scope.telemetry,
+            },
+            hook,
+        );
+        if created && matches!(result, Some(Admit::Dropped(_))) {
+            self.retire_physical(physical);
+        } else if created {
+            // Drain the new connection's handshake deadline into its timers.
+            self.mark_ready_physical(physical);
+        }
+        result
+    }
+
+    /// Answer an INDUCTION without keeping anything (libsrt
+    /// core.cpp:11755-11790): its SYN cookie binds the caller's address and
+    /// socket ID to this acceptor and the current time bucket, and only a
+    /// CONCLUSION echoing it creates state. One answer per request, queued
+    /// for [`Self::poll_outbound`]; nothing is resent unprompted.
+    fn answer_induction(
+        &mut self,
+        packet: &srt_proto::handshake::HandshakePacket,
+        scope: AdmissionScope<'_>,
+    ) -> Admit {
+        if self.induction_replies.len() >= MAX_PENDING_INDUCTION_REPLIES {
+            scope.telemetry.record_admission_capacity_drop();
+            return Admit::Dropped(AdmissionDropReason::Capacity);
+        }
+        let cookie = SYN_COOKIES.key.issue(
+            scope.worker_index,
+            scope.peer,
+            packet.socket_id,
+            SYN_COOKIES.bucket(),
+        );
+        let encryption = scope
+            .options
+            .connection_template
+            .as_ref()
+            .filter(|template| template.passphrase.is_some())
+            .map(|template| template.key_length);
+        let Ok(response) = SrtConnection::stateless_induction_response(
+            packet,
+            cookie,
+            encryption,
+            scope.peer.ip(),
+        ) else {
+            scope.telemetry.record_invalid_datagram();
+            return Admit::Dropped(AdmissionDropReason::InvalidPacket);
+        };
+        let mut control_info = std::mem::take(&mut self.reply_scratch);
+        control_info.clear();
+        response.write_control_info(&mut control_info);
+        let control = srt_proto::wire::ControlPacket {
+            control_type: srt_proto::wire::ControlType::Handshake,
+            subtype: 0,
+            type_specific_info: 0,
+            // The low 32 bits of the receive clock, as libsrt stamps its
+            // stateless answer; the caller does not read it.
+            timestamp: scope.now.as_micros() as u32,
+            dest_socket_id: packet.socket_id,
+            control_info,
+        };
+        let mut datagram = [0u8; INDUCTION_REPLY_LEN];
+        let encoded = control.encode_into(&mut datagram);
+        self.reply_scratch = control.control_info;
+        let Ok(len) = encoded else {
+            debug_assert!(false, "an INDUCTION answer fits INDUCTION_REPLY_LEN");
+            scope.telemetry.record_invalid_datagram();
+            return Admit::Dropped(AdmissionDropReason::InvalidPacket);
+        };
+        self.induction_replies.push_back(InductionReply {
+            peer: scope.peer,
+            len,
+            datagram,
+        });
+        Admit::Fed
     }
 
     /// Remove incomplete handshakes that have stopped making progress.
@@ -3182,8 +3325,12 @@ impl PeerTable {
         self.last_now = now;
         let mut rejected = Vec::new();
         let mut report = OutputDrainReport::default();
+        let mut reply_visits = 0;
+        let replies_blocked =
+            self.drain_induction_replies(budget, sink, &mut report, &mut reply_visits);
         let (mut visits, direct_due_remaining) =
-            self.mark_due_peers_bounded(now, budget.max_actions);
+            self.mark_due_peers_bounded(now, budget.max_actions.saturating_sub(reply_visits));
+        visits = visits.saturating_add(reply_visits);
         let direct_blocked = self.poll_direct_outbound_bounded(
             now,
             budget,
@@ -3198,7 +3345,8 @@ impl PeerTable {
         visits = visits.saturating_add(group_due_visits);
         let group_blocked =
             self.poll_group_outbound_bounded(now, budget, sink, &mut report, &mut visits);
-        if direct_due_remaining
+        if replies_blocked
+            || direct_due_remaining
             || group_due_remaining
             || direct_blocked
             || group_blocked
@@ -3208,6 +3356,42 @@ impl PeerTable {
             report.status = OutputDrainStatus::BudgetExhausted;
         }
         (report, visits)
+    }
+
+    /// Send queued stateless INDUCTION answers, oldest first, within
+    /// `budget`; `true` when one is left queued.
+    fn drain_induction_replies<S: DatagramSink + ?Sized>(
+        &mut self,
+        budget: OutputDrainBudget,
+        sink: &mut S,
+        report: &mut OutputDrainReport,
+        visits: &mut usize,
+    ) -> bool {
+        while let Some(reply) = self.induction_replies.front() {
+            if *visits >= budget.max_actions
+                || report.packets >= budget.max_packets
+                || report.bytes.saturating_add(reply.len) > budget.max_bytes
+            {
+                return true;
+            }
+            let mut slot = match sink.acquire(reply.peer, reply.len) {
+                Ok(Some(slot)) => slot,
+                Ok(None) => {
+                    record_peer_unavailable(report);
+                    return true;
+                }
+                Err(error) => {
+                    record_peer_sink_rejection(report, &error);
+                    return true;
+                }
+            };
+            slot.bytes_mut()[..reply.len].copy_from_slice(&reply.datagram[..reply.len]);
+            slot.commit(reply.len, DatagramClass::Handshake, None);
+            record_peer_pushed(report, reply.len);
+            *visits += 1;
+            self.induction_replies.pop_front();
+        }
+        false
     }
 
     /// Bounded drain into a [`Vec<(SocketAddr, Vec<u8>)>`].
@@ -3915,10 +4099,11 @@ impl PeerTable {
     }
 
     /// Whether output or a due timer can be serviced at `now`, across
-    /// both direct peers and bonded-group legs.
+    /// stateless INDUCTION answers, direct peers and bonded-group legs.
     #[must_use]
     pub fn has_pending_output(&self, now: Timestamp) -> bool {
-        !self.ready.is_empty()
+        !self.induction_replies.is_empty()
+            || !self.ready.is_empty()
             || !self.group_ready.is_empty()
             || self.deadlines.has_due(now)
             || self.group_deadlines.has_due(now)
@@ -4314,7 +4499,7 @@ impl PeerTable {
         data: &[u8],
     ) -> Option<&mut AdmissionPeer> {
         let destination_socket_id = srt_proto::wire::peek_destination_socket_id(data).ok()?;
-        let physical = self.physical_for_datagram(peer, destination_socket_id, None)?;
+        let physical = self.physical_for_datagram(peer, destination_socket_id)?;
         self.get_peer_mut(&physical)
     }
 
@@ -4387,8 +4572,6 @@ impl PeerTable {
             PeerSlotTarget::Direct(entry) => entry,
             PeerSlotTarget::GroupLeg(_) | PeerSlotTarget::Detached => return None,
         };
-        self.half_open_by_caller
-            .remove(&(slot.address, entry.conn.peer_socket_id()));
         if !relocating {
             // Sample the retiring connection before it is handed back to the
             // application: after this function returns, the table no longer
@@ -4565,7 +4748,6 @@ impl PeerTable {
             let address = slot.address;
             let at = walk(&|other| other.address == address);
             assert_eq!(self.routes.first_at(address), at.first().copied());
-            assert_eq!(self.routes.sole_at(address), (at.len() == 1).then(|| at[0]));
             let caller = caller_of(&slot).unwrap_or(0);
             for probe in [caller, caller.wrapping_add(1)] {
                 let found =
@@ -4829,11 +5011,6 @@ fn is_control_datagram(data: &[u8]) -> bool {
     data.first().is_some_and(|byte| byte & 0x80 != 0)
 }
 
-fn peer_entropy(peer: std::net::SocketAddr) -> u32 {
-    use std::hash::BuildHasher;
-    std::collections::hash_map::RandomState::new().hash_one(peer) as u32
-}
-
 fn duration_micros_saturating(timeout: Duration) -> u64 {
     u64::try_from(timeout.as_micros()).unwrap_or(u64::MAX)
 }
@@ -5019,15 +5196,13 @@ pub(crate) mod tests {
 
             for i in 0..peer_count {
                 let peer = std::net::SocketAddr::from(([10, 0, (i >> 8) as u8, i as u8], 5000));
-                let packet = induction_packet(100 + u32::from(i));
-                table.admit(
+                let _ = open_half(
+                    &mut table,
                     peer,
-                    &packet,
-                    Timestamp::from_micros(u64::from(i) * 1000),
+                    100 + u32::from(i),
                     &options,
-                    0,
-                    1,
                     &telemetry,
+                    Timestamp::from_micros(u64::from(i) * 1000),
                 );
 
                 let effective_max = config.max_peers.max(1);
@@ -5067,15 +5242,13 @@ pub(crate) mod tests {
             let mut admitted = 0usize;
             for i in 0..attempts {
                 let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 5000 + i));
-                let packet = induction_packet(200 + u32::from(i));
-                let result = table.admit(
+                let result = open_half(
+                    &mut table,
                     peer,
-                    &packet,
-                    Timestamp::from_micros(u64::from(i) * 1000),
+                    200 + u32::from(i),
                     &options,
-                    0,
-                    1,
                     &telemetry,
+                    Timestamp::from_micros(u64::from(i) * 1000),
                 );
                 if !matches!(result, Admit::Dropped(_)) {
                     admitted += 1;
@@ -5110,14 +5283,13 @@ pub(crate) mod tests {
             let peer = std::net::SocketAddr::from(([10, 0, 0, 1], 5000));
             let mut admitted = 0usize;
             for i in 0..n {
-                let result = table.admit(
+                let result = open_half(
+                    &mut table,
                     peer,
-                    &induction_packet(100 + u32::from(i)),
-                    Timestamp::from_micros(u64::from(i) * 1000),
+                    100 + u32::from(i),
                     &options,
-                    0,
-                    1,
                     &telemetry,
+                    Timestamp::from_micros(u64::from(i) * 1000),
                 );
                 if !matches!(result, Admit::Dropped(_)) {
                     admitted += 1;
@@ -5142,30 +5314,19 @@ pub(crate) mod tests {
         let options = default_options();
         let peer = "10.0.0.1:5000".parse().unwrap();
 
-        assert!(!matches!(
-            table.admit(
-                peer,
-                &induction_packet(1),
-                Timestamp::from_micros(0),
-                &options,
-                0,
-                1,
-                &telemetry,
-            ),
-            Admit::Dropped(_)
-        ));
-        assert!(!matches!(
-            table.admit(
-                peer,
-                &induction_packet(2),
-                Timestamp::from_micros(1),
-                &options,
-                0,
-                1,
-                &telemetry,
-            ),
-            Admit::Dropped(_)
-        ));
+        for socket_id in [1, 2] {
+            assert_eq!(
+                open_half(
+                    &mut table,
+                    peer,
+                    socket_id,
+                    &options,
+                    &telemetry,
+                    Timestamp::from_micros(u64::from(socket_id)),
+                ),
+                Admit::Deferred
+            );
+        }
         assert_eq!(table.half_open_count(), 2);
         assert_eq!(table.len(), 2);
     }
@@ -5188,68 +5349,38 @@ pub(crate) mod tests {
         let peer_b = "10.0.0.2:5000".parse().unwrap();
         let peer_c = "10.0.0.3:5000".parse().unwrap();
 
-        table.admit(
-            peer_a,
-            &induction_packet(1),
-            Timestamp::from_micros(0),
-            &options,
-            0,
-            1,
-            &telemetry,
-        );
-        table.admit(
-            peer_b,
-            &induction_packet(2),
-            Timestamp::from_micros(0),
-            &options,
-            0,
-            1,
-            &telemetry,
-        );
+        let start = Timestamp::from_micros(0);
+        for (peer, socket_id) in [(peer_a, 1), (peer_b, 2)] {
+            assert_eq!(
+                open_half(&mut table, peer, socket_id, &options, &telemetry, start),
+                Admit::Deferred
+            );
+        }
         assert_eq!(table.half_open_count(), 2);
 
-        let result = table.admit(
-            peer_c,
-            &induction_packet(3),
-            Timestamp::from_micros(0),
-            &options,
-            0,
-            1,
-            &telemetry,
-        );
-        assert!(matches!(
-            result,
+        // A CONCLUSION is refused without state, so it can be presented
+        // again; each admission prunes at most one expired peer.
+        let conclusion = induct(&mut table, peer_c, None, &options, &telemetry, start);
+        let conclude = |table: &mut PeerTable, now| {
+            table.admit(peer_c, &conclusion, now, &options, 0, 1, &telemetry)
+        };
+        assert_eq!(
+            conclude(&mut table, start),
             Admit::Dropped(AdmissionDropReason::HalfOpenCapacity)
-        ));
+        );
 
-        let result = table.admit(
-            peer_c,
-            &induction_packet(3),
-            Timestamp::from_micros(200_000),
-            &options,
-            0,
-            1,
-            &telemetry,
-        );
-        assert!(matches!(
-            result,
+        let later = Timestamp::from_micros(200_000);
+        assert_eq!(
+            conclude(&mut table, later),
             Admit::Dropped(AdmissionDropReason::HalfOpenCapacity)
-        ));
+        );
         assert_eq!(table.half_open_count(), 1);
         assert_eq!(table.retirements_pending(), 1);
         assert_eq!(table.reclaim_retired(0), 0);
         table.reclaim_retired(64);
         assert_eq!(table.retirements_pending(), 0);
         assert_eq!(
-            table.admit(
-                peer_c,
-                &induction_packet(3),
-                Timestamp::from_micros(200_000),
-                &options,
-                0,
-                1,
-                &telemetry,
-            ),
+            conclude(&mut table, later),
             Admit::Fed,
             "physical reclamation makes the expired half-open slot reusable"
         );
@@ -5265,11 +5396,25 @@ pub(crate) mod tests {
         telemetry: &IngressTelemetry,
         now: Timestamp,
     ) -> Vec<u8> {
-        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+        let caller = ConnectionOptions {
             socket_id: u32::from(peer.port()),
             passphrase: passphrase.map(str::to_owned),
             ..ConnectionOptions::default()
-        });
+        };
+        induct_with(table, peer, caller, options, telemetry, now).1
+    }
+
+    /// A caller with `caller_options` at `peer` through the stateless
+    /// INDUCTION exchange; returns it and its CONCLUSION, not yet fed.
+    fn induct_with(
+        table: &mut PeerTable,
+        peer: std::net::SocketAddr,
+        caller_options: ConnectionOptions,
+        options: &AdmissionOptions,
+        telemetry: &IngressTelemetry,
+        now: Timestamp,
+    ) -> (SrtConnection, Vec<u8>) {
+        let mut caller = SrtConnection::new_caller(caller_options);
         caller.connect(now).expect("start caller");
         let induction = next_packet(&mut caller);
         assert_eq!(
@@ -5283,7 +5428,42 @@ pub(crate) mod tests {
                 let _ = caller.feed_recv_buf(&packet, now);
             }
         }
-        next_packet(&mut caller)
+        let conclusion = next_packet(&mut caller);
+        (caller, conclusion)
+    }
+
+    /// The first CONCLUSION of a caller with `socket_id` at `peer`, after
+    /// the stateless INDUCTION exchange at `now`; not yet fed.
+    pub(crate) fn conclusion_from(
+        table: &mut PeerTable,
+        peer: std::net::SocketAddr,
+        socket_id: u32,
+        options: &AdmissionOptions,
+        telemetry: &IngressTelemetry,
+        now: Timestamp,
+    ) -> Vec<u8> {
+        let caller = ConnectionOptions {
+            socket_id,
+            ..ConnectionOptions::default()
+        };
+        induct_with(table, peer, caller, options, telemetry, now).1
+    }
+
+    /// [`conclusion_from`], then feed it with policy deferring it; returns
+    /// what the table did with the CONCLUSION (`Deferred` leaves a half-open
+    /// peer: a CONCLUSION policy lets through establishes the peer at once).
+    pub(crate) fn open_half(
+        table: &mut PeerTable,
+        peer: std::net::SocketAddr,
+        socket_id: u32,
+        options: &AdmissionOptions,
+        telemetry: &IngressTelemetry,
+        now: Timestamp,
+    ) -> Admit {
+        let conclusion = conclusion_from(table, peer, socket_id, options, telemetry, now);
+        table.admit_with_resolver(peer, &conclusion, now, options, 0, 1, telemetry, |_| {
+            AdmissionResolution::Defer
+        })
     }
 
     /// [`induct`], then feed the CONCLUSION; returns what the table did with
@@ -5376,12 +5556,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// F06: a handshake that names no slot -- an INDUCTION from a caller
-    /// the table has not seen, a CONCLUSION with a cookie it never issued --
-    /// is routed before capacity rejection, so any source can repeat it per
-    /// datagram. Routing must not walk the arena's slot domain: the work is
-    /// a few index probes whatever the capacity, while the arena holds one
-    /// peer.
+    /// F06: a handshake that names no slot -- an INDUCTION, a CONCLUSION
+    /// from a caller the table holds no peer for, one with a cookie issued
+    /// elsewhere -- is answered or refused before any state exists, so any
+    /// source can repeat it per datagram. It must not walk the arena's slot
+    /// domain: the work is a few index probes whatever the capacity, while
+    /// the arena holds one peer.
     #[test]
     fn unknown_handshakes_route_without_walking_the_arena() {
         let telemetry = IngressTelemetry::new();
@@ -5400,11 +5580,11 @@ pub(crate) mod tests {
             let (admit, _) = conclude_as(&mut table, established, None, &options, &telemetry, now);
             assert_eq!(admit, Admit::Fed);
 
-            // An INDUCTION from a new caller on the same IP misses every
-            // index, then meets the per-source cap.
+            // An INDUCTION is answered from no state at all.
+            let newcomer: std::net::SocketAddr = "10.0.0.1:5001".parse().unwrap();
             let (admit, induction) = crate::work::WorkCounters::measure(|| {
                 table.admit(
-                    "10.0.0.1:5001".parse().unwrap(),
+                    newcomer,
                     &induction_packet(77),
                     now,
                     &options,
@@ -5413,19 +5593,30 @@ pub(crate) mod tests {
                     &telemetry,
                 )
             });
+            assert_eq!(admit, Admit::Fed);
+
+            // A verified CONCLUSION from a new caller on the same IP misses
+            // every index, then meets the per-source cap.
+            let conclusion = induct(&mut table, newcomer, None, &options, &telemetry, now);
+            let (admit, capped) = crate::work::WorkCounters::measure(|| {
+                table.admit(newcomer, &conclusion, now, &options, 0, 1, &telemetry)
+            });
             assert_eq!(admit, Admit::Dropped(AdmissionDropReason::SourceCapacity));
 
-            // A CONCLUSION carrying another table's cookie, from an address
-            // this table has never seen.
+            // A CONCLUSION carrying a cookie issued to another address.
             let stranger: std::net::SocketAddr = "10.0.0.2:6000".parse().unwrap();
-            let mut other = PeerTable::new();
-            let conclusion = induct(&mut other, stranger, None, &options, &telemetry, now);
-            let (admit, stale) = crate::work::WorkCounters::measure(|| {
+            let elsewhere: std::net::SocketAddr = "10.0.0.3:6000".parse().unwrap();
+            let conclusion = induct(&mut table, elsewhere, None, &options, &telemetry, now);
+            let (admit, forged) = crate::work::WorkCounters::measure(|| {
                 table.admit(stranger, &conclusion, now, &options, 0, 1, &telemetry)
             });
-            assert_eq!(admit, Admit::Dropped(AdmissionDropReason::StaleConclusion));
+            assert_eq!(admit, Admit::Dropped(AdmissionDropReason::InvalidCookie));
 
-            for (what, work) in [("induction", induction), ("conclusion", stale)] {
+            for (what, work) in [
+                ("induction", induction),
+                ("capped conclusion", capped),
+                ("forged conclusion", forged),
+            ] {
                 assert_eq!(
                     work.arena_slot_probes, 0,
                     "{what} miss at capacity {max_peers}: {work:?}"
@@ -5890,34 +6081,21 @@ pub(crate) mod tests {
         let mut socket_id = 0;
         let mut admit = |table: &mut PeerTable, address| {
             socket_id += 1;
-            let mut caller = SrtConnection::new_caller(ConnectionOptions {
-                socket_id,
-                ..ConnectionOptions::default()
-            });
-            caller.connect(now).expect("start caller");
-            table.admit(
-                at(address),
-                &next_packet(&mut caller),
-                now,
-                &options,
-                0,
-                1,
-                &telemetry,
-            )
+            open_half(table, at(address), socket_id, &options, &telemetry, now)
         };
         let source_drop = Admit::Dropped(AdmissionDropReason::SourceCapacity);
-        assert_eq!(admit(&mut table, "2001:db8:1:2::1"), Admit::Fed);
+        assert_eq!(admit(&mut table, "2001:db8:1:2::1"), Admit::Deferred);
         assert_eq!(admit(&mut table, "2001:db8:1:2:ffff::9"), source_drop);
-        assert_eq!(admit(&mut table, "2001:db8:1:3::1"), Admit::Fed);
-        assert_eq!(admit(&mut table, "192.0.2.7"), Admit::Fed);
+        assert_eq!(admit(&mut table, "2001:db8:1:3::1"), Admit::Deferred);
+        assert_eq!(admit(&mut table, "192.0.2.7"), Admit::Deferred);
         assert_eq!(admit(&mut table, "::ffff:192.0.2.7"), source_drop);
-        assert_eq!(admit(&mut table, "::ffff:192.0.2.8"), Admit::Fed);
+        assert_eq!(admit(&mut table, "::ffff:192.0.2.8"), Admit::Deferred);
         // Retiring the /64's peer returns its share to the whole /64.
         let retiring = table
             .physical_for_address(at("2001:db8:1:2::1"))
             .expect("half-open peer");
         assert!(table.remove_direct(retiring).is_some());
-        assert_eq!(admit(&mut table, "2001:db8:1:2:ffff::9"), Admit::Fed);
+        assert_eq!(admit(&mut table, "2001:db8:1:2:ffff::9"), Admit::Deferred);
 
         // The key-derivation share is keyed the same way.
         let mut table = PeerTable::with_config(PeerTableConfig {
@@ -5960,9 +6138,9 @@ pub(crate) mod tests {
         let entry = PeerTable::new_admission_peer(
             logical_peer,
             physical,
-            addr,
-            &default_options(),
+            preferred_socket_id ^ 0x4000_0000,
             0,
+            &default_options(),
             Timestamp::default(),
         );
         table
@@ -6440,6 +6618,243 @@ pub(crate) mod tests {
         let snapshot = telemetry.snapshot();
         assert_eq!(snapshot.policy_errors, 0);
         assert_eq!(snapshot.policy_requests, 1);
+    }
+
+    /// `datagram` (one handshake control packet) with its handshake body
+    /// changed by `change`: what an attacker who saw or guessed it can send.
+    fn rewrite_handshake(
+        datagram: &[u8],
+        change: impl FnOnce(&mut srt_proto::handshake::HandshakePacket),
+    ) -> Vec<u8> {
+        let Ok(srt_proto::wire::SrtPacket::Control(control)) =
+            srt_proto::wire::SrtPacket::decode(datagram)
+        else {
+            panic!("a handshake control packet");
+        };
+        let mut handshake =
+            srt_proto::handshake::HandshakePacket::decode(&control).expect("handshake body");
+        change(&mut handshake);
+        let mut bytes = Vec::new();
+        handshake
+            .encode(control.timestamp, control.dest_socket_id)
+            .encode(&mut bytes)
+            .expect("handshake fits a datagram");
+        bytes
+    }
+
+    /// RS1/T3: a CONCLUSION that names no live peer creates state, and
+    /// reaches the resolver, only once its SYN cookie verifies: a keyed MAC
+    /// over the caller's address and socket ID (libsrt checks the cookie
+    /// first, core.cpp:11829-11850). A forged cookie, a genuine cookie
+    /// presented for another caller socket, and one issued to another
+    /// address are each dropped before policy, so a spoofer cannot make the
+    /// application see failures for a victim's address (Restream bans
+    /// addresses on them).
+    #[test]
+    fn a_conclusion_whose_cookie_was_not_issued_to_it_never_reaches_the_resolver() {
+        let mut table = PeerTable::new();
+        let telemetry = IngressTelemetry::new();
+        let options = default_options();
+        let victim: std::net::SocketAddr = "10.0.0.20:5000".parse().unwrap();
+        let attacker: std::net::SocketAddr = "10.0.0.66:5000".parse().unwrap();
+        // The victim is between INDUCTION and CONCLUSION; the attacker holds
+        // a genuine cookie of its own.
+        let (mut caller, genuine) =
+            admit_up_to_conclusion(&mut table, victim, 0x20, &options, &telemetry);
+        let (_, own) = admit_up_to_conclusion(&mut table, attacker, 0x66, &options, &telemetry);
+        let forged = rewrite_handshake(&genuine, |hs| hs.syn_cookie ^= 0x5A5A_0000);
+        let other_socket = rewrite_handshake(&genuine, |hs| hs.socket_id ^= 1);
+        let resolved = std::cell::Cell::new(0);
+        let resolver = |_: &AdmissionRequest| {
+            resolved.set(resolved.get() + 1);
+            AdmissionResolution::Accept
+        };
+        let now = Timestamp::from_micros(2);
+        for (what, conclusion) in [
+            ("a forged cookie", &forged),
+            ("another caller socket's cookie", &other_socket),
+            ("another address's cookie", &own),
+        ] {
+            let admit = table.admit_with_resolver(
+                victim, conclusion, now, &options, 0, 1, &telemetry, resolver,
+            );
+            assert_eq!(resolved.get(), 0, "{what} reached the resolver");
+            assert_eq!(
+                admit,
+                Admit::Dropped(AdmissionDropReason::InvalidCookie),
+                "{what}"
+            );
+            assert!(table.is_empty(), "{what} left state");
+        }
+        assert_eq!(telemetry.snapshot().invalid_cookies, 3);
+
+        // The genuine CONCLUSION still connects the victim.
+        let admit =
+            table.admit_with_resolver(victim, &genuine, now, &options, 0, 1, &telemetry, resolver);
+        assert_eq!(admit, Admit::Fed);
+        assert_eq!(resolved.get(), 1);
+        let mut outbound = Vec::new();
+        table.poll_outbound(now, &mut outbound);
+        for (to, packet) in outbound {
+            if to == victim {
+                let _ = caller.feed_recv_buf(&packet, now);
+            }
+        }
+        assert_eq!(caller.state(), srt_proto::ConnectionState::Connected);
+    }
+
+    /// S3/T4: a CONCLUSION naming no live peer is forwarded to the layout
+    /// member that issued its cookie only after the cookie verifies here.
+    /// Routing on an unverified worker index let any source fill another
+    /// member's forwarded-CONCLUSION inbox with forgeries.
+    #[test]
+    fn a_conclusion_failing_its_cookie_is_not_forwarded_to_another_member() {
+        let mut table = PeerTable::new();
+        let telemetry = IngressTelemetry::new();
+        let options = AdmissionOptions::basic(1, 120, true);
+        let issued_to: std::net::SocketAddr = "10.0.0.40:5000".parse().unwrap();
+        let spoofed: std::net::SocketAddr = "10.0.0.41:5000".parse().unwrap();
+        let (_, conclusion) =
+            admit_up_to_conclusion(&mut table, issued_to, 0x40, &options, &telemetry);
+        // Claim member 1 of 2 in the cookie's low byte, where an index used
+        // to travel in the clear.
+        let forged = rewrite_handshake(&conclusion, |hs| {
+            hs.syn_cookie = (hs.syn_cookie & !0xFF) | 1;
+        });
+        assert_eq!(
+            table.admit(
+                spoofed,
+                &forged,
+                Timestamp::from_micros(2),
+                &options,
+                0,
+                2,
+                &telemetry
+            ),
+            Admit::Dropped(AdmissionDropReason::InvalidCookie)
+        );
+        assert_eq!(telemetry.snapshot().cookie_routed, 0);
+    }
+
+    /// RS1/T3: an INDUCTION is answered from no state (libsrt
+    /// core.cpp:11755-11790). Anyone can send one claiming any address, so
+    /// if each kept a half-open peer, 1024 of them would fill the default
+    /// half-open table and lock every real caller out for the half-open
+    /// timeout.
+    #[test]
+    fn inductions_keep_no_state_and_cannot_lock_out_a_caller() {
+        let mut table = PeerTable::new();
+        let telemetry = IngressTelemetry::new();
+        let options = default_options();
+        let now = Timestamp::from_micros(1);
+        for i in 0..1024u32 {
+            let spoofed = std::net::SocketAddr::from(([10, 7, (i >> 8) as u8, i as u8], 4000));
+            let _ = table.admit(
+                spoofed,
+                &induction_packet(0x1000 + i),
+                now,
+                &options,
+                0,
+                1,
+                &telemetry,
+            );
+        }
+        assert_eq!(
+            (table.len(), table.half_open_count()),
+            (0, 0),
+            "no per-INDUCTION state"
+        );
+        let mut outbound = Vec::new();
+        while table.has_pending_output(now) {
+            table.poll_outbound(now, &mut outbound);
+        }
+
+        let caller_at: std::net::SocketAddr = "192.0.2.1:7000".parse().unwrap();
+        let (mut caller, conclusion) =
+            admit_up_to_conclusion(&mut table, caller_at, 0x77, &options, &telemetry);
+        admit_conclusion(
+            &mut table,
+            caller_at,
+            &mut caller,
+            &conclusion,
+            &options,
+            &telemetry,
+        );
+        assert_eq!(caller.state(), srt_proto::ConnectionState::Connected);
+    }
+
+    /// Stateless INDUCTION answers wait in a bounded queue between output
+    /// drains: one beyond it is dropped (the caller retries) rather than
+    /// growing memory with the request rate.
+    #[test]
+    fn the_induction_answer_queue_is_bounded() {
+        let mut table = PeerTable::new();
+        let telemetry = IngressTelemetry::new();
+        let options = default_options();
+        let now = Timestamp::from_micros(1);
+        let induct = |table: &mut PeerTable, i: u32| {
+            let source = std::net::SocketAddr::from(([10, 8, (i >> 8) as u8, i as u8], 4000));
+            table.admit(
+                source,
+                &induction_packet(i + 1),
+                now,
+                &options,
+                0,
+                1,
+                &telemetry,
+            )
+        };
+        for i in 0..MAX_PENDING_INDUCTION_REPLIES as u32 {
+            assert_eq!(induct(&mut table, i), Admit::Fed);
+        }
+        assert_eq!(
+            induct(&mut table, MAX_PENDING_INDUCTION_REPLIES as u32),
+            Admit::Dropped(AdmissionDropReason::Capacity)
+        );
+        let mut outbound = Vec::new();
+        table.poll_outbound(now, &mut outbound);
+        assert!(!outbound.is_empty());
+        assert_eq!(
+            induct(&mut table, MAX_PENDING_INDUCTION_REPLIES as u32),
+            Admit::Fed,
+            "a drain makes room"
+        );
+    }
+
+    /// T5: one INDUCTION gets one answer. The listener answers each request
+    /// once, as libsrt does (core.cpp:11769-11810); the caller's own
+    /// retransmissions drive any repeat. Re-sending the answer on the
+    /// listener's handshake timer reflected about a dozen datagrams per
+    /// (possibly forged) request at the address it claimed.
+    #[test]
+    fn an_induction_is_answered_by_exactly_one_datagram() {
+        let mut table = PeerTable::new();
+        let telemetry = IngressTelemetry::new();
+        let options = default_options();
+        let claimed: std::net::SocketAddr = "10.0.0.31:5000".parse().unwrap();
+        let start = Timestamp::from_micros(0);
+        assert_eq!(
+            table.admit(
+                claimed,
+                &induction_packet(0x31),
+                start,
+                &options,
+                0,
+                1,
+                &telemetry
+            ),
+            Admit::Fed
+        );
+        // Past the whole handshake timeout, in 10 ms steps.
+        let horizon = options.handshake_timeout + Duration::from_secs(1);
+        let steps = horizon.as_millis() as u64 / 10;
+        let mut outbound = Vec::new();
+        let mut sent = 0;
+        for step in 0..=steps {
+            table.poll_outbound(start.add_micros(step * 10_000), &mut outbound);
+            sent += outbound.iter().filter(|(to, _)| *to == claimed).count();
+        }
+        assert_eq!(sent, 1, "datagrams sent for one INDUCTION");
     }
 
     /// A Rust caller and a Rust listener on an IPv6 path negotiate the IPv6

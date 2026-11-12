@@ -324,17 +324,25 @@ fn test_handshake_retransmits_after_packet_loss() {
     transfer_caller_to_listener(&mut caller, &mut listener, ts(1_000_000));
     while listener.poll_output().unwrap().is_some() {}
 
+    // The listener does not resend its lost answer (libsrt answers each
+    // request once, core.cpp:11769-11810): the caller's retry drives it.
     listener
         .handle_timer(TimerId::Handshake, ts(2_000_000))
-        .expect("listener handshake retry");
-    transfer_listener_to_caller(&mut listener, &mut caller, ts(2_000_000));
-    while caller.poll_output().unwrap().is_some() {}
+        .expect("listener handshake timer");
+    while let Some(output) = listener.poll_output().unwrap() {
+        assert!(
+            !matches!(output, ConnectionOutput::SendPacket(_)),
+            "the listener resent a handshake unprompted"
+        );
+    }
 
     caller
-        .handle_timer(TimerId::Handshake, ts(2_750_000))
-        .expect("caller conclusion retry");
-    transfer_caller_to_listener(&mut caller, &mut listener, ts(2_750_000));
-    transfer_listener_to_caller(&mut listener, &mut caller, ts(2_750_000));
+        .handle_timer(TimerId::Handshake, ts(2_000_000))
+        .expect("caller induction retry");
+    transfer_caller_to_listener(&mut caller, &mut listener, ts(2_000_000));
+    transfer_listener_to_caller(&mut listener, &mut caller, ts(2_000_000));
+    transfer_caller_to_listener(&mut caller, &mut listener, ts(2_000_001));
+    transfer_listener_to_caller(&mut listener, &mut caller, ts(2_000_001));
 
     assert_eq!(caller.state(), ConnectionState::Connected);
     assert_eq!(listener.state(), ConnectionState::Connected);

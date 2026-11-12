@@ -25,7 +25,7 @@
 //!   ──────────────────────        ──────────────────────
 //!   WorkerRouter                  PeerTable / AdmissionPeer
 //!   decide_promotion()            ManualTimerStore
-//!   cookie_for_worker()           Handoff / WorkerMessage
+//!   CookieKey (SYN cookies)       Handoff / WorkerMessage
 //!   is_terminal()                 IngressTelemetry
 //!   handshake_identity()          per-runtime Conn
 //! ```
@@ -249,14 +249,29 @@ mod promotion_tests {
 #[cfg(test)]
 mod cookie_tests {
     use super::*;
+    use proptest::prelude::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    /// A fresh key per call: the cookie properties hold for any key, and two
+    /// calls differ (with probability 1 - 2^-256).
+    fn key() -> CookieKey {
+        use std::hash::{BuildHasher, RandomState};
+        let state = RandomState::new();
+        CookieKey::new(&std::array::from_fn(|byte| state.hash_one(byte) as u8))
+    }
+
+    fn peer() -> SocketAddr {
+        "192.0.2.7:4000".parse().unwrap()
+    }
 
     #[test]
-    fn cookie_round_trips_the_owning_worker() {
+    fn cookie_round_trips_the_issuing_worker() {
+        let key = key();
         for workers in [1usize, 2, 4, 17, 64, 256] {
             for worker in 0..workers {
-                let cookie = cookie_for_worker(worker, 0xDEAD_BE00);
+                let cookie = key.issue(worker, peer(), 0x1234, 77);
                 assert_eq!(
-                    worker_from_cookie(cookie, workers),
+                    key.verify(cookie, peer(), 0x1234, 77, workers),
                     Some(worker),
                     "worker {worker} of {workers} did not survive the cookie round trip"
                 );
@@ -264,34 +279,99 @@ mod cookie_tests {
         }
     }
 
+    /// A cookie lives for the bucket it was issued in and the next one.
     #[test]
-    fn cookie_keeps_peer_entropy_outside_the_index_byte() {
-        // Two peers on the same worker must still get distinct cookies,
-        // or the cookie stops being per-connection at all.
-        let a = cookie_for_worker(3, 0x1111_1100);
-        let b = cookie_for_worker(3, 0x2222_2200);
-        assert_ne!(a, b);
-        assert_eq!(a & 0xFF, 3);
-        assert_eq!(b & 0xFF, 3);
+    fn cookie_expires_after_the_following_bucket() {
+        let key = key();
+        let cookie = key.issue(0, peer(), 9, 100);
+        assert_eq!(key.verify(cookie, peer(), 9, 100, 1), Some(0));
+        assert_eq!(key.verify(cookie, peer(), 9, 101, 1), Some(0));
+        assert_eq!(key.verify(cookie, peer(), 9, 102, 1), None);
+        assert_eq!(
+            key.verify(cookie, peer(), 9, 99, 1),
+            None,
+            "not before issue"
+        );
+    }
+
+    /// A cookie is bound to the address and caller socket it was issued
+    /// to, and only the key that issued it verifies it.
+    #[test]
+    fn cookie_is_bound_to_its_address_caller_socket_and_key() {
+        let (key, other_key) = (key(), key());
+        let cookie = key.issue(0, peer(), 9, 5);
+        let other_port = SocketAddr::new(peer().ip(), 4001);
+        let other_ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 8)), 4000);
+        let mapped = SocketAddr::new(
+            IpAddr::V6(Ipv4Addr::new(192, 0, 2, 7).to_ipv6_mapped()),
+            4000,
+        );
+        for address in [other_port, other_ip, mapped] {
+            assert_eq!(key.verify(cookie, address, 9, 5, 1), None, "{address}");
+        }
+        assert_eq!(key.verify(cookie, peer(), 10, 5, 1), None);
+        assert_eq!(other_key.verify(cookie, peer(), 9, 5, 1), None);
     }
 
     #[test]
     fn cookie_index_beyond_worker_count_is_not_routable() {
-        // A cookie this listener never issued (or one from a previous
-        // run with more workers) must not route to a nonexistent worker.
-        let cookie = cookie_for_worker(9, 0);
-        assert_eq!(worker_from_cookie(cookie, 4), None);
+        // A cookie from a layout with more workers must not route to a
+        // worker this one does not have.
+        let key = key();
+        let cookie = key.issue(9, peer(), 1, 1);
+        assert_eq!(key.verify(cookie, peer(), 1, 1, 4), None);
+        assert_eq!(key.verify(cookie, peer(), 1, 1, 0), None);
+        let last = key.issue(MAX_COOKIE_WORKERS - 1, peer(), 1, 1);
+        assert_eq!(
+            key.verify(last, peer(), 1, 1, MAX_COOKIE_WORKERS + 1),
+            Some(MAX_COOKIE_WORKERS - 1)
+        );
     }
 
     #[test]
-    fn cookie_routing_is_declined_for_unsupported_worker_counts() {
-        assert_eq!(worker_from_cookie(0, 0), None);
-        assert_eq!(worker_from_cookie(0, MAX_COOKIE_WORKERS + 1), None);
-        // Exactly at the limit is still fine.
-        assert_eq!(
-            worker_from_cookie(cookie_for_worker(255, 0), 256),
-            Some(255)
-        );
+    fn cookie_debug_does_not_show_the_key() {
+        assert_eq!(format!("{:?}", key()), "CookieKey { .. }");
+    }
+
+    fn address() -> impl Strategy<Value = SocketAddr> {
+        prop_oneof![
+            (any::<u32>(), any::<u16>())
+                .prop_map(|(ip, port)| SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port)),
+            (any::<u128>(), any::<u16>())
+                .prop_map(|(ip, port)| SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip)), port)),
+        ]
+    }
+
+    proptest! {
+        /// Model: a cookie verifies, naming its issuer, exactly when the
+        /// address and caller socket match and the bucket is the issue
+        /// bucket or the next. (A mismatch verifies by chance with
+        /// probability 2 * workers / 2^32, out of reach of this test.)
+        #[test]
+        fn cookie_verifies_exactly_like_the_model(
+            issued_at in address(),
+            presented_at in address(),
+            caller in any::<u32>(),
+            presented_caller in any::<u32>(),
+            bucket in 1..u64::MAX - 4,
+            age in 0u64..4,
+            workers in 1usize..=MAX_COOKIE_WORKERS,
+            worker_seed in any::<usize>(),
+            same_address in any::<bool>(),
+            same_caller in any::<bool>(),
+        ) {
+            let key = key();
+            let worker = worker_seed % workers;
+            let presented_at = if same_address { issued_at } else { presented_at };
+            let presented_caller = if same_caller { caller } else { presented_caller };
+            let cookie = key.issue(worker, issued_at, caller, bucket);
+            let expected = (presented_at == issued_at && presented_caller == caller && age < 2)
+                .then_some(worker);
+            prop_assert_eq!(
+                key.verify(cookie, presented_at, presented_caller, bucket + age, workers),
+                expected
+            );
+        }
     }
 }
 

@@ -305,14 +305,11 @@ pub struct IngressTelemetry {
     pub cookie_routed: AtomicU64,
     /// Cookie-routed CONCLUSIONs whose owning worker channel was closed.
     pub cookie_route_failures: AtomicU64,
-    /// Late or duplicate CONCLUSIONs for a connection this acceptor had
-    /// already promoted (so its peer entry was gone). Harmless, but
-    /// indistinguishable from a stranded handshake without checking the
-    /// cookie -- counted apart so the two are never conflated again.
-    pub promoted_duplicates: AtomicU64,
     /// Malformed or out-of-state datagrams rejected before protocol work.
     pub invalid_datagrams: AtomicU64,
-    /// CONCLUSIONs whose cookie did not match the retained half-open peer.
+    /// CONCLUSIONs whose SYN cookie failed verification: forged, expired,
+    /// issued to another address or caller socket, or not the cookie of the
+    /// half-open peer they name.
     pub invalid_cookies: AtomicU64,
     /// Valid new inductions refused because the half-open table was full.
     pub admission_capacity_drops: AtomicU64,
@@ -355,7 +352,6 @@ pub struct IngressTelemetrySnapshot {
     pub layout_incomplete_drops: u64,
     pub cookie_routed: u64,
     pub cookie_route_failures: u64,
-    pub promoted_duplicates: u64,
     pub invalid_datagrams: u64,
     pub invalid_cookies: u64,
     pub admission_capacity_drops: u64,
@@ -421,9 +417,6 @@ impl IngressTelemetry {
     }
     pub fn record_cookie_route_failure(&self) {
         Self::bump(&self.cookie_route_failures);
-    }
-    pub fn record_promoted_duplicate(&self) {
-        Self::bump(&self.promoted_duplicates);
     }
     pub fn record_invalid_datagram(&self) {
         Self::bump(&self.invalid_datagrams);
@@ -493,7 +486,6 @@ impl IngressTelemetry {
             layout_incomplete_drops: get(&self.layout_incomplete_drops),
             cookie_routed: get(&self.cookie_routed),
             cookie_route_failures: get(&self.cookie_route_failures),
-            promoted_duplicates: get(&self.promoted_duplicates),
             invalid_datagrams: get(&self.invalid_datagrams),
             invalid_cookies: get(&self.invalid_cookies),
             admission_capacity_drops: get(&self.admission_capacity_drops),
@@ -520,7 +512,6 @@ impl IngressTelemetry {
         format!(
             "[bench-{backend}] pool receiver: {} local promotions, {} bond handoffs, \
              {} stranded CONCLUSIONs, {} cookie-routed, {} cookie-route failures, \
-             {} post-promotion dups, \
              {} invalid datagrams, {} invalid cookies, {} total-capacity drops, \
              {} half-open-capacity drops, {} established-capacity drops, \
              {} source-capacity drops, {} policy requests, {} policy configurations, \
@@ -532,7 +523,6 @@ impl IngressTelemetry {
             snapshot.stranded_conclusions,
             snapshot.cookie_routed,
             snapshot.cookie_route_failures,
-            snapshot.promoted_duplicates,
             snapshot.invalid_datagrams,
             snapshot.invalid_cookies,
             snapshot.admission_capacity_drops,
@@ -667,7 +657,6 @@ mod tests {
         t.record_stranded_conclusion();
         t.record_cookie_routed();
         t.record_cookie_route_failure();
-        t.record_promoted_duplicate();
         t.record_invalid_datagram();
         t.record_invalid_cookie();
         t.record_admission_capacity_drop();
@@ -687,7 +676,6 @@ mod tests {
         assert_eq!(s.stranded_conclusions, 1);
         assert_eq!(s.cookie_routed, 1);
         assert_eq!(s.cookie_route_failures, 1);
-        assert_eq!(s.promoted_duplicates, 1);
         assert_eq!(s.invalid_datagrams, 1);
         assert_eq!(s.invalid_cookies, 1);
         assert_eq!(s.admission_capacity_drops, 1);

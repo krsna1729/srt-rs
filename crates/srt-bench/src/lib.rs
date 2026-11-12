@@ -383,7 +383,7 @@ pub struct BenchConfig {
     pub promotion: Promotion,
     /// Receiver only, `ReuseportMulti` only. Route a handshake datagram
     /// to the acceptor named by its SYN cookie when the kernel delivers
-    /// it to the wrong one (see `srt_lifecycle::cookie_for_worker`).
+    /// it to the wrong one (see `srt_lifecycle::CookieKey`).
     /// Defaults on; the switch exists so the rescue can be measured
     /// against not having it.
     pub cookie_routing: bool,

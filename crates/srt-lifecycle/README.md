@@ -29,7 +29,7 @@ helpers. Root re-exports remain available for the existing workspace callers.
         ──────────────────────          ──────────────────────
         WorkerRouter                    PeerTable / AdmissionPeer
         decide_promotion()              ManualTimerStore
-        cookie_for_worker()             Handoff / WorkerMessage
+        CookieKey (SYN cookies)         Handoff / WorkerMessage
         is_terminal()                   IngressTelemetry
         wire::handshake_identity()      per-runtime Conn
 ```
@@ -39,9 +39,9 @@ helpers. Root re-exports remain available for the existing workspace callers.
 An SRT listener fronting a multi-worker service makes two related decisions at
 different points in the two-stage handshake:
 
-1. **Which worker owns this physical handshake?** INDUCTION creates bounded
-   half-open protocol state. The listener encodes its chosen owner in the SYN
-   cookie so a rehashed CONCLUSION can be routed back to that state.
+1. **Which worker owns this physical handshake?** INDUCTION is answered
+   statelessly; the listener mixes the issuing worker into the keyed SYN
+   cookie so a rehashed CONCLUSION is verified and routed back to it.
 2. **Which logical publisher is this?** CONCLUSION carries StreamID and GROUP
    extensions. A bonding group arrives as N independent physical legs; the
    decoded affinity keeps them on one logical owner.
@@ -129,21 +129,27 @@ Under `Never` the router is not consulted at all, so affinity state stays
 empty and legs remain wherever the kernel hashed them. That is the
 diagnostic control which says what affinity plus relocation actually buy.
 
-### SYN-cookie routing
+### SYN cookies
+
+A listener answers INDUCTION without keeping any state: the cookie in its
+answer is a keyed MAC (HMAC-SHA1) over the caller's address and port, the
+caller's socket ID and a 60 s time bucket, and only a CONCLUSION echoing a
+cookie that verifies creates a half-open peer (libsrt's `bake()` cookie,
+core.cpp:11755-11850). A cookie verifies in its issue bucket and the next.
 
 With several acceptors on one SO_REUSEPORT port, the kernel can rehash a
-flow *between* its INDUCTION and CONCLUSION, stranding the handshake on
-an acceptor that holds no cookie state for it. The listener chooses the
-cookie and the caller echoes it, which makes the cookie the one field on
-the wire able to carry listener-chosen routing data through a handshake:
+flow *between* its INDUCTION and CONCLUSION. The issuing acceptor's index
+is mixed into the cookie, so every acceptor holding the same key recovers
+it while verifying:
 
 ```rust
-let cookie = cookie_for_worker(worker_index, peer_entropy);   // low byte = owner
-let owner  = worker_from_cookie(observed_cookie, worker_count); // Option<usize>
+let key = CookieKey::new(&secret);                       // 32 random bytes
+let cookie = key.issue(worker_index, peer, caller_socket_id, bucket);
+let owner = key.verify(cookie, peer, caller_socket_id, bucket, worker_count);
 ```
 
-`None` means "no usable routing information" — handle it locally rather
-than dropping it.
+`None` means the cookie is forged, expired, or was issued to another
+address or caller socket: drop the CONCLUSION.
 
 ## Position in the stack
 

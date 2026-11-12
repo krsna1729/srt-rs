@@ -662,13 +662,27 @@ impl HandshakePacket {
     /// Encode to a control packet.
     pub fn encode(&self, timestamp: u32, dest_socket_id: u32) -> ControlPacket {
         let mut control_info = Vec::new();
+        self.write_control_info(&mut control_info);
+        ControlPacket {
+            control_type: ControlType::Handshake,
+            subtype: 0,
+            type_specific_info: 0,
+            timestamp,
+            dest_socket_id,
+            control_info,
+        }
+    }
 
-        write_u32(&mut control_info, self.version);
-        write_u16(&mut control_info, self.encryption_field);
-        write_u16(&mut control_info, self.extension_field);
-        write_u32(&mut control_info, self.initial_packet_seq & 0x7FFF_FFFF);
-        write_u32(&mut control_info, self.mtu);
-        write_u32(&mut control_info, self.flow_window);
+    /// Append the handshake body (a handshake control packet's
+    /// control-information field) to `control_info`: [`Self::encode`]
+    /// without allocating, when the caller reuses the buffer.
+    pub fn write_control_info(&self, control_info: &mut Vec<u8>) {
+        write_u32(control_info, self.version);
+        write_u16(control_info, self.encryption_field);
+        write_u16(control_info, self.extension_field);
+        write_u32(control_info, self.initial_packet_seq & 0x7FFF_FFFF);
+        write_u32(control_info, self.mtu);
+        write_u32(control_info, self.flow_window);
         // Rejected's discriminant (1000) is only a sentinel for the
         // decoded-from-wire case; the actual wire value a *rejection we
         // originate* must carry is `1000 + reject_reason` (see
@@ -687,33 +701,24 @@ impl HandshakePacket {
         } else {
             self.handshake_type as u32
         };
-        write_u32(&mut control_info, handshake_type_wire);
-        write_u32(&mut control_info, self.socket_id);
-        write_u32(&mut control_info, self.syn_cookie);
+        write_u32(control_info, handshake_type_wire);
+        write_u32(control_info, self.socket_id);
+        write_u32(control_info, self.syn_cookie);
 
         // Peer IP
-        encode_peer_ip(&self.peer_ip, &mut control_info);
+        encode_peer_ip(&self.peer_ip, control_info);
 
         // Extensions.
         for ext in &self.extensions {
-            write_u16(&mut control_info, ext.ext_type as u16);
+            write_u16(control_info, ext.ext_type as u16);
             let len_in_words = ext.data.len().div_ceil(4);
-            write_u16(&mut control_info, len_in_words as u16);
-            write_bytes(&mut control_info, &ext.data);
+            write_u16(control_info, len_in_words as u16);
+            write_bytes(control_info, &ext.data);
             // Padding.
             let padding = len_in_words * 4 - ext.data.len();
             for _ in 0..padding {
-                write_u8(&mut control_info, 0);
+                write_u8(control_info, 0);
             }
-        }
-
-        ControlPacket {
-            control_type: ControlType::Handshake,
-            subtype: 0,
-            type_specific_info: 0,
-            timestamp,
-            dest_socket_id,
-            control_info,
         }
     }
 
