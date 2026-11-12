@@ -128,7 +128,8 @@ struct SentPacket {
     /// be DATA-retransmitted. What remains is the identity a repeated NAK
     /// needs -- the sequence, the message number, and the surrounding
     /// tombstone run that regenerates DROPREQ -- until the cumulative ACK
-    /// retires it.
+    /// retires it, or `SenderBuffer::retire_notified_drops` once its
+    /// DROPREQ is out.
     dropped: bool,
     /// Whether this packet's FIRST datagram has actually left the protocol for
     /// the transport.
@@ -231,6 +232,9 @@ struct PendingNak {
     /// `oldest_unacked` on arrival: a position retired since then, by an
     /// ACK between two visits, was retained when the peer reported it.
     retired_from: u32,
+    /// `peer_ack` on arrival: `[dropped_from, retired_from)` are drops
+    /// retired without a peer ACK, answered with a DROPREQ for the range.
+    dropped_from: u32,
     /// `next_seq` on arrival: no position from here on was sent yet.
     sent_end: u32,
     /// `newest_submitted` on arrival: a position first submitted after the
@@ -358,6 +362,13 @@ pub struct SenderBuffer {
     /// The oldest un-ACKed sequence number.
     oldest_unacked: u32,
 
+    /// The newest cumulative ACK the peer actually sent (or the position a
+    /// local reconciliation discarded to). `[peer_ack, oldest_unacked)` holds
+    /// only dropped messages retired without a peer ACK once their DROPREQs
+    /// were out (libsrt's `sndDropTooLate` fake ACK); a later NAK into that
+    /// range is answered with a DROPREQ for it.
+    peer_ack: u32,
+
     /// The next send sequence number.
     next_seq: u32,
 
@@ -431,10 +442,10 @@ pub struct SenderBuffer {
     retained_tx_even: u32,
     retained_tx_odd: u32,
     /// Retained tombstones (dropped entries not yet retired by the
-    /// cumulative ACK). They occupy window span but no flow-window credit
-    /// and no payload accounting. (Reuses the slot the never-read
-    /// `max_buffer_size` field occupied, so inline state does not grow for
-    /// it.)
+    /// cumulative ACK or after their DROPREQs went out). They occupy window
+    /// span but no flow-window credit and no payload accounting. (Reuses the
+    /// slot the never-read `max_buffer_size` field occupied, so inline state
+    /// does not grow for it.)
     dropped_retained: u32,
     /// Locally discarded packets that exceeded the TLPKTDROP deadline.
     total_dropped: u64,
@@ -590,6 +601,7 @@ impl SenderBuffer {
             loss_list: RetransmitList::default(),
             stale_retransmits: 0,
             oldest_unacked: initial_seq,
+            peer_ack: initial_seq,
             next_seq: initial_seq,
             next_msg: 1,
             negotiated_window: flow_window,
@@ -699,7 +711,7 @@ impl SenderBuffer {
     /// actually crossed the wire. Bounded by the dropped message's own
     /// fragment count (one DROPREQ range names one message), not by the
     /// window.
-    pub(crate) fn note_dropreq_submitted(&mut self, first_seq: u32, last_seq: u32) {
+    pub fn note_dropreq_submitted(&mut self, first_seq: u32, last_seq: u32) {
         let mut sequence = first_seq & SEQUENCE_MASK;
         let last = last_seq & SEQUENCE_MASK;
         loop {
@@ -720,6 +732,7 @@ impl SenderBuffer {
         }
         self.next_seq = sequence_number & 0x7FFF_FFFF;
         self.oldest_unacked = self.next_seq;
+        self.peer_ack = self.next_seq;
         self.expiry_scan_from = self.next_seq;
         self.drop_records.clear();
         self.retained_tx_even = 0;
@@ -1654,6 +1667,14 @@ impl SenderBuffer {
         self.total_acks_received = self.total_acks_received.saturating_add(1);
         let acked = self.discard_acked(ack_seq);
         self.total_bytes_acked = self.total_bytes_acked.saturating_add(acked);
+        // An ACK into the drops retired without one moves nothing, but it
+        // narrows what a later NAK may still name.
+        if ack_seq & !SEQUENCE_MASK == 0
+            && sequence_less_than(self.peer_ack, ack_seq)
+            && !sequence_less_than(self.oldest_unacked, ack_seq)
+        {
+            self.peer_ack = ack_seq;
+        }
     }
 
     /// Discard as `discard_acked(seq)` would for every `seq` of
@@ -1724,6 +1745,7 @@ impl SenderBuffer {
         }
 
         self.oldest_unacked = ack_seq;
+        self.peer_ack = ack_seq;
         // Records the ACK retired entirely leave in one step: they are the
         // front of the sequence-ordered list.
         let retired_records = self.drop_records_before(ack_seq);
@@ -1921,6 +1943,7 @@ impl SenderBuffer {
             seen_starts: BTreeSet::new(),
             known_run: None,
             retired_from: self.oldest_unacked,
+            dropped_from: self.peer_ack,
             sent_end: self.next_seq,
             newest_submitted: self.newest_submitted,
             arrived_at: now,
@@ -2015,21 +2038,12 @@ impl SenderBuffer {
     /// `last_seq`: `Some(true)` once it is all credible, `Some(false)` when
     /// `budget` ran out first (`report.next` is then the first position left
     /// to check), `None` at a position no peer could have reported.
-    ///
-    /// Credible means retained when the report arrived, and either a
-    /// tombstone or submitted by then. A position missing now was never
-    /// sent, already acknowledged when the report arrived, or outside the
-    /// retained span, unless an ACK retired it since the report arrived.
     fn validate_nak_range(
         &self,
         report: &mut PendingNak,
         last_seq: u32,
         budget: &mut u32,
     ) -> Option<bool> {
-        let retired_from = report.retired_from;
-        let sent_end = report.sent_end;
-        let newest_submitted = report.newest_submitted;
-        let mut known_run = report.known_run;
         let mut sequence = report.next;
         let mut left = *budget;
         let done = loop {
@@ -2038,49 +2052,99 @@ impl SenderBuffer {
             }
             left -= 1;
             count_work!(NakPositionsVisited);
-            if let Some((first, last)) = known_run
-                && !sequence_less_than(sequence, first)
-                && !sequence_less_than(last, sequence)
-            {
-                sequence = if sequence_less_than(last, last_seq) {
-                    last
-                } else {
-                    last_seq
-                };
-            } else {
-                known_run = None;
-                // Retained and sent when the report arrived: anything else
-                // is a position the peer could not have observed, even if
-                // it was sent, or sent and retired, since.
-                let at_arrival = !sequence_less_than(sequence, retired_from)
-                    && sequence_less_than(sequence, sent_end);
-                let credible = at_arrival
-                    && match self.packets.get(sequence) {
-                        Some(entry) if entry.dropped => {
-                            known_run =
-                                Some(self.record_nak_tombstone(report, sequence, &mut left));
-                            true
-                        }
-                        Some(entry) => {
-                            entry.submitted
-                                && newest_submitted
-                                    .is_some_and(|newest| !sequence_less_than(newest, sequence))
-                        }
-                        None => sequence_less_than(sequence, self.oldest_unacked),
-                    };
-                if !credible {
-                    return None;
-                }
-            }
+            sequence = self.validate_nak_position(report, sequence, last_seq, &mut left)?;
             if sequence == last_seq {
                 break true;
             }
             sequence = sequence.wrapping_add(1) & SEQUENCE_MASK;
         };
-        report.known_run = known_run;
         report.next = sequence;
         *budget = left;
         Some(done)
+    }
+
+    /// Validate `sequence`, one position of a range ending at `last_seq`;
+    /// returns the last position the check covered (a whole known tombstone
+    /// run or retired range is stepped over), `None` if no peer could have
+    /// reported it.
+    ///
+    /// Credible means retained when the report arrived, and either a
+    /// tombstone or submitted by then, or a drop retired without a peer ACK
+    /// by then. A position missing now was never sent, already acknowledged
+    /// when the report arrived, or outside the retained span, unless an ACK
+    /// retired it since the report arrived.
+    fn validate_nak_position(
+        &self,
+        report: &mut PendingNak,
+        sequence: u32,
+        last_seq: u32,
+        budget: &mut u32,
+    ) -> Option<u32> {
+        if let Some((first, last)) = report.known_run
+            && !sequence_less_than(sequence, first)
+            && !sequence_less_than(last, sequence)
+        {
+            return Some(if sequence_less_than(last, last_seq) {
+                last
+            } else {
+                last_seq
+            });
+        }
+        report.known_run = None;
+        if !sequence_less_than(sequence, report.dropped_from)
+            && sequence_less_than(sequence, report.retired_from)
+        {
+            return Some(Self::record_nak_retired(report, sequence, last_seq, budget));
+        }
+        // Retained and sent when the report arrived: anything else is a
+        // position the peer could not have observed, even if it was sent, or
+        // sent and retired, since.
+        let at_arrival = !sequence_less_than(sequence, report.retired_from)
+            && sequence_less_than(sequence, report.sent_end);
+        let credible = at_arrival
+            && match self.packets.get(sequence) {
+                Some(entry) if entry.dropped => {
+                    report.known_run = Some(self.record_nak_tombstone(report, sequence, budget));
+                    true
+                }
+                Some(entry) => {
+                    entry.submitted
+                        && report
+                            .newest_submitted
+                            .is_some_and(|newest| !sequence_less_than(newest, sequence))
+                }
+                None => sequence_less_than(sequence, self.oldest_unacked),
+            };
+        credible.then_some(sequence)
+    }
+
+    /// Record the part of a range from `sequence` (up to `last_seq`) that
+    /// lies in drops retired without a peer ACK, for one DROPREQ with message
+    /// number 0, as libsrt answers a NAK below its fake ACK
+    /// (core.cpp:9150-9200). Charges the part's span to `budget`; returns
+    /// its last position.
+    fn record_nak_retired(
+        report: &mut PendingNak,
+        sequence: u32,
+        last_seq: u32,
+        budget: &mut u32,
+    ) -> u32 {
+        let retired_last = report.retired_from.wrapping_sub(1) & SEQUENCE_MASK;
+        let last = if sequence_less_than(retired_last, last_seq) {
+            retired_last
+        } else {
+            last_seq
+        };
+        *budget = budget.saturating_sub(last.wrapping_sub(sequence) & SEQUENCE_MASK);
+        if report.seen_starts.insert(sequence) {
+            report.tombstones.push(DroppedMessage {
+                message_number: 0,
+                first_seq: sequence,
+                last_seq: last,
+            });
+        }
+        report.known_run = Some((sequence, last));
+        last
     }
 
     /// Record the tombstone run holding `sequence` for DROPREQ, once per
@@ -2241,11 +2305,13 @@ impl SenderBuffer {
     /// call*, so the connection answers with DROPREQ once per drop.
     ///
     /// The tombstone keeps only what a repeated NAK needs; the media payload
-    /// is released here. `oldest_unacked` deliberately does not advance: the
-    /// peer has not acknowledged these sequences, and until it does they are
-    /// what a repeated NAK is matched against. They retire on the cumulative
-    /// ACK, exactly like live packets.
+    /// is released here. `oldest_unacked` does not advance yet: until the
+    /// peer can know of the drop, the tombstones are what a repeated NAK is
+    /// matched against. They retire on the cumulative ACK, exactly like live
+    /// packets, or, once their DROPREQs are out, at the start of a later
+    /// call (see `retire_notified_drops`).
     pub fn drop_expired(&mut self, now: Timestamp) -> Vec<DroppedMessage> {
+        self.retire_notified_drops();
         let threshold = (self.latency_us * 125 / 100).max(1_000_000);
 
         let mut messages = Vec::new();
@@ -2286,6 +2352,38 @@ impl SenderBuffer {
         self.compact_stale_retransmits(STALE_RETRANSMITS_CHECKED_PER_CALL);
 
         messages
+    }
+
+    /// Retire the tombstones at the front of the window whose DROPREQs have
+    /// gone out, without a peer ACK, as libsrt's `sndDropTooLate` fake ACK
+    /// does (core.cpp:6806-6870): their window storage returns, and the
+    /// flow credit moves on by the positions retired, as if the peer had
+    /// acknowledged them. A peer that stops acknowledging after drops cannot
+    /// wedge the sender. `peer_ack` stays where the peer left it, so a later
+    /// NAK into them is answered with a DROPREQ for the range. Each position
+    /// is walked once, when it retires; the walk stops at the first one that
+    /// cannot.
+    fn retire_notified_drops(&mut self) {
+        if self.dropped_retained == 0 {
+            return;
+        }
+        let mut end = self.oldest_unacked;
+        while sequence_less_than(end, self.next_seq)
+            && self
+                .packets
+                .get(end)
+                .is_some_and(|entry| entry.dropped && entry.drop_notified)
+        {
+            end = end.wrapping_add(1) & SEQUENCE_MASK;
+        }
+        let retired = end.wrapping_sub(self.oldest_unacked) & SEQUENCE_MASK;
+        if retired == 0 {
+            return;
+        }
+        let peer_ack = self.peer_ack;
+        self.discard_acked(end);
+        self.peer_ack = peer_ack;
+        self.peer_window_end = self.peer_window_end.wrapping_add(retired) & SEQUENCE_MASK;
     }
 
     /// Turn one expired message into tombstones, reporting its range.
@@ -4449,7 +4547,9 @@ mod tests {
     }
 
     /// Worst case: every retained position becomes a tombstone. Memory stays
-    /// where it was, and the window backpressures instead of growing.
+    /// where it was, and until the DROPREQs are out (see
+    /// `drops_retire_once_their_dropreqs_are_out_without_a_peer_ack`) the
+    /// window backpressures instead of growing.
     #[test]
     fn an_all_tombstone_window_stays_bounded_and_backpressures() {
         let now = Timestamp::default();
@@ -4492,8 +4592,9 @@ mod tests {
             MAX_DROPREQ_PER_NAK
         );
 
-        // No room for new DATA until the peer acknowledges: the span bound is
-        // what the window has instead of an unbounded tombstone list.
+        // No room for new DATA until the peer acknowledges or the DROPREQs
+        // are out: the span bound is what the window has instead of an
+        // unbounded tombstone list.
         assert!(!buf.can_send());
         assert!(buf.push(vec![1], 1, 1, now).is_none());
         assert_eq!(buf.allocated_pages(), allocated_before);
@@ -4507,6 +4608,115 @@ mod tests {
         assert!(!buf.can_send());
         buf.set_peer_window(WINDOW, 32);
         assert!(buf.can_send(), "the advertised window reopens the flight");
+    }
+
+    /// A sender whose whole `window`-packet flight TLPKTDROP gave up, one
+    /// message per packet, with the messages it dropped.
+    fn dropped_flight(window: u32) -> (SenderBuffer, Vec<DroppedMessage>) {
+        let mut buf = SenderBuffer::new(0, window, 10);
+        for _ in 0..window {
+            buf.push_submitted(vec![1; 64], 1, 1, Timestamp::default())
+                .expect("admitted");
+        }
+        let dropped = buf.drop_expired(Timestamp::from_micros(1_000_001));
+        assert_eq!(dropped.len() as u32, window);
+        (buf, dropped)
+    }
+
+    /// A peer that stops acknowledging after TLPKTDROP must not wedge the
+    /// sender. Once a dropped prefix's DROPREQs are out, the next expiry
+    /// pass retires it the way libsrt's `sndDropTooLate` fake ACK does
+    /// (core.cpp:6806-6870): window storage and flow credit return without a
+    /// peer ACK.
+    #[test]
+    fn drops_retire_once_their_dropreqs_are_out_without_a_peer_ack() {
+        const WINDOW: u32 = 32;
+        let (mut buf, dropped) = dropped_flight(WINDOW);
+        let allocated_before = buf.allocated_pages();
+        // Until the peer can know of the drops, nothing retires: not while
+        // no DROPREQ is out, nor while the oldest one is not.
+        assert!(
+            buf.drop_expired(Timestamp::from_micros(1_000_002))
+                .is_empty()
+        );
+        assert_eq!(buf.retained_span(), WINDOW, "no DROPREQ is out");
+        for message in &dropped[1..] {
+            buf.note_dropreq_submitted(message.first_seq, message.last_seq);
+        }
+        assert!(
+            buf.drop_expired(Timestamp::from_micros(1_000_003))
+                .is_empty()
+        );
+        assert_eq!(buf.retained_span(), WINDOW, "the oldest DROPREQ is not out");
+        buf.note_dropreq_submitted(dropped[0].first_seq, dropped[0].last_seq);
+        assert!(
+            buf.drop_expired(Timestamp::from_micros(1_000_004))
+                .is_empty()
+        );
+        assert_eq!(buf.retained_span(), 0);
+        assert_eq!(buf.oldest_unacked_sequence(), WINDOW);
+        assert!(buf.can_send(), "the retired drops return their credit");
+        assert!(buf.allocated_pages() <= allocated_before);
+        for _ in 0..WINDOW {
+            buf.push_submitted(vec![1; 64], 1, 1, Timestamp::default())
+                .expect("admitted");
+        }
+        assert!(!buf.can_send(), "a full new flight fills the window");
+    }
+
+    /// A NAK into drops retired without a peer ACK is answered with one
+    /// DROPREQ per range, message number 0, as libsrt answers a NAK below its
+    /// fake ACK (core.cpp:9150-9200). A peer ACK below them moves nothing but
+    /// narrows what a NAK may still name.
+    #[test]
+    fn a_nak_into_retired_drops_is_answered_with_a_dropreq_for_the_range() {
+        const WINDOW: u32 = 32;
+        let now = Timestamp::default();
+        let (mut buf, dropped) = dropped_flight(WINDOW);
+        for message in &dropped {
+            buf.note_dropreq_submitted(message.first_seq, message.last_seq);
+        }
+        assert!(
+            buf.drop_expired(Timestamp::from_micros(1_000_002))
+                .is_empty()
+        );
+        for _ in 0..WINDOW {
+            buf.push_submitted(vec![1; 64], 1, 1, now)
+                .expect("admitted");
+        }
+
+        let nak = |buf: &mut SenderBuffer, first_seq, last_seq| {
+            buf.handle_nak_ranges(
+                &[LossRange {
+                    first_seq,
+                    last_seq,
+                }],
+                now,
+            )
+        };
+        let retired = |first_seq, last_seq| DroppedMessage {
+            message_number: 0,
+            first_seq,
+            last_seq,
+        };
+        assert_eq!(
+            nak(&mut buf, 0, WINDOW - 1),
+            Ok(vec![retired(0, WINDOW - 1)])
+        );
+        assert_eq!(buf.stats().packets_in_loss_list, 0);
+
+        buf.handle_ack(WINDOW / 2);
+        assert_eq!(buf.oldest_unacked_sequence(), WINDOW);
+        assert_eq!(
+            nak(&mut buf, 0, 0),
+            Err(InvalidNak),
+            "the peer acknowledged it"
+        );
+        assert_eq!(
+            nak(&mut buf, WINDOW / 2, WINDOW),
+            Ok(vec![retired(WINDOW / 2, WINDOW - 1)])
+        );
+        assert_eq!(buf.stats().packets_in_loss_list, 1, "the live position");
     }
 
     /// A NAK range spanning more tombstoned messages than
