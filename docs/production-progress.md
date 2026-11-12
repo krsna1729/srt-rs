@@ -879,3 +879,23 @@ mutation results and numbers in its commit message.
   change it was dropped as a duplicate. Owner promotion keeps the session in
   the table and answers the repeat (T2). Telling the repeat apart would need
   per-departed-peer state in the bench harness.
+
+## Pass 3 sender: peer-triggered amplification and stalls
+
+Each item below was reproduced by a regression test that failed on
+`8a697ef`; commit messages carry the fail-before output and mutations.
+
+- NAK re-queue amplification and unpaced retransmission (R1/S1). Every
+  repeat of a NAK re-queued every named packet the sender had already
+  popped, and retransmissions bypassed pacing: three repeats of one
+  64-packet NAK sent 192 retransmissions, fifty more at one instant 3,392,
+  and a window-wide NAK at a 100 kB/s configured rate went out within 0 µs.
+  A position retransmitted less than the sender's smoothed RTT before a
+  report arrives is no longer queued (the peer sent that report before the
+  retransmission could reach it; its next periodic NAK re-reports and
+  re-sends), and retransmissions take slots of the new-data pacing
+  schedule, repaying at most one visit (32) of missed slots, as libsrt's
+  `packData` does. The stamp sits in `SentPacket` padding (still 64 B).
+- `total_lost` counted repeats (R6). It counts positions a report newly
+  queues, so a held-back repeat adds nothing (3,392 before, 64 after), as
+  libsrt counts newly inserted losses (core.cpp:9194, 9218).

@@ -22,8 +22,8 @@ fn push_transmitted(buf: &mut SenderBuffer, payload: Vec<u8>, now: Timestamp) ->
     }
 }
 
-/// Report single-sequence losses the way a receiver does.
-fn report_losses(buf: &mut SenderBuffer, sequences: &[u32]) {
+/// Report single-sequence losses the way a receiver does, arriving at `now`.
+fn report_losses(buf: &mut SenderBuffer, sequences: &[u32], now: Timestamp) {
     let ranges: Vec<LossRange> = sequences
         .iter()
         .map(|&sequence| LossRange {
@@ -31,7 +31,7 @@ fn report_losses(buf: &mut SenderBuffer, sequences: &[u32]) {
             last_seq: sequence,
         })
         .collect();
-    let _ = buf.handle_nak_ranges(&ranges);
+    let _ = buf.handle_nak_ranges(&ranges, now);
 }
 
 proptest! {
@@ -126,7 +126,7 @@ proptest! {
 
         // 中間のパケットを NAK
         let lost_seq = (initial_seq + 1) & 0x7FFF_FFFF;
-        report_losses(&mut buf, &[lost_seq]);
+        report_losses(&mut buf, &[lost_seq], now);
 
         prop_assert!(buf.has_retransmit());
     }
@@ -155,7 +155,7 @@ proptest! {
             let every_position_retained = sequences.iter().all(|&sequence| {
                 (sequence.wrapping_sub(initial_seq) & SEQUENCE_MASK) < 32
             });
-            report_losses(&mut sender, &sequences);
+            report_losses(&mut sender, &sequences, Timestamp::default());
             if !every_position_retained {
                 continue;
             }
@@ -166,7 +166,7 @@ proptest! {
             }
         }
 
-        let actual = std::iter::from_fn(|| sender.pop_retransmit(1))
+        let actual = std::iter::from_fn(|| sender.pop_retransmit(1, Timestamp::default()))
             .map(|(header, _)| header.sequence_number)
             .collect::<Vec<_>>();
         prop_assert_eq!(actual, expected);
@@ -186,10 +186,10 @@ proptest! {
 
         // 中間のパケットを NAK
         let lost_seq = (initial_seq + 1) & 0x7FFF_FFFF;
-        report_losses(&mut buf, &[lost_seq]);
+        report_losses(&mut buf, &[lost_seq], now);
 
         // 再送パケットを取得
-        let retransmit = buf.pop_retransmit(1);
+        let retransmit = buf.pop_retransmit(1, now);
         prop_assert!(retransmit.is_some());
         let (hdr, _payload) = retransmit.expect("再送パケットは Some になる想定");
         prop_assert_eq!(hdr.sequence_number, lost_seq);
@@ -435,7 +435,7 @@ proptest! {
     fn prop_sender_differential_state_machine(
         initial_seq in 0u32..0x7FFF_FFFFu32,
         window_size in 64u32..256u32,
-        operations in prop::collection::vec(0u8..8u8, 1..60),
+        operations in prop::collection::vec(0u8..9u8, 1..100),
     ) {
         const MASK: u32 = 0x7FFF_FFFF;
         let mut buf = SenderBuffer::new(initial_seq, window_size, 10);
@@ -450,12 +450,25 @@ proptest! {
         // The peer's advertised window end, moved only by the valid-ACK op
         // (which models a Full ACK carrying the same window back).
         let mut model_window_end = (initial_seq & MASK).wrapping_add(window_size) & MASK;
+        // When each packet was last retransmitted. A loss report arriving
+        // less than the sender's RTT estimate later must not queue it again;
+        // one arriving at or after that must.
+        let mut model_retransmitted_at = std::collections::HashMap::new();
+        let suppression = u64::from(buf.rtt_estimate_micros().0);
+        let mut model_lost = 0u64;
 
         let mut current_time_us = 1_000u64;
 
         for op in operations {
             current_time_us += 1_000;
             let now = Timestamp::from_micros(current_time_us);
+            let may_queue = move |seq: u32,
+                                  retransmitted_at: &std::collections::HashMap<u32, u64>|
+             -> bool {
+                retransmitted_at
+                    .get(&seq)
+                    .is_none_or(|&at| current_time_us - at >= suppression)
+            };
 
             match op {
                 0 => {
@@ -521,30 +534,42 @@ proptest! {
                     let future_ack = model_next_seq.wrapping_add(1 + (current_time_us as u32 % 50)) & MASK;
                     buf.handle_ack(future_ack);
                 }
-                4 => {
-                    // NAK a random sequence in the in-flight span
-                    if !model_packets.is_empty() {
-                        let in_flight = model_packets.len();
-                        let offset = (current_time_us as usize % in_flight) as u32;
-                        let nak_seq = model_oldest_unacked.wrapping_add(offset) & MASK;
-                        report_losses(&mut buf, &[nak_seq]);
-                        if model_packets.contains_key(&nak_seq) && model_retransmit_set.insert(nak_seq) {
+                4 | 5 => {
+                    // NAK a random sequence in the in-flight span (4), or the
+                    // oldest one, queued or not (5).
+                    if op == 5 || !model_packets.is_empty() {
+                        let offset = match model_packets.len() {
+                            0 => 0,
+                            in_flight => (current_time_us as usize % in_flight) as u32,
+                        };
+                        let nak_seq = if op == 4 {
+                            model_oldest_unacked.wrapping_add(offset) & MASK
+                        } else {
+                            model_oldest_unacked
+                        };
+                        let queued_before = buf.stats().packets_in_loss_list;
+                        report_losses(&mut buf, &[nak_seq], now);
+                        // A repeat within the interval of the last
+                        // retransmission never re-sends; one after it always
+                        // does.
+                        let queues = model_packets.contains_key(&nak_seq)
+                            && !model_retransmit_set.contains(&nak_seq)
+                            && may_queue(nak_seq, &model_retransmitted_at);
+                        prop_assert_eq!(
+                            buf.stats().packets_in_loss_list,
+                            queued_before + u32::from(queues)
+                        );
+                        if queues {
+                            model_retransmit_set.insert(nak_seq);
                             model_queue.push_back(nak_seq);
+                            model_lost += 1;
                         }
-                    }
-                }
-                5 => {
-                    // Duplicate NAK on already queued or non-existent sequence
-                    let dup_seq = model_oldest_unacked;
-                    report_losses(&mut buf, &[dup_seq]);
-                    if model_packets.contains_key(&dup_seq) && model_retransmit_set.insert(dup_seq) {
-                        model_queue.push_back(dup_seq);
                     }
                 }
                 6 => {
                     // Pop retransmit
                     if buf.has_retransmit() {
-                        let popped = buf.pop_retransmit(1);
+                        let popped = buf.pop_retransmit(1, now);
                         prop_assert!(popped.is_some());
                         let seq = popped.unwrap().0.sequence_number;
 
@@ -558,6 +583,7 @@ proptest! {
                             }
                         }
                         prop_assert!(found);
+                        model_retransmitted_at.insert(seq, current_time_us);
                     }
                 }
                 7 => {
@@ -578,6 +604,10 @@ proptest! {
                         }
                     }
                 }
+                8 => {
+                    // Time passes: up to one and a half suppression intervals.
+                    current_time_us += current_time_us % (suppression * 3 / 2);
+                }
                 _ => unreachable!(),
             }
 
@@ -594,6 +624,7 @@ proptest! {
             prop_assert_eq!(buf.next_sequence_number(), model_next_seq);
             prop_assert_eq!(buf.has_retransmit(), !model_retransmit_set.is_empty());
             prop_assert_eq!(buf.stats().packets_in_loss_list as usize, model_retransmit_set.len());
+            prop_assert_eq!(buf.stats().total_lost, model_lost);
             prop_assert_eq!(
                 buf.oldest_packet_time().is_some(),
                 !(model_packets.is_empty() && model_dropped.is_empty())
@@ -685,7 +716,7 @@ proptest! {
         let mut whole = nak_sender(count, expired, fragments);
         let mut bounded = nak_sender(count, expired, fragments);
 
-        let expected = whole.handle_nak_ranges(&ranges);
+        let expected = whole.handle_nak_ranges(&ranges, Timestamp::default());
         let got = receive_in_visits(&mut bounded, ranges);
         prop_assert_eq!(&got, &expected);
         prop_assert_eq!(

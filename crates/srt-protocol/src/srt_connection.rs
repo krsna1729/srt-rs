@@ -2037,11 +2037,6 @@ impl SrtConnection {
 
     /// Get a packet to retransmit and add it to the send queue.
     ///
-    /// `now` is kept for signature consistency with this Core's other
-    /// methods (this method itself no longer uses it -- see
-    /// `SenderBuffer::pop_retransmit`'s doc comment for why retransmitted
-    /// packets' `sent_time` is no longer updated).
-    ///
     /// Bounded to `MAX_RETRANSMITS_PER_VISIT` per call (P01): a NAK
     /// reporting a large loss range, or a visit catching up after one,
     /// used to encrypt and queue the connection's entire retained send
@@ -2050,6 +2045,10 @@ impl SrtConnection {
     /// so stopping early here leaves the remainder exactly where it was --
     /// membership and FIFO ordering are untouched, and a follow-up visit
     /// picks up right where this one left off.
+    ///
+    /// Paced: each retransmission takes a slot of the send-period schedule
+    /// new data uses (`SenderBuffer::retransmit_pacing_wait`), so a visit
+    /// also stops when the schedule has no slot left at `now`.
     pub fn process_retransmit(&mut self, now: Timestamp) {
         let dest_socket_id = self.peer_socket_id;
         // This function only *drains* what is already queued: whatever put a
@@ -2069,11 +2068,13 @@ impl SrtConnection {
         let mut dropped = 0u32;
         let mut first_dropped_seq = None;
         for _ in 0..MAX_RETRANSMITS_PER_VISIT {
-            let Some((header, payload)) = self
-                .sender
-                .as_mut()
-                .and_then(|s| s.pop_retransmit(dest_socket_id))
-            else {
+            let Some((header, payload)) = self.sender.as_mut().and_then(|s| {
+                if s.retransmit_pacing_wait(now) == 0 {
+                    s.pop_retransmit(dest_socket_id, now)
+                } else {
+                    None
+                }
+            }) else {
                 break;
             };
             let seq = header.sequence_number;
@@ -2100,37 +2101,37 @@ impl SrtConnection {
         // left work behind. A conforming peer's periodic NAK will usually
         // re-report deferred sequences on its own (`ReceiverBuffer` re-emits
         // its whole loss list every periodic-NAK interval), but this must not
-        // *depend* on that -- so the follow-up is armed at `duration_micros: 0`
-        // (due immediately, not after a fixed delay): any nonzero fixed
-        // interval turns the per-visit cap into a hard aggregate
-        // retransmit-rate ceiling (packets-per-visit / interval), an unrelated
-        // policy this card has no documented rate to justify. A zero-delay
-        // rearm only bounds *work per call*, which is this card's actual
-        // charter, and lets the transport's own poll cadence decide how fast
-        // the remainder actually goes out.
+        // *depend* on that. The follow-up is due when the pacing schedule has
+        // its next slot: at once when the per-visit cap stopped this visit
+        // with slots still owed, later when the schedule ran out. The rate is
+        // the configured bandwidth, the same ceiling new data has; the
+        // per-visit cap only bounds *work per call*.
         //
         // Loss detection is a different mechanism entirely and lives on
         // `TimerId::SenderRto`; this one only continues work already queued.
         //
         // The same continuation finishes a peer loss report too large for
         // one visit (`SenderBuffer::receive_nak`) and drops acknowledged
-        // packets a large ACK left (`SenderBuffer::release_acked_packets`).
-        if self.has_retransmit()
-            || self
-                .sender
-                .as_ref()
-                .is_some_and(SenderBuffer::has_pending_nak)
-        {
-            self.arm_retransmit_continue();
-        } else {
-            self.continue_acked_release_later();
+        // packets a large ACK left (`SenderBuffer::release_acked_packets`),
+        // both at once.
+        let continue_after = self.sender.as_ref().and_then(|sender| {
+            if sender.has_pending_nak() || sender.has_acked_packets_to_release() {
+                Some(0)
+            } else if sender.has_retransmit() {
+                Some(sender.retransmit_pacing_wait(now))
+            } else {
+                None
+            }
+        });
+        if let Some(delay) = continue_after {
+            self.arm_retransmit_continue(delay);
         }
     }
 
-    fn arm_retransmit_continue(&mut self) {
+    fn arm_retransmit_continue(&mut self, duration_micros: u64) {
         self.queue_output(QueuedOutput::SetTimer {
             id: TimerId::RetransmitContinue,
-            duration_micros: 0,
+            duration_micros,
         });
     }
 
@@ -2141,7 +2142,7 @@ impl SrtConnection {
             .as_ref()
             .is_some_and(SenderBuffer::has_acked_packets_to_release)
         {
-            self.arm_retransmit_continue();
+            self.arm_retransmit_continue(0);
         }
     }
 
@@ -2296,7 +2297,7 @@ impl SrtConnection {
                     self.continue_pending_naks(now);
                     self.process_retransmit(now);
                 } else if more_acked {
-                    self.arm_retransmit_continue();
+                    self.arm_retransmit_continue(0);
                 }
             }
             TimerId::DeliveryContinue => {
@@ -7379,10 +7380,13 @@ mod tests {
             .sender
             .as_mut()
             .expect("connected sender")
-            .handle_nak_ranges(&[LossRange {
-                first_seq: first + 1,
-                last_seq: first + 1,
-            }])
+            .handle_nak_ranges(
+                &[LossRange {
+                    first_seq: first + 1,
+                    last_seq: first + 1,
+                }],
+                now,
+            )
             .unwrap();
         assert!(caller.has_retransmit(), "the NAK leaves work pending");
 
@@ -7480,19 +7484,25 @@ mod tests {
         // *retransmit* path, not the original transmission.
         while caller.poll_output().unwrap().is_some() {}
 
-        // Simulate the peer NAK-ing every one of them in one range.
+        // Simulate the peer NAK-ing every one of them in one range, once the
+        // pacing slots those sends took have passed (retransmissions share
+        // that schedule).
+        let first_visit = Timestamp::from_micros(10_000);
         let last_seq = first_seq.wrapping_add(SENT as u32 - 1);
         caller
             .sender
             .as_mut()
             .expect("connected sender")
-            .handle_nak_ranges(&[LossRange {
-                first_seq,
-                last_seq,
-            }])
+            .handle_nak_ranges(
+                &[LossRange {
+                    first_seq,
+                    last_seq,
+                }],
+                first_visit,
+            )
             .unwrap();
 
-        caller.process_retransmit(now);
+        caller.process_retransmit(first_visit);
 
         let mut first_visit_seqs = Vec::new();
         let mut first_visit_rearmed = false;
@@ -7531,7 +7541,7 @@ mod tests {
         );
 
         // The follow-up visit (as if the self-armed timer had just fired).
-        caller.process_retransmit(Timestamp::from_micros(1_000));
+        caller.process_retransmit(Timestamp::from_micros(11_000));
 
         let mut second_visit_seqs = Vec::new();
         let mut second_visit_rearmed = false;
@@ -7564,6 +7574,189 @@ mod tests {
             "once the loss list is fully drained there is nothing left to resume"
         );
         assert!(!caller.has_retransmit());
+    }
+
+    /// Drain `conn`'s output, following each `RetransmitContinue` it arms
+    /// after the delay it asks for (as a transport timer store would), and
+    /// return every retransmitted DATA as `(emitted at, sequence)`.
+    fn drain_retransmissions(conn: &mut SrtConnection, at: &mut u64) -> Vec<(u64, u32)> {
+        let mut retransmitted = Vec::new();
+        loop {
+            let mut continue_after = None;
+            while let Some(output) = conn.poll_output().expect("output materializes") {
+                match output {
+                    ConnectionOutput::SendPacket(bytes) => {
+                        if let Ok(SrtPacket::Data(packet)) = SrtPacket::decode(&bytes)
+                            && packet.retransmitted
+                        {
+                            retransmitted.push((*at, packet.sequence_number));
+                        }
+                    }
+                    ConnectionOutput::SetTimer {
+                        id: TimerId::RetransmitContinue,
+                        duration_micros,
+                    } => continue_after = Some(duration_micros),
+                    _ => {}
+                }
+            }
+            let Some(delay) = continue_after else {
+                return retransmitted;
+            };
+            *at += delay;
+            conn.handle_timer(TimerId::RetransmitContinue, Timestamp::from_micros(*at))
+                .expect("continuation");
+        }
+    }
+
+    /// A caller that sent `count` packets of `payload` bytes at time 0, all
+    /// drained to the wire, with no peer ACK.
+    fn sent_unacknowledged(count: u32, payload: usize) -> (SrtConnection, u32, u32) {
+        let (mut caller, _listener) = connected_pair();
+        let first = caller.next_sequence_number().expect("connected sender");
+        for _ in 0..count {
+            caller
+                .send(&vec![0u8; payload], Timestamp::from_micros(0))
+                .expect("send admits the payload");
+        }
+        drain_outputs(&mut caller);
+        let last = first.wrapping_add(count - 1) & SEQUENCE_MASK;
+        (caller, first, last)
+    }
+
+    /// A NAK repeated before the sender's own RTT estimate has elapsed since
+    /// a packet's last retransmission is a report the peer sent before that
+    /// retransmission could have reached it, so it re-sends nothing; a NAK
+    /// after the interval is evidence the retransmission itself was lost and
+    /// re-sends again. libsrt skips such repeats too
+    /// (`CUDT::checkRexmitRightTime`, core.cpp:9827-9862).
+    #[test]
+    fn a_repeated_nak_retransmits_each_loss_once_per_rtt() {
+        let (mut caller, first, last) = sent_unacknowledged(64, 100);
+        let nak = nak_datagram(caller.socket_id(), &[first, last]);
+        let mut at = 10_000;
+
+        caller
+            .feed_recv_buf(&nak, Timestamp::from_micros(at))
+            .expect("a credible NAK is accepted");
+        let burst = drain_retransmissions(&mut caller, &mut at);
+        assert_eq!(burst.len(), 64, "the first NAK repairs every loss");
+        let mut retransmitted = burst.len();
+        for _ in 0..2 {
+            caller
+                .feed_recv_buf(&nak, Timestamp::from_micros(at))
+                .expect("a credible NAK is accepted");
+            retransmitted += drain_retransmissions(&mut caller, &mut at).len();
+        }
+        assert_eq!(retransmitted, 64, "three repeats of one NAK");
+
+        for _ in 0..50 {
+            caller
+                .feed_recv_buf(&nak, Timestamp::from_micros(at))
+                .expect("a credible NAK is accepted");
+            retransmitted += drain_retransmissions(&mut caller, &mut at).len();
+        }
+        assert_eq!(retransmitted, 64, "fifty more repeats at one instant");
+        assert_eq!(
+            caller.sender_stats().expect("sender").total_lost,
+            64,
+            "a repeat that queues nothing reports no new loss"
+        );
+
+        // The sender has no RTT feedback yet, so its estimate is the initial
+        // 100 ms. Pacing spreads the burst, so each packet's interval starts
+        // at its own retransmission.
+        let srtt = u64::from(
+            caller
+                .sender
+                .as_ref()
+                .expect("sender")
+                .rtt_estimate_micros()
+                .0,
+        );
+        let first_retransmission = burst[0].0;
+        let last_retransmission = burst[burst.len() - 1].0;
+        let resent_by = |caller: &mut SrtConnection, at: &mut u64| {
+            caller
+                .feed_recv_buf(&nak, Timestamp::from_micros(*at))
+                .expect("a credible NAK is accepted");
+            drain_retransmissions(caller, at)
+                .into_iter()
+                .map(|(_, seq)| seq)
+                .collect::<Vec<_>>()
+        };
+
+        // Just inside the earliest retransmission's interval, nothing is due.
+        at = first_retransmission + srtt - 1;
+        assert_eq!(resent_by(&mut caller, &mut at), Vec::<u32>::new());
+
+        // Halfway through the burst's intervals, exactly the packets
+        // retransmitted at least one estimate earlier re-send.
+        at = (first_retransmission + last_retransmission) / 2 + srtt;
+        let due = |at: u64| {
+            burst
+                .iter()
+                .filter(|&&(emitted, _)| emitted + srtt <= at)
+                .map(|&(_, seq)| seq)
+                .collect::<Vec<_>>()
+        };
+        let early = due(at);
+        assert!(
+            !early.is_empty() && early.len() < 64,
+            "{} early",
+            early.len()
+        );
+        assert_eq!(resent_by(&mut caller, &mut at), early);
+
+        // Past the last one's interval, the rest re-send; the half that just
+        // went is inside its new interval.
+        at = at.max(last_retransmission + srtt);
+        let rest = due(at)
+            .into_iter()
+            .filter(|seq| !early.contains(seq))
+            .collect::<Vec<_>>();
+        assert_eq!(early.len() + rest.len(), 64);
+        assert_eq!(resent_by(&mut caller, &mut at), rest);
+        assert_eq!(caller.sender_stats().expect("sender").total_lost, 128);
+    }
+
+    /// Retransmissions share the send-period schedule with new data, as
+    /// libsrt's `packData` advances `m_tsNextSendTime` for every packet it
+    /// sends: one window-wide NAK goes out at the configured rate (after at
+    /// most one visit's burst), not as fast as the continuation can run.
+    #[test]
+    fn retransmissions_are_paced_at_the_configured_bandwidth() {
+        const PAYLOAD: usize = 1_000;
+        const BYTES_PER_SECOND: u64 = 100_000;
+        let (mut caller, first, last) = sent_unacknowledged(64, PAYLOAD);
+        caller
+            .sender
+            .as_mut()
+            .expect("sender")
+            .set_max_bandwidth(BYTES_PER_SECOND);
+        let start = 2_000_000;
+        let mut at = start;
+        caller
+            .feed_recv_buf(
+                &nak_datagram(caller.socket_id(), &[first, last]),
+                Timestamp::from_micros(at),
+            )
+            .expect("a credible NAK is accepted");
+        let retransmitted = drain_retransmissions(&mut caller, &mut at);
+        assert_eq!(retransmitted.len(), 64, "every loss is still repaired");
+
+        // The pacing period is at least one header plus payload at the
+        // configured rate.
+        let min_period = (PAYLOAD + SRT_HEADER_SIZE) as u64 * 1_000_000 / BYTES_PER_SECOND;
+        for window in [0, 50_000, 200_000] {
+            let within = retransmitted
+                .iter()
+                .filter(|&&(emitted, _)| emitted - start <= window)
+                .count() as u64;
+            assert!(
+                within <= MAX_RETRANSMITS_PER_VISIT as u64 + window / min_period + 1,
+                "{within} retransmissions within {window} us"
+            );
+        }
     }
 
     /// A cumulative ACK of a large flight retires it at once and leaves only
@@ -9055,6 +9248,8 @@ mod tests {
             drain_until_one_data_packet_submitted(caller);
         }
         let last = first.wrapping_add(sent / 2 - 1);
+        // Not about pacing: every retransmission is queued at `now`.
+        caller.set_packet_send_period(0);
         caller
             .feed_recv_buf(&nak_datagram(socket_id, &[first, last]), now)
             .expect("the NAK names submitted packets");

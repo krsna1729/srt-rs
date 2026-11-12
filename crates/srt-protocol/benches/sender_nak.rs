@@ -52,7 +52,7 @@ fn bench_sender_nak_scale(c: &mut Criterion) {
         b.iter_batched_ref(
             || populated_sender(PACKETS),
             |sender| {
-                let _ = sender.handle_nak_ranges(black_box(&expanded_ranges));
+                let _ = sender.handle_nak_ranges(black_box(&expanded_ranges), Timestamp::default());
                 black_box(sender.has_retransmit());
             },
             BatchSize::SmallInput,
@@ -64,7 +64,7 @@ fn bench_sender_nak_scale(c: &mut Criterion) {
         b.iter_batched_ref(
             || populated_sender(PACKETS),
             |sender| {
-                let _ = sender.handle_nak_ranges(black_box(&dense_range));
+                let _ = sender.handle_nak_ranges(black_box(&dense_range), Timestamp::default());
                 black_box(sender.has_retransmit());
             },
             BatchSize::SmallInput,
@@ -76,11 +76,11 @@ fn bench_sender_nak_scale(c: &mut Criterion) {
         b.iter_batched_ref(
             || {
                 let mut sender = populated_sender(PACKETS);
-                let _ = sender.handle_nak_ranges(&expanded_ranges);
+                let _ = sender.handle_nak_ranges(&expanded_ranges, Timestamp::default());
                 sender
             },
             |sender| {
-                let _ = sender.handle_nak_ranges(black_box(&expanded_ranges));
+                let _ = sender.handle_nak_ranges(black_box(&expanded_ranges), Timestamp::default());
                 black_box(sender.has_retransmit());
             },
             BatchSize::SmallInput,
@@ -92,11 +92,11 @@ fn bench_sender_nak_scale(c: &mut Criterion) {
         b.iter_batched_ref(
             || {
                 let mut sender = populated_sender(PACKETS);
-                let _ = sender.handle_nak_ranges(&dense_range);
+                let _ = sender.handle_nak_ranges(&dense_range, Timestamp::default());
                 sender
             },
             |sender| {
-                let _ = sender.handle_nak_ranges(black_box(&dense_range));
+                let _ = sender.handle_nak_ranges(black_box(&dense_range), Timestamp::default());
                 black_box(sender.has_retransmit());
             },
             BatchSize::SmallInput,
@@ -108,12 +108,12 @@ fn bench_sender_nak_scale(c: &mut Criterion) {
         b.iter_batched_ref(
             || {
                 let mut sender = populated_sender(PACKETS);
-                let _ = sender.handle_nak_ranges(&dense_range);
+                let _ = sender.handle_nak_ranges(&dense_range, Timestamp::default());
                 sender
             },
             |sender| {
                 let mut drained = 0;
-                while let Some((hdr, _)) = sender.pop_retransmit(1400) {
+                while let Some((hdr, _)) = sender.pop_retransmit(1400, Timestamp::default()) {
                     black_box(hdr);
                     drained += 1;
                 }
@@ -159,7 +159,11 @@ fn bench_sender_nak_tombstones(c: &mut Criterion) {
         b.iter_batched_ref(
             || many_one_packet(TOMBSTONES),
             |sender| {
-                black_box(sender.handle_nak_ranges(black_box(&dense_range)).ok());
+                black_box(
+                    sender
+                        .handle_nak_ranges(black_box(&dense_range), Timestamp::default())
+                        .ok(),
+                );
             },
             BatchSize::SmallInput,
         );
@@ -179,7 +183,11 @@ fn bench_sender_nak_tombstones(c: &mut Criterion) {
         b.iter_batched_ref(
             one_giant_fragmented_tombstone,
             |sender| {
-                black_box(sender.handle_nak_ranges(black_box(&dense_range)).ok());
+                black_box(
+                    sender
+                        .handle_nak_ranges(black_box(&dense_range), Timestamp::default())
+                        .ok(),
+                );
             },
             BatchSize::SmallInput,
         );
@@ -202,7 +210,13 @@ fn bench_sender_nak_visit(c: &mut Criterion) {
     group.bench_function("whole_report_65536", |b| {
         b.iter_batched_ref(
             || populated_sender(WINDOW),
-            |sender| black_box(sender.handle_nak_ranges(black_box(&full_window)).is_ok()),
+            |sender| {
+                black_box(
+                    sender
+                        .handle_nak_ranges(black_box(&full_window), Timestamp::default())
+                        .is_ok(),
+                )
+            },
             BatchSize::LargeInput,
         );
     });

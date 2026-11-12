@@ -83,12 +83,16 @@ fn nak_crossing_page_boundary_and_sequence_wrap() {
         first_seq: 60,
         last_seq: 70,
     }];
-    sender.handle_nak_ranges(&page_crossing_range).unwrap();
+    sender
+        .handle_nak_ranges(&page_crossing_range, Timestamp::default())
+        .unwrap();
     assert_eq!(sender.stats().packets_in_loss_list, 11);
 
     // Pop and verify retransmit packets are in order
     for expected in 60..=70 {
-        let (header, _) = sender.pop_retransmit(1400).expect("pop retransmit");
+        let (header, _) = sender
+            .pop_retransmit(1400, Timestamp::default())
+            .expect("pop retransmit");
         assert_eq!(header.sequence_number, expected);
     }
     assert_eq!(sender.stats().packets_in_loss_list, 0);
@@ -104,11 +108,13 @@ fn nak_crossing_page_boundary_and_sequence_wrap() {
         first_seq: 0x7fff_fff8,
         last_seq: 5,
     }];
-    wrap_sender.handle_nak_ranges(&wrap_loss_range).unwrap();
+    wrap_sender
+        .handle_nak_ranges(&wrap_loss_range, Timestamp::default())
+        .unwrap();
     assert_eq!(wrap_sender.stats().packets_in_loss_list, 14);
 
     let mut popped = Vec::new();
-    while let Some((hdr, _)) = wrap_sender.pop_retransmit(1400) {
+    while let Some((hdr, _)) = wrap_sender.pop_retransmit(1400, Timestamp::default()) {
         popped.push(hdr.sequence_number);
     }
     assert_eq!(popped.len(), 14);
@@ -126,10 +132,13 @@ fn retransmit_queue_entry_survives_physical_page_reuse_and_rejects_stale_alias()
     }
     // NAK seq 10 on page 0
     sender
-        .handle_nak_ranges(&[LossRange {
-            first_seq: 10,
-            last_seq: 10,
-        }])
+        .handle_nak_ranges(
+            &[LossRange {
+                first_seq: 10,
+                last_seq: 10,
+            }],
+            Timestamp::default(),
+        )
         .unwrap();
     assert!(sender.has_retransmit());
 
@@ -144,5 +153,7 @@ fn retransmit_queue_entry_survives_physical_page_reuse_and_rejects_stale_alias()
     assert_eq!(sender.packets_in_flight(), 64);
 
     // Stale sequence 10 must NOT alias to seq 74
-    assert!(!sender.has_retransmit() || sender.pop_retransmit(1400).is_none());
+    assert!(
+        !sender.has_retransmit() || sender.pop_retransmit(1400, Timestamp::default()).is_none()
+    );
 }
