@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794393925571,
+  "lastUpdate": 1794480340868,
   "repoUrl": "https://github.com/krsna1729/srt-rs",
   "entries": {
     "Benchmark": [
@@ -332,6 +332,43 @@ window.BENCHMARK_DATA = {
           {
             "name": "tokio",
             "value": 40076.5,
+            "unit": "pkt/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Saikrishna Edupuganti",
+            "username": "krsna1729",
+            "email": "6157640+krsna1729@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "8a697efb9e12cc78d22de099298d76b78adc385d",
+          "message": "Fix connection drains, bonded transitions and directional encryption (#193)\n\n* Fix connection drains, bonded ordering and directional encryption\n\nProblem: inactivity could truncate complete fragmented messages or lose incomplete-tail expiry. Bonded receive could skip recoverable backpressured DATA; failover hid viable standbys and restamped retained packets. Independent members could overfill group capacity. Initial bidirectional encrypted traffic reused handshake key/nonce space, and retired TX keys could be reflected as RX material.\n\nPreserve bounded drain continuations and inactivity decisions; service group delivery under one shared64-action budget before declaring a gap impossible. Inherit a group-owned clock with explicit wrap phases, retain progress across member churn, and defer epoch carries while raw packets/losses/assembly still need the old epoch. Preserve original replay source times separately from current service time. Recheck admission capacity, preserve failed-adoption ownership, and expose logical caller lifecycle events. Confirm fresh directional TX keys through standard KMREQ/KMRSP before application readiness; retain bounded zeroizing TX identities and reject post-terminal confirmations. Extract polling phases and regression setup/assertions without changing behavior or exempting complexity gates.\n\nEvidence: independent crypto/delivery and bonded reviews APPROVE, including final extraction deltas. Targeted batch:160 connection unit tests;112 protocol integration tests;13 delivery/KM/group properties;85 caller/admission tests;22 Compio bonded Owner tests. Receiver inline budget passes. Delivery matrix covers576 deterministic scenarios plus64 action-model cases. Changed extraction paths were rechecked; all-target/all-feature Clippy passes. Six deliberate mutations exercise terminal-KMRSP, wrap refresh, prewrap carry, group refill, group continuation and64-member guards; original incomplete-tail hang fails before its fix. All guards restored and regressions pass.\n\nInterop:18/18 Haivision1.5.7 and18/18 Robotweax0.3.2 on filters live_ _gcm_ _5pct_loss compio_owner_direct, serial. Post-extraction native public-C encrypted bidirectional exchange, Compio broadcast bonding and Compio direct caller also pass against Haivision1.5.7. One earlier Robotweax loss-case failure did not reproduce in isolated baseline/current checks or the final matrix; cause remains unattributed. No behavior workaround or gate override added.\n\nPerformance host vmi3423592:AMD EPYC KVM,6vCPU,x86-64-v3. Isolated ba833dd6 export vs final tree; env -u RUSTFLAGS RUSTC_WORKSPACE_WRAPPER= cargo bench -p srt-proto --bench core_packet_loop -- 'core_packet_loop/(plain_send_recv|aes128_send_recv|aes128_gcm_send_recv)/64$' --warm-up-time 1 --measurement-time 2 --sample-size 20 --save-baseline NAME. Group uses --bench group_requalification and identical settings. Separate target directories, saved transitions-before/after. Median us [95%CI] before/after:plain58.891[57.183,61.981]/62.881[61.707,66.110];CTR140.457[134.484,156.809]/147.851[143.651,154.028];GCM198.139[189.008,205.903]/205.904[197.897,211.810];group16.376[15.120,17.319]/15.436[14.916,17.359]. Intervals overlap; no gain or clear regression claimed. These workloads cover direct batch64 packet loops and group requalification, not group-receive capacity.\n\n* Wait for confirmed keys in resolver UDP fixtures\n\nCI caught two resolver tests sending as soon as coarse LogicalCallerState::Connected was visible, before the new directional KM confirmation completed. Wait for LogicalCallerMut::can_send while continuing the same bounded two-Owner pump; document the protocol-state/writability distinction. No production behavior or readiness guard changed.\n\nEvidence: failed CI run42881974386 reported534 transport tests passing and2 resolver send failures. The unchanged resolver behavior assertions now pass:env RUSTC_WORKSPACE_WRAPPER= cargo test -p srt-transport --all-features --lib compio_transport::listener_resolver_tests (8 passed). Independent crypto/delivery critic APPROVE. Latency still measured from each actual send; credentials, refusals and resolver invocation checks unchanged.",
+          "timestamp": "2026-11-10T23:22:57Z",
+          "url": "https://github.com/krsna1729/srt-rs/commit/8a697efb9e12cc78d22de099298d76b78adc385d"
+        },
+        "date": 1794480340456,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "compio",
+            "value": 23796.9,
+            "unit": "pkt/s"
+          },
+          {
+            "name": "mio",
+            "value": 55898.5,
+            "unit": "pkt/s"
+          },
+          {
+            "name": "tokio",
+            "value": 37997.3,
             "unit": "pkt/s"
           }
         ]
