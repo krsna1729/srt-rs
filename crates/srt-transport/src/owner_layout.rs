@@ -13,15 +13,65 @@
 
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::admission::{Admit, PromotionWork, RelocatedLeg, SharedWorkerRouter, TableRelocation};
 use crate::reuseport_group::{MemberClaim, ReusePortGroup};
 use crate::{ConfigError, IngressTelemetry, ResolvedListenerTopology, RuntimeBuildError};
 
-/// Most CONCLUSIONs one Owner holds for other acceptor-group members before
-/// the application drains them; more are counted as dropped and cost the
-/// caller a handshake retry. Sessions and slot releases are never dropped.
+/// Most CONCLUSION forwards addressed to one acceptor-group member that
+/// exist at once: queued at their source member, carried by the
+/// application, or waiting in the target's inbox. Each holds one of its
+/// target's credits until the target accepts it or it is dropped; a forward
+/// without a credit is counted as dropped and costs the caller a handshake
+/// retry. Sessions and slot releases take no credit and are never dropped.
 pub(crate) const LISTENER_FORWARD_CAPACITY: usize = 256;
+
+/// Forward credits of one reuseport layout: the CONCLUSION forwards
+/// addressed to each member that currently exist, shared by the layout's
+/// plans like its router and group.
+struct ForwardCredits {
+    in_flight: Box<[AtomicUsize]>,
+}
+
+impl ForwardCredits {
+    fn new(members: usize) -> Arc<Self> {
+        Arc::new(Self {
+            in_flight: (0..members).map(|_| AtomicUsize::new(0)).collect(),
+        })
+    }
+
+    /// A credit for one more forward to member `to`, unless
+    /// [`LISTENER_FORWARD_CAPACITY`] are out. The count only bounds a
+    /// quantity and publishes nothing, so relaxed ordering is enough; the
+    /// read-modify-write keeps concurrent members from overshooting it.
+    fn take(self: &Arc<Self>, to: usize) -> Option<ForwardCredit> {
+        self.in_flight
+            .get(to)?
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < LISTENER_FORWARD_CAPACITY).then_some(n + 1)
+            })
+            .ok()?;
+        Some(ForwardCredit {
+            credits: Arc::clone(self),
+            to,
+        })
+    }
+}
+
+/// One forwarded CONCLUSION's claim on its target member's credits,
+/// returned when the transfer is accepted or dropped.
+struct ForwardCredit {
+    credits: Arc<ForwardCredits>,
+    to: usize,
+}
+
+impl Drop for ForwardCredit {
+    fn drop(&mut self) {
+        self.credits.in_flight[self.to].fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// One Owner's place in a `SO_REUSEPORT` acceptor group: `count` Owners,
 /// each on its own thread with its own socket on one port.
@@ -66,7 +116,9 @@ impl ReusePortMember {
 
 /// A message from one Owner of a listener layout to another. The
 /// application only routes it: deliver it to member `to` with that Owner's
-/// `accept_listener_transfer`. The payload is opaque.
+/// `accept_listener_transfer`, or drop it. The payload is opaque. A
+/// handshake transfer holds one of member `to`'s 256 forward credits until
+/// then.
 pub struct ListenerTransfer {
     pub to: usize,
     kind: TransferKind,
@@ -75,7 +127,11 @@ pub struct ListenerTransfer {
 enum TransferKind {
     /// A CONCLUSION whose SYN cookie names member `to`, which holds the
     /// half-open handshake and resolves admission policy.
-    Handshake { peer: SocketAddr, data: Vec<u8> },
+    Handshake {
+        peer: SocketAddr,
+        data: Vec<u8>,
+        credit: ForwardCredit,
+    },
     /// An established bonded leg moving to the member that holds its group,
     /// with its connected socket.
     Session {
@@ -88,7 +144,9 @@ enum TransferKind {
 
 impl ListenerTransfer {
     /// A CONCLUSION forward. Handshake forwards are the only transfers the
-    /// transport may drop under backlog (the caller retries).
+    /// transport may drop under backlog (the caller retries): at most 256
+    /// addressed to one member exist until it accepts them or they are
+    /// dropped.
     #[must_use]
     pub fn is_handshake(&self) -> bool {
         matches!(self.kind, TransferKind::Handshake { .. })
@@ -127,6 +185,8 @@ pub struct OwnerListenerPlan {
     router: Option<SharedWorkerRouter>,
     /// Membership of a reuseport layout's kernel group, shared by its plans.
     group: Option<std::sync::Arc<ReusePortGroup>>,
+    /// A reuseport layout's forward credits, shared by its plans.
+    forward_credits: Option<Arc<ForwardCredits>>,
 }
 
 impl std::fmt::Debug for OwnerListenerPlan {
@@ -198,12 +258,14 @@ pub fn owner_plans(
     });
     let bind = prepared.bind;
     // One membership record per reuseport layout: the barrier, the
-    // one-claim-per-member rule and the one-layout-per-address rule.
-    let group = match prepared.transport.topology {
-        ResolvedListenerTopology::ReusePortMulti { acceptors } => {
-            Some(ReusePortGroup::new(bind, acceptors.get()))
-        }
-        _ => None,
+    // one-claim-per-member rule and the one-layout-per-address rule. Its
+    // forward credits bound the CONCLUSIONs in flight to each member.
+    let (group, forward_credits) = match prepared.transport.topology {
+        ResolvedListenerTopology::ReusePortMulti { acceptors } => (
+            Some(ReusePortGroup::new(bind, acceptors.get())),
+            Some(ForwardCredits::new(acceptors.get())),
+        ),
+        _ => (None, None),
     };
     let plan = |member, bind| OwnerListenerPlan {
         config: config.clone(),
@@ -211,6 +273,7 @@ pub fn owner_plans(
         bind,
         router: router.clone(),
         group: group.clone(),
+        forward_credits: forward_credits.clone(),
     };
     let explicit_port = |owners: usize| {
         if owners > 1 && bind.port() == 0 {
@@ -360,7 +423,9 @@ pub(crate) struct ListenerRouting {
     pub(crate) index: usize,
     pub(crate) count: usize,
     transfers: VecDeque<ListenerTransfer>,
-    queued_handshakes: usize,
+    /// The layout's forward credits; `None` outside a reuseport layout,
+    /// where admission never forwards.
+    forward_credits: Option<Arc<ForwardCredits>>,
     dropped: u64,
     promotion: Option<PromotionIo>,
     /// Connected sockets adopted or promoted here, for the runtime to
@@ -398,7 +463,7 @@ impl ListenerRouting {
             index,
             count,
             transfers: VecDeque::new(),
-            queued_handshakes: 0,
+            forward_credits: plan.and_then(|plan| plan.forward_credits.clone()),
             dropped: 0,
             promotion,
             promoted: Vec::new(),
@@ -425,7 +490,8 @@ impl ListenerRouting {
         self.group_complete
     }
 
-    /// Queue a CONCLUSION admission said belongs to another member.
+    /// Queue a CONCLUSION admission said belongs to another member, if that
+    /// member has a forward credit left.
     fn record(
         &mut self,
         admitted: &Admit,
@@ -436,18 +502,23 @@ impl ListenerRouting {
         let Admit::ForwardTo(to) = *admitted else {
             return;
         };
-        if self.queued_handshakes < LISTENER_FORWARD_CAPACITY {
-            self.queued_handshakes += 1;
-            self.transfers.push_back(ListenerTransfer {
+        match self
+            .forward_credits
+            .as_ref()
+            .and_then(|credits| credits.take(to))
+        {
+            Some(credit) => self.transfers.push_back(ListenerTransfer {
                 to,
                 kind: TransferKind::Handshake {
                     peer,
                     data: data.to_vec(),
+                    credit,
                 },
-            });
-        } else {
-            self.dropped += 1;
-            telemetry.record_cookie_route_failure();
+            }),
+            None => {
+                self.dropped += 1;
+                telemetry.record_cookie_route_failure();
+            }
         }
     }
 
@@ -585,8 +656,10 @@ impl ListenerRouting {
         telemetry: &IngressTelemetry,
     ) {
         match transfer.kind {
-            TransferKind::Handshake { peer, data } => {
+            TransferKind::Handshake { peer, data, credit } => {
                 self.admit(table, resolver, peer, &data, now, options, telemetry);
+                // Consumed: the target's inbox has room for one more.
+                drop(credit);
             }
             TransferKind::Session { leg, socket } => {
                 let physical = crate::admission::PhysicalPeerKey {
@@ -645,10 +718,11 @@ impl ListenerRouting {
                 kind: TransferKind::SlotReleased { slot },
             });
         }
-        self.queued_handshakes = 0;
         out.extend(self.transfers.drain(..));
     }
 
+    /// CONCLUSION forwards this member dropped because their target had no
+    /// forward credit left.
     pub(crate) fn dropped(&self) -> u64 {
         self.dropped
     }
@@ -998,6 +1072,98 @@ mod tests {
         assert_eq!(invalid(), 1);
         routing.admit(&mut table, None, session, &other, now, &options, &telemetry);
         assert_eq!(table.len(), 2, "the listener socket admits it");
+    }
+
+    /// T4: CONCLUSION forwards addressed to one member are bounded while
+    /// they exist, not per drain. Each holds a credit of its target member
+    /// until that member accepts it or the application drops it. The cap
+    /// used to reset on every `drain_into`, so the inbox of a member that
+    /// consumed slower than its peers forwarded grew without bound (one
+    /// verified CONCLUSION, replayed, is enough).
+    #[test]
+    fn forwarded_handshakes_are_bounded_until_their_member_consumes_them() {
+        use crate::admission::tests::next_packet;
+        let config = config(
+            40_030,
+            crate::ListenerTopology::ReusePortMulti {
+                acceptors: count(2),
+            },
+            crate::PromotionPolicy::Never,
+        );
+        let flavor = crate::RuntimeFlavor::Mio;
+        let plans = owner_plans(&config, flavor).expect("plans");
+        let prepared = config.prepare(flavor).expect("prepared");
+        let mut tables: Vec<_> = plans
+            .iter()
+            .map(|plan| listener_table(&prepared, Some(plan)))
+            .collect();
+        let mut routings: Vec<_> = plans
+            .iter()
+            .map(|plan| ListenerRouting::new(&prepared, Some(plan), None))
+            .collect();
+        let options = prepared.admission_options();
+        let telemetry = IngressTelemetry::new();
+        let now = srt_proto::Timestamp::from_micros(1);
+        let peer: SocketAddr = "10.0.0.70:5000".parse().unwrap();
+        // Member 1 issues the cookie.
+        let mut caller = srt_proto::SrtConnection::new_caller(srt_proto::ConnectionOptions {
+            socket_id: 0x70,
+            ..srt_proto::ConnectionOptions::default()
+        });
+        caller.connect(now).expect("start caller");
+        let induction = next_packet(&mut caller);
+        routings[1].admit(
+            &mut tables[1],
+            None,
+            peer,
+            &induction,
+            now,
+            &options,
+            &telemetry,
+        );
+        let mut outbound = Vec::new();
+        tables[1].poll_outbound(now, &mut outbound);
+        for (_, packet) in outbound {
+            caller
+                .feed_recv_buf(&packet, now)
+                .expect("induction answer");
+        }
+        let conclusion = next_packet(&mut caller);
+        // Member 0 forwards every copy to member 1; nothing delivers them.
+        let mut inbox = Vec::new();
+        let forward = |routing: &mut ListenerRouting,
+                       table: &mut crate::PeerTable,
+                       inbox: &mut Vec<ListenerTransfer>| {
+            routing.admit(table, None, peer, &conclusion, now, &options, &telemetry);
+            routing.drain_into(table, inbox);
+        };
+        let (member0, rest) = routings.split_first_mut().expect("two members");
+        let (table0, tables1) = tables.split_first_mut().expect("two tables");
+        for _ in 0..300 {
+            forward(member0, &mut *table0, &mut inbox);
+        }
+        assert_eq!(
+            (inbox.len(), member0.dropped()),
+            (LISTENER_FORWARD_CAPACITY, 44)
+        );
+        // Member 1 consumes one: its credit returns.
+        let transfer = inbox.pop().expect("a forward");
+        rest[0].accept(transfer, &mut tables1[0], None, now, &options, &telemetry);
+        assert_eq!(tables1[0].len(), 1, "member 1 admitted the forward");
+        forward(member0, &mut *table0, &mut inbox);
+        assert_eq!(
+            (inbox.len(), member0.dropped()),
+            (LISTENER_FORWARD_CAPACITY, 44)
+        );
+        // The application drops one: its credit returns too.
+        drop(inbox.pop());
+        forward(member0, &mut *table0, &mut inbox);
+        assert_eq!(
+            (inbox.len(), member0.dropped()),
+            (LISTENER_FORWARD_CAPACITY, 44)
+        );
+        forward(member0, &mut *table0, &mut inbox);
+        assert_eq!(member0.dropped(), 45);
     }
 }
 

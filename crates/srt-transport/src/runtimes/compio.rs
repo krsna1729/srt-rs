@@ -4214,7 +4214,8 @@ impl Owner {
         }
     }
 
-    /// CONCLUSIONs dropped because the forward queue was full.
+    /// CONCLUSION forwards this Owner dropped because their target member
+    /// already had 256 undelivered or unaccepted forwards.
     #[must_use]
     pub fn listener_forwards_dropped(&self) -> u64 {
         self.listener

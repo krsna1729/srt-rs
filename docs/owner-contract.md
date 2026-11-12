@@ -254,7 +254,14 @@ application only routes them.** After every service visit it drains
   never forwarded. Member `to` issued the cookie, creates the half-open peer
   and runs the resolver. These are the only transfers the transport drops
   under backlog (`listener_forwards_dropped`; the caller retries its
-  handshake).
+  handshake). At most 256 (`LISTENER_FORWARD_CAPACITY`) handshake transfers
+  addressed to one member exist at once, across every source member: each
+  holds one of that member's credits from the moment it is queued until
+  `accept_listener_transfer` consumes it or the application drops it. A
+  forward with no credit left is dropped at its source. An application that
+  holds handshake transfers (a stalled target, a queue it never drains)
+  therefore stops forwards to that member instead of growing its inbox;
+  deliver promptly, and drop rather than hoard what cannot be delivered.
 * under promotion `Relocate` on `ReusePortMulti`, an established bonded leg
   that the kernel hashed to a member other than the one holding its group
   (one router per layout, created by `owner_plans`, decides). The source
