@@ -603,8 +603,9 @@ impl ListenerRouting {
     }
 
     /// [`Self::admit_bytes`] for a datagram from a promoted session's
-    /// connected socket: a handshake that would create a peer at that
-    /// session's 4-tuple is dropped and counted as invalid
+    /// connected socket: a CONCLUSION at that session's 4-tuple that neither
+    /// belongs to a live peer nor carries a cookie this member issued there
+    /// is dropped and counted as invalid
     /// ([`crate::PeerTable::admits_from_private_socket`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn admit_private_bytes(
@@ -617,7 +618,7 @@ impl ListenerRouting {
         options: &crate::AdmissionOptions,
         telemetry: &IngressTelemetry,
     ) {
-        if table.admits_from_private_socket(peer, &data) {
+        if table.admits_from_private_socket(peer, &data, self.index, self.count) {
             self.admit_bytes(table, resolver, peer, data, now, options, telemetry);
         } else {
             telemetry.record_invalid_datagram();
@@ -637,7 +638,7 @@ impl ListenerRouting {
         options: &crate::AdmissionOptions,
         telemetry: &IngressTelemetry,
     ) {
-        if table.admits_from_private_socket(peer, data) {
+        if table.admits_from_private_socket(peer, data, self.index, self.count) {
             self.admit(table, resolver, peer, data, now, options, telemetry);
         } else {
             telemetry.record_invalid_datagram();
@@ -1023,14 +1024,15 @@ mod tests {
     }
 
     /// T1: a promoted session's connected socket receives only that
-    /// session's 4-tuple. A CONCLUSION arriving there that names no live peer
-    /// (another caller socket claiming the address) is dropped as invalid
-    /// instead of creating a peer, whose departure closed the live session's
-    /// socket. The session's own retransmitted CONCLUSION and an INDUCTION
-    /// (answered without state) still pass; the listener socket still admits
-    /// that other caller.
+    /// session's 4-tuple. A CONCLUSION arriving there whose cookie this
+    /// member did not issue to that caller socket at that address (here, one
+    /// issued to another address) is dropped as invalid before it creates
+    /// state. The session's own retransmitted CONCLUSION and an INDUCTION
+    /// (answered without state) pass, and so does a caller restarted on the
+    /// same address and port with a verified cookie: it connects at once, as
+    /// libsrt accepts it.
     #[test]
-    fn a_promoted_socket_never_creates_a_peer() {
+    fn a_promoted_socket_admits_only_live_or_verified_conclusions() {
         use crate::admission::tests::{conclusion_from, induction_packet};
         let prepared = config(
             40_020,
@@ -1066,12 +1068,24 @@ mod tests {
         table.poll_outbound(now, &mut outbound);
         assert_eq!(invalid(), 0);
 
-        let other = conclusion_from(&mut table, session, 0x62, &options, &telemetry, now);
-        routing.admit_private(&mut table, None, session, &other, now, &options, &telemetry);
-        assert_eq!(table.len(), 1, "no peer is created from a promoted socket");
+        let elsewhere: SocketAddr = "10.0.0.61:5000".parse().unwrap();
+        let replayed = conclusion_from(&mut table, elsewhere, 0x62, &options, &telemetry, now);
+        routing.admit_private(
+            &mut table, None, session, &replayed, now, &options, &telemetry,
+        );
+        assert_eq!(table.len(), 1, "a replayed cookie creates no peer");
         assert_eq!(invalid(), 1);
-        routing.admit(&mut table, None, session, &other, now, &options, &telemetry);
-        assert_eq!(table.len(), 2, "the listener socket admits it");
+
+        let restarted = conclusion_from(&mut table, session, 0x63, &options, &telemetry, now);
+        routing.admit_private(
+            &mut table, None, session, &restarted, now, &options, &telemetry,
+        );
+        assert_eq!(
+            (table.len(), table.established_count()),
+            (2, 2),
+            "a caller restarted at the session's address connects at once"
+        );
+        assert_eq!(invalid(), 1);
     }
 
     /// T4: CONCLUSION forwards addressed to one member are bounded while

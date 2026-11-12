@@ -271,9 +271,11 @@ application only routes them.** After every service visit it drains
   socket, and reports it like any other listener peer. One bonded publisher
   therefore stays one stream. If the socket cannot be made, the leg stays
   where it is, as under `Never`. A connected socket receives only its leg's
-  4-tuple, so a handshake arriving there never creates a peer: a CONCLUSION
-  passes only when it belongs to a live peer (a retransmission that peer
-  answers), and any other is dropped and counted as `invalid_datagrams`.
+  4-tuple. A CONCLUSION arriving there passes when it belongs to a live peer
+  (a retransmission that peer answers) or carries a cookie this member
+  issued to that caller socket at that address (a caller restarted on the
+  same address and port, which connects at once while the old leg lives, as
+  libsrt accepts it); any other is dropped and counted as `invalid_datagrams`.
   The socket closes when the last peer at its address leaves the table.
 * a slot release. Members allocate socket IDs from disjoint slot residues,
   so a relocated leg keeps its ID on its new member. The source member holds

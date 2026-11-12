@@ -1590,17 +1590,26 @@ impl PeerTable {
     }
 
     /// Whether a datagram that arrived on the connected socket of a promoted
-    /// session at `peer` may enter admission. That socket receives only this
-    /// 4-tuple, which a live session already holds, so it never creates a
-    /// peer: a CONCLUSION passes only when it belongs to a live peer (a
-    /// retransmission that peer answers). Everything else creates no state
-    /// and passes: traffic demultiplexed by socket ID, and an INDUCTION,
-    /// answered without state.
+    /// session at `peer` may enter admission, as member `worker_index` of
+    /// `worker_count`. That socket receives only this 4-tuple, which a live
+    /// session already holds. A CONCLUSION passes when it belongs to a live
+    /// peer (a retransmission that peer answers) or carries a cookie this
+    /// member issued to that caller socket at that address
+    /// ([`Self::verify_new_conclusion`]): a caller restarted on the same
+    /// address and port, which libsrt accepts at once as a new connection
+    /// (it matches by socket ID, `api.cpp` `locatePeer`). Any other
+    /// CONCLUSION is refused before it creates state. Everything else
+    /// creates no state and passes: traffic demultiplexed by socket ID, and
+    /// an INDUCTION, answered without state. A peer created here never
+    /// closes the live session's socket on its way out
+    /// (`note_slot_freed` frees an address only once no live peer holds it).
     #[inline]
     pub(crate) fn admits_from_private_socket(
         &self,
         peer: std::net::SocketAddr,
         data: &[u8],
+        worker_index: usize,
+        worker_count: usize,
     ) -> bool {
         if !is_handshake_datagram(data) {
             return true;
@@ -1618,6 +1627,25 @@ impl PeerTable {
                 .physical_for_datagram(peer, destination_socket_id)
                 .or_else(|| self.route_conclusion(peer, packet.socket_id, identity.syn_cookie))
                 .is_some()
+            || Self::cookie_issuer(&packet, &identity, peer, worker_count) == Some(worker_index)
+    }
+
+    /// The member that issued a CONCLUSION's SYN cookie to this caller
+    /// socket at `peer` within the cookie's lifetime, if any.
+    #[inline]
+    fn cookie_issuer(
+        packet: &srt_proto::handshake::HandshakePacket,
+        identity: &srt_lifecycle::HandshakeIdentity,
+        peer: std::net::SocketAddr,
+        worker_count: usize,
+    ) -> Option<usize> {
+        SYN_COOKIES.key.verify(
+            identity.syn_cookie,
+            peer,
+            packet.socket_id,
+            SYN_COOKIES.bucket(),
+            worker_count,
+        )
     }
 
     /// Whether a CONCLUSION naming no live peer is admitted here (`Ok`), or
@@ -1631,14 +1659,7 @@ impl PeerTable {
         identity: &srt_lifecycle::HandshakeIdentity,
         scope: AdmissionScope<'_>,
     ) -> Result<(), Admit> {
-        let owner = SYN_COOKIES.key.verify(
-            identity.syn_cookie,
-            scope.peer,
-            packet.socket_id,
-            SYN_COOKIES.bucket(),
-            scope.worker_count,
-        );
-        match owner {
+        match Self::cookie_issuer(packet, identity, scope.peer, scope.worker_count) {
             None => {
                 scope.telemetry.record_invalid_cookie();
                 Err(Admit::Dropped(AdmissionDropReason::InvalidCookie))
@@ -4523,15 +4544,16 @@ impl PeerTable {
             .and_then(|physical| self.get_peer(&physical))
     }
 
-    /// Benchmark-only access to `admits_from_private_socket`, the
-    /// gate every datagram from a promoted connected socket passes.
+    /// Benchmark-only access to `admits_from_private_socket` for a
+    /// single-member layout, the gate every datagram from a promoted
+    /// connected socket passes.
     #[cfg(feature = "bench-internals")]
     pub fn admits_from_private_socket_for_bench(
         &self,
         peer: std::net::SocketAddr,
         data: &[u8],
     ) -> bool {
-        self.admits_from_private_socket(peer, data)
+        self.admits_from_private_socket(peer, data, 0, 1)
     }
 
     /// Mutable twin of [`Self::direct_for_bench`]: ACK/NAK a StayOnListener
@@ -6791,13 +6813,10 @@ pub(crate) mod tests {
         assert_eq!(telemetry.snapshot().cookie_routed, 0);
     }
 
-    /// T1: a peer leaving the table frees its address for the runtime (which
-    /// closes the promoted connected socket there) only when no other live
-    /// peer remains at that address. A second caller socket at a promoted
-    /// session's address, rejected by policy, used to close the live
-    /// session's socket on its way out.
-    #[test]
-    fn a_peer_leaving_an_address_another_live_peer_holds_does_not_free_it() {
+    /// A table in a single-member relocating layout: departing peers free
+    /// their addresses for the runtime, which closes a promoted connected
+    /// socket there.
+    fn relocating_table() -> PeerTable {
         let mut table = PeerTable::new();
         table.set_relocation(TableRelocation {
             mode: srt_lifecycle::Promotion::Relocate,
@@ -6805,20 +6824,36 @@ pub(crate) mod tests {
             router: std::sync::Arc::new(std::sync::Mutex::new(srt_lifecycle::WorkerRouter::new(1))),
             exclusive: true,
         });
+        table
+    }
+
+    /// An established session of caller socket `socket_id` at `peer`.
+    fn established_at(
+        table: &mut PeerTable,
+        peer: std::net::SocketAddr,
+        socket_id: u32,
+        options: &AdmissionOptions,
+        telemetry: &IngressTelemetry,
+    ) -> SrtConnection {
+        let (mut caller, conclusion) =
+            admit_up_to_conclusion(table, peer, socket_id, options, telemetry);
+        admit_conclusion(table, peer, &mut caller, &conclusion, options, telemetry);
+        assert_eq!(caller.state(), srt_proto::ConnectionState::Connected);
+        caller
+    }
+
+    /// T1: a peer leaving the table frees its address for the runtime (which
+    /// closes the promoted connected socket there) only when no other live
+    /// peer remains at that address. A second caller socket at a promoted
+    /// session's address, rejected by policy, used to close the live
+    /// session's socket on its way out.
+    #[test]
+    fn a_peer_leaving_an_address_another_live_peer_holds_does_not_free_it() {
+        let mut table = relocating_table();
         let telemetry = IngressTelemetry::new();
         let options = default_options();
         let shared: std::net::SocketAddr = "10.0.0.50:5000".parse().unwrap();
-        let (mut live, conclusion) =
-            admit_up_to_conclusion(&mut table, shared, 0x50, &options, &telemetry);
-        admit_conclusion(
-            &mut table,
-            shared,
-            &mut live,
-            &conclusion,
-            &options,
-            &telemetry,
-        );
-        assert_eq!(live.state(), srt_proto::ConnectionState::Connected);
+        established_at(&mut table, shared, 0x50, &options, &telemetry);
         let now = Timestamp::from_micros(10);
         let second = conclusion_from(&mut table, shared, 0x51, &options, &telemetry, now);
         assert_eq!(
@@ -6844,6 +6879,132 @@ pub(crate) mod tests {
             vec![shared],
             "the last peer at the address frees it"
         );
+    }
+
+    /// Run caller socket `socket_id`'s handshake at `peer` through a
+    /// promoted socket's gate and then the table (member 0 of 1); returns
+    /// the caller.
+    fn handshake_through_promoted_socket(
+        table: &mut PeerTable,
+        peer: std::net::SocketAddr,
+        socket_id: u32,
+        options: &AdmissionOptions,
+        telemetry: &IngressTelemetry,
+        now: Timestamp,
+    ) -> SrtConnection {
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id,
+            ..ConnectionOptions::default()
+        });
+        caller.connect(now).expect("start caller");
+        let mut outbound = Vec::new();
+        for _ in 0..2 {
+            let handshake = next_packet(&mut caller);
+            assert!(
+                table.admits_from_private_socket(peer, &handshake, 0, 1),
+                "the caller's handshake passes the connected socket"
+            );
+            assert_eq!(
+                table.admit(peer, &handshake, now, options, 0, 1, telemetry),
+                Admit::Fed
+            );
+            table.poll_outbound(now, &mut outbound);
+            for (_, reply) in outbound.drain(..) {
+                let _ = caller.feed_recv_buf(&reply, now);
+            }
+        }
+        caller
+    }
+
+    /// The CONCLUSION of caller socket `socket_id` at `peer` after member 0
+    /// of a two-member layout answered its INDUCTION.
+    fn conclusion_issued_by_member_zero_of_two(
+        table: &mut PeerTable,
+        peer: std::net::SocketAddr,
+        socket_id: u32,
+        options: &AdmissionOptions,
+        telemetry: &IngressTelemetry,
+        now: Timestamp,
+    ) -> Vec<u8> {
+        let mut caller = SrtConnection::new_caller(ConnectionOptions {
+            socket_id,
+            ..ConnectionOptions::default()
+        });
+        caller.connect(now).expect("start caller");
+        let induction = next_packet(&mut caller);
+        let _ = table.admit(peer, &induction, now, options, 0, 2, telemetry);
+        let mut outbound = Vec::new();
+        table.poll_outbound(now, &mut outbound);
+        for (_, reply) in outbound {
+            let _ = caller.feed_recv_buf(&reply, now);
+        }
+        next_packet(&mut caller)
+    }
+
+    /// T1: a caller restarted on a promoted session's address and port, with
+    /// a new caller socket ID, completes its handshake through that session's
+    /// connected socket at once, while the old session still lives: libsrt
+    /// accepts it as a new connection (it matches by socket ID, `api.cpp`
+    /// `locatePeer`). It used to be refused until the old session idled out
+    /// (~5 s, past libsrt's 3 s default connect timeout). Whichever of the
+    /// two leaves first, the address (so the connected socket) stays until
+    /// the other leaves too. A CONCLUSION whose cookie this member did not
+    /// issue to that caller socket at that address is still refused there.
+    #[test]
+    fn a_caller_restarted_at_a_live_sessions_address_connects_at_once() {
+        for old_leaves_first in [true, false] {
+            let mut table = relocating_table();
+            let telemetry = IngressTelemetry::new();
+            let options = default_options();
+            let shared: std::net::SocketAddr = "10.0.0.52:5000".parse().unwrap();
+            let now = Timestamp::from_micros(10);
+            let old = established_at(&mut table, shared, 0x70, &options, &telemetry);
+            let restarted = handshake_through_promoted_socket(
+                &mut table, shared, 0x71, &options, &telemetry, now,
+            );
+            assert_eq!(
+                restarted.state(),
+                srt_proto::ConnectionState::Connected,
+                "the restart connects while the old session lives"
+            );
+            assert_eq!((table.len(), table.established_count()), (2, 2));
+
+            let elsewhere: std::net::SocketAddr = "10.0.0.53:5000".parse().unwrap();
+            let replayed = conclusion_from(&mut table, elsewhere, 0x72, &options, &telemetry, now);
+            assert!(
+                !table.admits_from_private_socket(shared, &replayed, 0, 1),
+                "a cookie issued to another address is refused"
+            );
+            let foreign = conclusion_issued_by_member_zero_of_two(
+                &mut table, shared, 0x73, &options, &telemetry, now,
+            );
+            assert!(
+                !table.admits_from_private_socket(shared, &foreign, 1, 2),
+                "a cookie another member issued is never forwarded from a connected socket"
+            );
+
+            let key = |caller: &SrtConnection| PhysicalPeerKey {
+                address: shared,
+                local_socket_id: caller.peer_socket_id(),
+            };
+            let (first, second) = if old_leaves_first {
+                (key(&old), key(&restarted))
+            } else {
+                (key(&restarted), key(&old))
+            };
+            assert!(table.remove_physical(first).is_some());
+            assert_eq!(
+                table.take_freed_addresses().collect::<Vec<_>>(),
+                Vec::<std::net::SocketAddr>::new(),
+                "the other session still holds the address (old leaves first: {old_leaves_first})"
+            );
+            assert!(table.remove_physical(second).is_some());
+            assert_eq!(
+                table.take_freed_addresses().collect::<Vec<_>>(),
+                vec![shared],
+                "the last session at the address frees it"
+            );
+        }
     }
 
     /// RS1/T3: an INDUCTION is answered from no state (libsrt
