@@ -714,55 +714,43 @@ const KM_REQUEST_MAX_RETRIES: u8 = 4;
 /// `KM_REQUEST_MAX_RETRIES` unanswered retries at this fixed cadence.
 const KM_REQUEST_RETRY_INTERVAL_MICROS: u64 = 1_000_000;
 
-/// Fresh-salt KEK derivations a connection allows at once (see
+/// Fresh-salt KEK derivations a connection allows in its lifetime (see
 /// [`KekDerivationBudget`]).
 const KM_KEK_DERIVATION_BURST: u8 = 2;
-
-/// One fresh-salt KEK derivation is restored per this interval.
-const KM_KEK_DERIVATION_REFILL_MICROS: u64 = 1_000_000;
 
 /// Bound on PBKDF2 work a peer's KMREQs can cause.
 ///
 /// A KMREQ under a salt with no cached KEK costs one 2048-iteration
-/// PBKDF2-HMAC-SHA1 derivation before its wrap can even be checked. A token
-/// bucket admits `KM_KEK_DERIVATION_BURST` such derivations at once and
-/// restores one per `KM_KEK_DERIVATION_REFILL_MICROS`. Legitimate peers need
-/// few: libsrt keeps its salt for the whole session, and Robotweax announces
-/// one new salt per direction after connecting. A KMREQ refused here gets
-/// no KMRSP and changes nothing, so the peer's own retry installs it once a
-/// derivation is available again.
+/// PBKDF2-HMAC-SHA1 derivation before its wrap can even be checked. A
+/// connection admits `KM_KEK_DERIVATION_BURST` such derivations for its
+/// whole lifetime, never refilled: a refill would let one peer force a
+/// derivation per interval forever. Legitimate peers need at most one:
+/// libsrt generates its salt once (`hcryptCtx_Tx_Rekey` from
+/// `HaiCrypt_Create`, hcrypt.c:161; `hcryptCtx_Tx_Refresh` keeps it), and
+/// Robotweax announces one new TX salt after connecting and keeps it for
+/// its rekeys. Every session already paid one listener-table-limited
+/// derivation at CONCLUSION, so an Owner's runtime derivations stay within
+/// twice its admitted sessions. A KMREQ refused here gets no KMRSP and
+/// changes nothing.
 struct KekDerivationBudget {
-    tokens: u8,
-    /// When `tokens` was last brought up to date.
-    updated_at: Option<Timestamp>,
+    remaining: u8,
 }
 
 impl Default for KekDerivationBudget {
     fn default() -> Self {
         Self {
-            tokens: KM_KEK_DERIVATION_BURST,
-            updated_at: None,
+            remaining: KM_KEK_DERIVATION_BURST,
         }
     }
 }
 
 impl KekDerivationBudget {
-    /// Take one derivation if available at `now`.
-    fn try_take(&mut self, now: Timestamp) -> bool {
-        let updated_at = *self.updated_at.get_or_insert(now);
-        let restored = now.saturating_sub(updated_at) / KM_KEK_DERIVATION_REFILL_MICROS;
-        if restored > 0 {
-            let tokens = u64::from(self.tokens).saturating_add(restored);
-            self.tokens = u8::try_from(tokens)
-                .unwrap_or(u8::MAX)
-                .min(KM_KEK_DERIVATION_BURST);
-            self.updated_at =
-                Some(updated_at.add_micros(restored * KM_KEK_DERIVATION_REFILL_MICROS));
-        }
-        if self.tokens == 0 {
+    /// Take one derivation if any is left.
+    fn try_take(&mut self) -> bool {
+        let Some(remaining) = self.remaining.checked_sub(1) else {
             return false;
-        }
-        self.tokens -= 1;
+        };
+        self.remaining = remaining;
         true
     }
 }
@@ -4956,7 +4944,7 @@ impl SrtConnection {
                 .km_control
                 .get_or_insert_with(Box::default)
                 .kek_derivations
-                .try_take(now)
+                .try_take()
         {
             return Err(Error::invalid_data(
                 "KMREQ salt exceeds the KEK derivation budget",
@@ -14230,10 +14218,11 @@ mod tests {
     }
 
     /// Each fresh salt costs a 2048-iteration PBKDF2 derivation, so a
-    /// connection admits `KM_KEK_DERIVATION_BURST` at once and one more per
-    /// `KM_KEK_DERIVATION_REFILL_MICROS`. A refused KMREQ is unanswered and
-    /// changes nothing; salts with a cached KEK cost nothing; the peer's
-    /// retry after the interval installs.
+    /// connection admits `KM_KEK_DERIVATION_BURST` of them for its whole
+    /// lifetime: libsrt never changes its salt mid-session and Robotweax
+    /// announces one new one. A refused KMREQ is unanswered and changes
+    /// nothing, however long the peer waits; salts with a cached KEK cost
+    /// nothing and keep installing.
     #[test]
     #[cfg_attr(
         all(miri, not(feature = "miri-extended")),
@@ -14262,11 +14251,16 @@ mod tests {
         let odd_under_session_salt =
             libsrt_km_body(0b10, test_km_salt(), &[&fixture_key(0x94)], ctr);
         feed_kmreq_expect_echo(&mut listener, &odd_under_session_salt, now.add_micros(4));
-        feed_kmreq_expect_echo(
-            &mut listener,
-            &third,
-            now.add_micros(KM_KEK_DERIVATION_REFILL_MICROS + 2),
-        );
+        for later in [1_000_002, 3_600_000_000] {
+            assert_km_control_rejected(
+                &mut listener,
+                SRT_CMD_KMREQ,
+                third.clone(),
+                now.add_micros(later),
+                "a third fresh salt is never derived",
+            );
+        }
+        feed_kmreq_expect_echo(&mut listener, &second, now.add_micros(3_600_000_001));
     }
 
     #[test]

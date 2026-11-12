@@ -498,9 +498,10 @@ matches, and only before policy and protocol work, through a GCRA pair
 rejection and counted in `key_derivation_drops`. `configure_listener_crypto`
 reaches `derive_kek` (PBKDF2-HMAC-SHA1, 2,048 iterations) at most once per
 handshake generation: repeated CONCLUSIONS after success retransmit, a failed key
-negotiation is terminal for that connection, handshake timers retransmit saved
-packets, and runtime KMREQ/SEK updates unwrap with the existing KEK instead of
-deriving. A bonded publisher costs one derivation per physical leg. PR #151's
+negotiation is terminal for that connection, and handshake timers retransmit saved
+packets. A runtime KMREQ under the session salt or the latest receive salt
+unwraps with that cached KEK; one under a fresh salt derives a new KEK, at most
+twice per connection lifetime (see Pass 3 receiver, S2). A bonded publisher costs one derivation per physical leg. PR #151's
 recorded cost, 190 us for AES-128 and 383 us for AES-192/256, puts one table's
 sustained allowance at about 2.4% or 4.9% of one core, with a full burst at
 24-49 ms.
@@ -974,3 +975,14 @@ Each item below was reproduced by a regression test that failed on
   still deferring to a deliverable tail's own TSBPD deadline. The same
   change stops the tick once a drain it completed itself has closed; it
   used to fall through and emit a second terminal event.
+- Runtime fresh-salt KMREQs forcing PBKDF2 forever (S2). A KMREQ under a
+  salt with no cached KEK costs one 2,048-iteration PBKDF2-HMAC-SHA1
+  derivation, bounded by a per-connection bucket of 2 refilled at 1/s, so a
+  peer cycling salts forced one derivation per second for the life of the
+  session (and this ledger wrongly said runtime KMREQs never derive).
+  libsrt never changes its salt mid-session (`hcryptCtx_Tx_Rekey` runs once
+  from `HaiCrypt_Create`, hcrypt.c:161) and Robotweax announces one fresh TX
+  salt after connecting and keeps it for rekeys, so the budget is now 2 for
+  the connection's lifetime, never refilled. Each session already paid one
+  table-limited derivation at CONCLUSION, so an Owner's runtime derivations
+  stay within twice its admitted sessions.
