@@ -531,6 +531,48 @@ impl ListenerRouting {
         self.after_admission(table, telemetry);
     }
 
+    /// [`Self::admit_bytes`] for a datagram from a promoted session's
+    /// connected socket: a handshake that would create a peer at that
+    /// session's 4-tuple is dropped and counted as invalid
+    /// ([`crate::PeerTable::admits_from_private_socket`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admit_private_bytes(
+        &mut self,
+        table: &mut crate::PeerTable,
+        resolver: Option<&crate::ListenerAdmissionResolver>,
+        peer: SocketAddr,
+        data: bytes::Bytes,
+        now: srt_proto::Timestamp,
+        options: &crate::AdmissionOptions,
+        telemetry: &IngressTelemetry,
+    ) {
+        if table.admits_from_private_socket(peer, &data) {
+            self.admit_bytes(table, resolver, peer, data, now, options, telemetry);
+        } else {
+            telemetry.record_invalid_datagram();
+        }
+    }
+
+    /// [`Self::admit`] for a datagram from a promoted session's connected
+    /// socket; see [`Self::admit_private_bytes`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admit_private(
+        &mut self,
+        table: &mut crate::PeerTable,
+        resolver: Option<&crate::ListenerAdmissionResolver>,
+        peer: SocketAddr,
+        data: &[u8],
+        now: srt_proto::Timestamp,
+        options: &crate::AdmissionOptions,
+        telemetry: &IngressTelemetry,
+    ) {
+        if table.admits_from_private_socket(peer, data) {
+            self.admit(table, resolver, peer, data, now, options, telemetry);
+        } else {
+            telemetry.record_invalid_datagram();
+        }
+    }
+
     /// Apply a transfer another member sent this one.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn accept(
@@ -904,6 +946,58 @@ mod tests {
                 (Err(_), Err(_)) => {}
             }
         }
+    }
+
+    /// T1: a promoted session's connected socket receives only that
+    /// session's 4-tuple. A CONCLUSION arriving there that names no live peer
+    /// (another caller socket claiming the address) is dropped as invalid
+    /// instead of creating a peer, whose departure closed the live session's
+    /// socket. The session's own retransmitted CONCLUSION and an INDUCTION
+    /// (answered without state) still pass; the listener socket still admits
+    /// that other caller.
+    #[test]
+    fn a_promoted_socket_never_creates_a_peer() {
+        use crate::admission::tests::{conclusion_from, induction_packet};
+        let prepared = config(
+            40_020,
+            crate::ListenerTopology::PerPort,
+            crate::PromotionPolicy::Never,
+        )
+        .prepare(crate::RuntimeFlavor::Mio)
+        .expect("prepared");
+        let mut table = listener_table(&prepared, None);
+        let mut routing = ListenerRouting::new(&prepared, None, None);
+        let options = prepared.admission_options();
+        let telemetry = IngressTelemetry::new();
+        let now = srt_proto::Timestamp::from_micros(1);
+        let invalid = || telemetry.snapshot().invalid_datagrams;
+        let mut outbound = Vec::new();
+        let session: SocketAddr = "10.0.0.60:5000".parse().unwrap();
+        let first = conclusion_from(&mut table, session, 0x60, &options, &telemetry, now);
+        routing.admit(&mut table, None, session, &first, now, &options, &telemetry);
+        assert_eq!((table.len(), table.established_count()), (1, 1));
+        table.poll_outbound(now, &mut outbound);
+
+        routing.admit_private(&mut table, None, session, &first, now, &options, &telemetry);
+        assert!(
+            table.has_pending_output(now),
+            "the session's retransmitted CONCLUSION is answered"
+        );
+        table.poll_outbound(now, &mut outbound);
+        let induction = induction_packet(0x61);
+        routing.admit_private(
+            &mut table, None, session, &induction, now, &options, &telemetry,
+        );
+        assert!(table.has_pending_output(now), "an INDUCTION is answered");
+        table.poll_outbound(now, &mut outbound);
+        assert_eq!(invalid(), 0);
+
+        let other = conclusion_from(&mut table, session, 0x62, &options, &telemetry, now);
+        routing.admit_private(&mut table, None, session, &other, now, &options, &telemetry);
+        assert_eq!(table.len(), 1, "no peer is created from a promoted socket");
+        assert_eq!(invalid(), 1);
+        routing.admit(&mut table, None, session, &other, now, &options, &telemetry);
+        assert_eq!(table.len(), 2, "the listener socket admits it");
     }
 }
 

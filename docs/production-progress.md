@@ -846,3 +846,16 @@ mutation results and numbers in its commit message.
   `IngressTelemetrySnapshot::promoted_duplicates` is removed: without
   INDUCTION state a verified CONCLUSION for a peer that already left the
   table is indistinguishable from a new attempt, and is admitted as one.
+- A spoofed handshake closed a live relocated session's socket (T1). Each
+  peer leaving the table freed its address, and the runtime closed the
+  promoted connected socket at that address, even while the session that
+  socket served was still there. A datagram from that 4-tuple arrives on the
+  connected socket and went through ordinary admission, so a second caller
+  socket claiming the address (on-path, or with a captured cookie) could
+  create a peer there, be rejected, and take the live session's socket with
+  it. An address is now freed only when no live peer remains at it, and a
+  handshake from a connected socket never creates a peer: a CONCLUSION
+  passes only when it routes to a live peer (the session's own
+  retransmission), any other is dropped as invalid. A caller restarted on
+  the same address and port is refused until the old session idles out, then
+  lands on the listener socket.

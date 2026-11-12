@@ -1152,9 +1152,9 @@ pub struct PeerTable {
     /// Adopted (foreign) slots this table has freed: `(home member, slot)`.
     /// The home member holds them lent until told.
     released_slots: Vec<(usize, u32)>,
-    /// Addresses of peers removed while a layout policy is attached, so the
-    /// Owner can close a promoted session's connected socket without
-    /// scanning.
+    /// Addresses the last live peer left while a layout policy is attached,
+    /// so the Owner can close a promoted session's connected socket without
+    /// scanning. An address another live peer still holds is not freed.
     freed_addresses: Vec<std::net::SocketAddr>,
 }
 /// The bond-group affinity a peer's handshake claims, if any; the same
@@ -1587,6 +1587,37 @@ impl PeerTable {
             .first_for_cookie(peer, syn_cookie)
             .or_else(|| self.routes.first_for_caller(peer, caller_socket_id))
             .and_then(|slot| self.physical_at_slot(slot))
+    }
+
+    /// Whether a datagram that arrived on the connected socket of a promoted
+    /// session at `peer` may enter admission. That socket receives only this
+    /// 4-tuple, which a live session already holds, so it never creates a
+    /// peer: a CONCLUSION passes only when it belongs to a live peer (a
+    /// retransmission that peer answers). Everything else creates no state
+    /// and passes: traffic demultiplexed by socket ID, and an INDUCTION,
+    /// answered without state.
+    #[inline]
+    pub(crate) fn admits_from_private_socket(
+        &self,
+        peer: std::net::SocketAddr,
+        data: &[u8],
+    ) -> bool {
+        if !is_handshake_datagram(data) {
+            return true;
+        }
+        let Ok(DecodedAdmissionDatagram {
+            handshake: Some(packet),
+            destination_socket_id,
+        }) = decode_admission_datagram(data)
+        else {
+            return true;
+        };
+        let identity = srt_lifecycle::handshake_identity_from_handshake(&packet);
+        !identity.is_conclusion
+            || self
+                .physical_for_datagram(peer, destination_socket_id)
+                .or_else(|| self.route_conclusion(peer, packet.socket_id, identity.syn_cookie))
+                .is_some()
     }
 
     /// Whether a CONCLUSION naming no live peer is admitted here (`Ok`), or
@@ -2385,7 +2416,8 @@ impl PeerTable {
         !self.freed_addresses.is_empty()
     }
 
-    /// Addresses of peers removed since the last call (layout policy only).
+    /// Addresses whose last peer left since the last call (layout policy
+    /// only).
     pub(crate) fn take_freed_addresses(&mut self) -> std::vec::Drain<'_, std::net::SocketAddr> {
         self.freed_addresses.drain(..)
     }
@@ -2410,7 +2442,10 @@ impl PeerTable {
     }
 
     /// Bookkeeping when a slot leaves this table: a foreign slot goes back to
-    /// its home member, and a routed leg leaves the layout router.
+    /// its home member, a routed leg leaves the layout router, and the
+    /// address is freed for the runtime (which closes a promoted connected
+    /// socket there) once no live peer remains at it. The caller has already
+    /// purged this slot's routes.
     fn note_slot_freed(&mut self, slot_idx: usize, address: std::net::SocketAddr, routed: bool) {
         if !self.slots.is_local_slot(slot_idx) {
             self.released_slots
@@ -2422,7 +2457,9 @@ impl PeerTable {
         if routed && let Ok(mut router) = policy.router.lock() {
             router.release(&address);
         }
-        self.freed_addresses.push(address);
+        if self.routes.first_at(address).is_none() {
+            self.freed_addresses.push(address);
+        }
     }
 
     fn adopt_bonded_peer(&mut self, peer: PhysicalPeerKey) {
@@ -4486,6 +4523,17 @@ impl PeerTable {
             .and_then(|physical| self.get_peer(&physical))
     }
 
+    /// Benchmark-only access to `admits_from_private_socket`, the
+    /// gate every datagram from a promoted connected socket passes.
+    #[cfg(feature = "bench-internals")]
+    pub fn admits_from_private_socket_for_bench(
+        &self,
+        peer: std::net::SocketAddr,
+        data: &[u8],
+    ) -> bool {
+        self.admits_from_private_socket(peer, data)
+    }
+
     /// Mutable twin of [`Self::direct_for_bench`]: ACK/NAK a StayOnListener
     /// peer mid-admission drain without waiting for the full peer sweep.
     ///
@@ -5011,6 +5059,13 @@ fn is_control_datagram(data: &[u8]) -> bool {
     data.first().is_some_and(|byte| byte & 0x80 != 0)
 }
 
+/// Is this datagram a HANDSHAKE control packet? The control type is the 15
+/// bits after the CONTROL bit, and HANDSHAKE is type 0, so this rejects ACK,
+/// NAK and the other control traffic without decoding it.
+fn is_handshake_datagram(data: &[u8]) -> bool {
+    data.get(..2) == Some(&[0x80, 0x00][..])
+}
+
 fn duration_micros_saturating(timeout: Duration) -> u64 {
     u64::try_from(timeout.as_micros()).unwrap_or(u64::MAX)
 }
@@ -5161,7 +5216,7 @@ pub(crate) mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    fn induction_packet(socket_id: u32) -> Vec<u8> {
+    pub(crate) fn induction_packet(socket_id: u32) -> Vec<u8> {
         let packet =
             srt_proto::handshake::HandshakePacket::new_induction_request(socket_id).encode(0, 0);
         let mut bytes = Vec::new();
@@ -6734,6 +6789,61 @@ pub(crate) mod tests {
             Admit::Dropped(AdmissionDropReason::InvalidCookie)
         );
         assert_eq!(telemetry.snapshot().cookie_routed, 0);
+    }
+
+    /// T1: a peer leaving the table frees its address for the runtime (which
+    /// closes the promoted connected socket there) only when no other live
+    /// peer remains at that address. A second caller socket at a promoted
+    /// session's address, rejected by policy, used to close the live
+    /// session's socket on its way out.
+    #[test]
+    fn a_peer_leaving_an_address_another_live_peer_holds_does_not_free_it() {
+        let mut table = PeerTable::new();
+        table.set_relocation(TableRelocation {
+            mode: srt_lifecycle::Promotion::Relocate,
+            member: 0,
+            router: std::sync::Arc::new(std::sync::Mutex::new(srt_lifecycle::WorkerRouter::new(1))),
+            exclusive: true,
+        });
+        let telemetry = IngressTelemetry::new();
+        let options = default_options();
+        let shared: std::net::SocketAddr = "10.0.0.50:5000".parse().unwrap();
+        let (mut live, conclusion) =
+            admit_up_to_conclusion(&mut table, shared, 0x50, &options, &telemetry);
+        admit_conclusion(
+            &mut table,
+            shared,
+            &mut live,
+            &conclusion,
+            &options,
+            &telemetry,
+        );
+        assert_eq!(live.state(), srt_proto::ConnectionState::Connected);
+        let now = Timestamp::from_micros(10);
+        let second = conclusion_from(&mut table, shared, 0x51, &options, &telemetry, now);
+        assert_eq!(
+            table.admit_with_resolver(shared, &second, now, &options, 0, 1, &telemetry, |_| {
+                AdmissionResolution::Reject {
+                    reason: RejectionReason::FORBIDDEN,
+                }
+            }),
+            Admit::Rejected
+        );
+        let mut outbound = Vec::new();
+        table.poll_outbound(now, &mut outbound);
+        assert_eq!(table.len(), 1, "the rejected peer left the table");
+        assert_eq!(
+            table.take_freed_addresses().collect::<Vec<_>>(),
+            Vec::<std::net::SocketAddr>::new(),
+            "the live session still holds the address"
+        );
+        let live_key = table.physical_for_address(shared).expect("live peer");
+        assert!(table.remove_physical(live_key).is_some());
+        assert_eq!(
+            table.take_freed_addresses().collect::<Vec<_>>(),
+            vec![shared],
+            "the last peer at the address frees it"
+        );
     }
 
     /// RS1/T3: an INDUCTION is answered from no state (libsrt

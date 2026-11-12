@@ -1257,8 +1257,10 @@ impl OwnerListenerSide {
     }
 
     /// Drain every readable promoted socket through the listener's
-    /// admission path (the table demultiplexes by socket ID), then poll the
-    /// drained ones' readiness so their next datagram wakes this Owner.
+    /// admission path (the table demultiplexes by socket ID; a datagram
+    /// there never creates a peer: `ListenerRouting::admit_private_bytes`),
+    /// then poll the drained ones' readiness so their next datagram wakes
+    /// this Owner.
     fn drain_promoted(&mut self, now: Timestamp) -> io::Result<()> {
         let (peers, admission, telemetry, resolver, routing, promoted) = (
             &mut self.peers,
@@ -1287,7 +1289,8 @@ impl OwnerListenerSide {
                 now,
                 |addr, data, at| {
                     let Some(peer) = addr else { return };
-                    routing.admit_bytes(peers, resolver, peer, data, at, admission, telemetry);
+                    routing
+                        .admit_private_bytes(peers, resolver, peer, data, at, admission, telemetry);
                 },
             ) {
                 Ok(report) => !receive_continuation(report, self.transport.recv_budget),
